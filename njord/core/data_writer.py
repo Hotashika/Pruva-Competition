@@ -11,6 +11,7 @@ import numpy as np
 from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
 from njord.core import shared_state
 from njord.core.shared_memory_utils import attach_existing_shared_memory
+from njord.vision.detector import BuoyDetector, VesselDetector
 
 OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")
@@ -19,6 +20,18 @@ VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 DEPTH_BIN_PATH = os.path.join(OUTPUT_DIR, "depth_stream.bin")  # single append-only file (disabled for now)
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
 VIDEO_FPS = 5
+
+TASK_DETECTOR_MAP = {
+    "task1": ("buoy",),
+    "task2": ("buoy", "vessel"),
+    "task3": ("vessel",),
+    "none": ("buoy", "vessel"),
+}
+
+DETECTOR_FACTORIES = {
+    "buoy": BuoyDetector,
+    "vessel": VesselDetector,
+}
 
 logger = logging.getLogger("zed_capture")
 
@@ -30,6 +43,35 @@ def setup_output_dirs():
 
 def attach_shared_memory(name, retries=50, delay=0.1):
     return attach_existing_shared_memory(name, retries=retries, delay=delay)
+
+
+def detector_names_for_task(active_task):
+    task_key = str(active_task or "task1").strip().lower()
+    detector_names = TASK_DETECTOR_MAP.get(task_key)
+
+    if detector_names is None:
+        logger.warning(
+            "Unknown NJORD task '%s' for video annotation, defaulting to task1 detectors.",
+            active_task,
+        )
+        return TASK_DETECTOR_MAP["task1"]
+
+    return detector_names
+
+
+def create_frame_detectors(active_task, fx=None, cx=None):
+    detectors = []
+
+    for detector_name in detector_names_for_task(active_task):
+        detector_cls = DETECTOR_FACTORIES[detector_name]
+        detectors.append(
+            (
+                detector_name,
+                detector_cls(fx=fx, cx=cx),
+            )
+        )
+
+    return detectors
 
 
 def disk_writer_worker(q, video_path, frame_size):
@@ -69,8 +111,76 @@ def disk_writer_worker(q, video_path, frame_size):
     video_writer.release()
 
 
+def draw_frame_timestamp(frame, timestamp_ms, frame_index):
+    timestamp_seconds = timestamp_ms / 1000.0
+    timestamp_text = (
+        f"Timestamp: {timestamp_ms} ms | "
+        f"Time: {timestamp_seconds:.3f} s | "
+        f"Frame: {frame_index}"
+    )
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness = 1
+
+    (text_width, text_height), baseline = cv2.getTextSize(
+        timestamp_text,
+        font,
+        font_scale,
+        thickness,
+    )
+
+    x = 10
+    y = 10 + text_height
+
+    cv2.rectangle(
+        frame,
+        (x - 5, y - text_height - 5),
+        (x + text_width + 5, y + baseline + 5),
+        (0, 0, 0),
+        -1,
+    )
+
+    cv2.putText(
+        frame,
+        timestamp_text,
+        (x, y),
+        font,
+        font_scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    return frame
+
+
+def annotate_frame(frame_bgr, depth_array, detectors):
+    all_detections = []
+
+    for detector_name, detector in detectors:
+        detections = detector.detect(frame_bgr, depth_array)
+
+        for detection in detections:
+            detection["type"] = detector_name
+
+        all_detections.extend(detections)
+
+    if not detectors:
+        return frame_bgr.copy()
+
+    return detectors[0][1].draw_detections(frame_bgr, all_detections)
+
+
 # noinspection D
-def run(frame_lock=None, frame_ready_event=None, stop_event=None):
+def run(
+    frame_lock=None,
+    frame_ready_event=None,
+    stop_event=None,
+    active_task="task1",
+    fx=None,
+    cx=None,
+):
     setup_output_dirs()
     frame_index = 0
     dropped_frames = 0
@@ -96,6 +206,17 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
 
     last_drop_log = 0.0
     last_frame_id = 0
+    record_interval_ms = max(1, int(1000 / VIDEO_FPS))
+    last_record_time_ms = None
+
+    try:
+        frame_detectors = create_frame_detectors(active_task, fx=fx, cx=cx)
+    except Exception:
+        logger.exception(
+            "NJORD video annotation detectors could not be loaded for task '%s'.",
+            active_task,
+        )
+        raise
 
     try:
         rgb_shm = attach_shared_memory(shared_state.RGB_SHM_NAME)
@@ -148,17 +269,42 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
             # float16 conversion disabled along with depth-to-disk writing (see below)
             # np.copyto(downsampled_depth_f16_buf, downsampled_depth_buf, casting="unsafe")
 
-            # queue gets a COPY of the frame, since frame_bgr_buf is reused next iteration
-            try:
-                write_queue.put_nowait(frame_bgr_buf.copy())
-            except queue.Full:
-                dropped_frames += 1
-                now = time.monotonic()
-                if now - last_drop_log > 1.0:  # rate-limit logging, don't block hot path
-                    logger.warning(
-                        "Disk write speed is lagging, number of dropped frames: %d", dropped_frames
-                    )
-                    last_drop_log = now
+            now_record_time_ms = int(time.monotonic() * 1000)
+            should_record = (
+                last_record_time_ms is None
+                or now_record_time_ms - last_record_time_ms >= record_interval_ms
+            )
+
+            if should_record:
+                try:
+                    processed_frame = annotate_frame(frame_bgr_buf, depth_buf, frame_detectors)
+                except Exception:
+                    logger.exception("NJORD video annotation failed. Raw frame will be used.")
+                    processed_frame = frame_bgr_buf.copy()
+
+                draw_frame_timestamp(
+                    processed_frame,
+                    timestamp_ms=timestamp_ms,
+                    frame_index=current_frame_id,
+                )
+
+                # The Flask video server reads this same annotated frame.
+                with shared_state.frame_lock:
+                    shared_state.latest_frame = processed_frame.copy()
+
+                shared_state.frame_event.set()
+
+                try:
+                    write_queue.put_nowait(processed_frame)
+                    last_record_time_ms = now_record_time_ms
+                except queue.Full:
+                    dropped_frames += 1
+                    now = time.monotonic()
+                    if now - last_drop_log > 1.0:  # rate-limit logging, don't block hot path
+                        logger.warning(
+                            "Disk write speed is lagging, number of dropped frames: %d", dropped_frames
+                        )
+                        last_drop_log = now
 
             # --- minimize time spent holding locks: just pointer/scalar assignment ---
             with shared_state.data_lock:
@@ -166,11 +312,7 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
                 shared_state.latest_imu = {"pitch": pitch, "yaw": yaw, "roll": roll}
                 shared_state.latest_timestamp = timestamp_ms
 
-            with shared_state.frame_lock:
-                shared_state.latest_frame = frame_bgr_buf.copy()
-
             shared_state.data_event.set()
-            shared_state.frame_event.set()
             frame_index += 1
     finally:
         print("System shutting down, writing remaining data to disk...")

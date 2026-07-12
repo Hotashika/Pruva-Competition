@@ -22,8 +22,7 @@ DEPTH_BIN_PATH = os.path.join(OUTPUT_DIR, "depth_stream.bin")  # single append-o
 
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
 
-# Şartname için en az 1 Hz gerekli.
-# 5 FPS yeterli ve güvenli bir değer.
+# Şartname için en az 1 Hz yeterli.
 VIDEO_FPS = 5
 
 # Takip ID istersen True yap.
