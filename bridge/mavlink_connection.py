@@ -2,8 +2,10 @@ import time
 
 from pymavlink import mavutil
 
-DEFAULT_CONNECTION_STRING = "/dev/ttyACM0"
-DEFAULT_BAUD = 115200
+# Jetson 40-pin header UART (8N1, flow control disabled by pymavlink/pyserial defaults).
+DEFAULT_CONNECTION_STRING = "/dev/ttyTHS0"
+DEFAULT_BAUD = 921600
+
 DEFAULT_HEARTBEAT_TIMEOUT = 15
 
 
@@ -50,6 +52,7 @@ def connect_mavlink(
     """MAVLink baglantisi kurar ve heartbeat bekledikten sonra master nesnesini dondurur.
 
     Ornek connection_string degerleri:
+        - Jetson UART / Cube TELEM: "/dev/ttyTHS0"
         - Orange Cube USB: "/dev/ttyACM0"
         - TELEM / USB-TTL: "/dev/ttyUSB0"
         - SITL: "udpin:127.0.0.1:14550"
