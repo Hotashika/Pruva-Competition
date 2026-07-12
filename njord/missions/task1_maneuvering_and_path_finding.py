@@ -28,7 +28,7 @@ from utils.mavlink_utilities import (
 from utils.read_waypoints import parse_qgc_waypoints
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR / "waypoints" / "njord1_2_maneuvering.waypoints"
+WAYPOINT_PATH = BASE_DIR / "waypoints" / "njord_task1.waypoints"
 ACTIVE_TASK_NAME = "task1"
 
 # ============================================================
@@ -37,17 +37,23 @@ ACTIVE_TASK_NAME = "task1"
 GPS_TIMEOUT_SEC = 2.0  # Bu sure GPS gelmezse dur ve HOLD moda gecmeyi dene
 HEADING_TIMEOUT_SEC = 2.0  # Bu sure heading gelmezse dur ve HOLD moda gecmeyi dene
 GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
-AVOID_ENTER_DIST_M = 10.0  # Kaçınma tetiklenme mesafesi
-AVOID_EXIT_DIST_M = 12.0  # Kaçınma için dikkate alınacak maksimum engel mesafesi
-AVOID_LINEAR_X = 0.5  # Kacinma manevrasinda ileri hiz
-AVOID_TURN_Z = 0.35  # Kacinma manevrasinda sag/sol donus komutu buyuklugu
-AVOID_MANEUVER_MIN_SEC = 1.2  # Temizlenme kabul edilmeden once minimum manevra suresi
-AVOID_MANEUVER_MAX_SEC = 3.0  # Tek kacinma manevrasinin maksimum suresi
-AVOID_CLEAR_DURATION_SEC = 0.7  # Obje temiz gorundukten sonra ana rotaya donus bekleme suresi
+
+AVOID_ENTER_DIST_M = 3.0  # Kaçınma tetiklenme mesafesi
+AVOID_EXIT_DIST_M = 5.0  # Kaçınma için dikkate alınacak maksimum engel mesafesi
+
+AVOID_LINEAR_X = 0.3  # Kacinma manevrasinda ileri hiz
+AVOID_TURN_Z = 0.15  # Kacinma manevrasinda sag/sol donus komutu buyuklugu
+
+AVOID_MANEUVER_MIN_SEC = 0.5  # Temizlenme kabul edilmeden once minimum manevra suresi
+AVOID_MANEUVER_MAX_SEC = 1.5  # Tek kacinma manevrasinin maksimum suresi
+
+AVOID_CLEAR_DURATION_SEC = 0.3  # Obje temiz gorundukten sonra ana rotaya donus bekleme suresi
 AVOID_CLEAR_ANGLE_DEG = 25.0  # Obje bu acinin disina cikinca merkezden temiz kabul edilir
+
 VISION_DETECTION_TIMEOUT_SEC = 1.0  # Son vision mesajı bu süreden eskiyse yok say
 EARTH_RADIUS_M = 6378137.0
 MIN_VALID_ABS_COORD = 1e-6
+
 HOLD_MODE_NAME = "HOLD"
 RELEVANT_OBSTACLE_CLASSES = (
     "red_buoy",
@@ -472,7 +478,7 @@ class Task1Maneuvering:
                 self._publish_avoidance_maneuver()
                 return
 
-        elif nearest is not None and nearest["distance"] < AVOID_ENTER_DIST_M:
+        elif nearest is not None and nearest["distance"] <= AVOID_ENTER_DIST_M:
             self.state = MissionState.AVOIDING
             self.avoiding_class = nearest["class"]
             self.avoid_started_time = now

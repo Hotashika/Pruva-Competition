@@ -22,6 +22,7 @@ TASK_DETECTOR_MAP = {
     "task1": {"buoy"},
     "task2": {"buoy", "vessel"},
     "task3": {"vessel"},
+    "task4": {...},
 }
 
 DETECTOR_REGISTRY = {

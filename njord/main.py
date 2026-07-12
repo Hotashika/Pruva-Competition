@@ -65,6 +65,15 @@ def stop_child_process(name, process, timeout_sec=5.0, sig=signal.SIGINT):
     process.wait(timeout=2)
 
 
+def run_startup_cleanup():
+    cleanup_script = os.path.join(PROJECT_ROOT, "scripts", "cleanup_shm.sh")
+    if not os.path.isfile(cleanup_script):
+        raise FileNotFoundError(f"Shared memory cleanup script not found: {cleanup_script}")
+
+    print(f"[SYSTEM] Startup shared memory cleanup running: {cleanup_script}")
+    subprocess.run(["/bin/bash", cleanup_script], check=True)
+
+
 def start_capture_process():
     mp_context = get_context("spawn")
     frame_lock = mp_context.Lock()
@@ -118,6 +127,8 @@ if __name__ == "__main__":
     p_njord_task1 = None
 
     try:
+        run_startup_cleanup()
+
         (
             capture_process,
             frame_lock,
