@@ -23,7 +23,13 @@ from bridge.mavlink_connection import (
     DEFAULT_HEARTBEAT_TIMEOUT,
     connect_mavlink,
 )
-from utils.mavlink_utilities import create_bridge_topics, create_bridge_services
+from utils.mavlink_utilities import (
+    calculate_angle_error_deg,
+    calculate_bearing,
+    calculate_gps_distance,
+    create_bridge_services,
+    create_bridge_topics,
+)
 
 MAV_CMD_NJORD_MISSION_START = mavutil.mavlink.MAV_CMD_USER_1
 
@@ -95,6 +101,19 @@ class OrangeCubeBridgeNode(Node):
             os.getenv("MAVLINK_DISARM_ON_SHUTDOWN", "1").lower()
             not in ("0", "false", "no", "off"),
         )
+        self.declare_parameter(
+            "align_before_set_position",
+            os.getenv("MAVLINK_ALIGN_BEFORE_SET_POSITION", "1").lower()
+            not in ("0", "false", "no", "off"),
+        )
+        self.declare_parameter(
+            "set_position_heading_tolerance_deg",
+            float(os.getenv("MAVLINK_SET_POSITION_HEADING_TOLERANCE_DEG", "8.0")),
+        )
+        self.declare_parameter(
+            "set_position_heading_min_distance_m",
+            float(os.getenv("MAVLINK_SET_POSITION_HEADING_MIN_DISTANCE_M", "1.5")),
+        )
 
         self.connection_string = self.get_parameter("connection_string").value
         self.baud = int(self.get_parameter("baud").value)
@@ -105,6 +124,15 @@ class OrangeCubeBridgeNode(Node):
             self.get_parameter("reconnect_heartbeat_timeout").value
         )
         self.disarm_on_shutdown = bool(self.get_parameter("disarm_on_shutdown").value)
+        self.align_before_set_position = bool(
+            self.get_parameter("align_before_set_position").value
+        )
+        self.set_position_heading_tolerance_deg = float(
+            self.get_parameter("set_position_heading_tolerance_deg").value
+        )
+        self.set_position_heading_min_distance_m = float(
+            self.get_parameter("set_position_heading_min_distance_m").value
+        )
 
         self.master = None
         self.connected = False
@@ -134,6 +162,7 @@ class OrangeCubeBridgeNode(Node):
         self.last_thrust = 0.0
         self.last_position_target_time = 0.0
         self.position_target_timeout_sec = 0.5
+        self.position_target_aligned_key = None
 
         self.topics = create_bridge_topics(
             self,
@@ -230,6 +259,7 @@ class OrangeCubeBridgeNode(Node):
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
+        self.position_target_aligned_key = None
 
     def _close_master(self):
         if self.master is None:
@@ -705,6 +735,9 @@ class OrangeCubeBridgeNode(Node):
             return
 
         try:
+            if not self._align_before_set_position(lat, lon):
+                return
+
             set_position(self.master, (lat, lon), self.boot_time)
             self.last_position_target_time = time.time()
             self.get_logger().info(
@@ -713,6 +746,57 @@ class OrangeCubeBridgeNode(Node):
             )
         except Exception as exc:
             self._publish_error(f"Set position hatasi: {exc}")
+
+    @staticmethod
+    def _position_target_key(lat, lon):
+        return (round(float(lat), 7), round(float(lon), 7))
+
+    def _align_before_set_position(self, lat, lon):
+        if not self.align_before_set_position:
+            return True
+
+        target_key = self._position_target_key(lat, lon)
+        if self.position_target_aligned_key == target_key:
+            return True
+
+        if self.gps_lat is None or self.gps_lon is None or self.heading_deg is None:
+            self._neutralize_outputs()
+            self.get_logger().warn(
+                "set_position oncesi heading hizalamasi icin GPS/heading bekleniyor.",
+                throttle_duration_sec=2.0,
+            )
+            return False
+
+        distance_m = calculate_gps_distance(self.gps_lat, self.gps_lon, lat, lon)
+        if distance_m <= self.set_position_heading_min_distance_m:
+            self.position_target_aligned_key = target_key
+            return True
+
+        target_bearing = calculate_bearing(self.gps_lat, self.gps_lon, lat, lon)
+        heading_error = calculate_angle_error_deg(target_bearing, self.heading_deg)
+
+        if abs(heading_error) <= self.set_position_heading_tolerance_deg:
+            self.position_target_aligned_key = target_key
+            self._neutralize_outputs()
+            self.get_logger().info(
+                f"set_position heading hizalandi: target={target_bearing:.1f}deg, "
+                f"current={self.heading_deg:.1f}deg, error={heading_error:.1f}deg",
+                throttle_duration_sec=1.0,
+            )
+            return True
+
+        target_yaw_rad = math.radians(target_bearing)
+        self.last_position_target_time = 0.0
+        self.last_target_q = self._yaw_to_mavlink_quaternion(target_yaw_rad)
+        self.last_thrust = 0.0
+        self.last_cmd_vel_time = time.time()
+
+        self.get_logger().info(
+            f"set_position oncesi heading hizalaniyor: target={target_bearing:.1f}deg, "
+            f"current={self.heading_deg:.1f}deg, error={heading_error:.1f}deg",
+            throttle_duration_sec=1.0,
+        )
+        return False
 
     def _cmd_vel_callback(self, msg):
         if not self._has_valid_link():
@@ -730,6 +814,8 @@ class OrangeCubeBridgeNode(Node):
 
         linear_x = max(-1.0, min(1.0, float(msg.linear.x)))
         angular_z = max(-1.0, min(1.0, float(msg.angular.z)))
+        if abs(linear_x) > 1e-3 or abs(angular_z) > 1e-3:
+            self.position_target_aligned_key = None
 
         target_yaw_rad = (self.yaw if self.yaw is not None else 0.0) + angular_z
         self.last_target_q = self._yaw_to_mavlink_quaternion(target_yaw_rad)
@@ -782,6 +868,9 @@ class OrangeCubeBridgeNode(Node):
             )
         except Exception as exc:
             self._publish_error(f"Attitude target hatasi: {exc}")
+
+    def _correction_yaw(self):
+        ...
 
 
 def main(args=None):
