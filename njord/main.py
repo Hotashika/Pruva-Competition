@@ -8,6 +8,8 @@ import threading
 import time
 from multiprocessing import get_context
 
+from utils.mavlink_utilities import call_trigger_service
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
 if COMPETITION_ROOT not in sys.path:
@@ -236,6 +238,15 @@ if __name__ == "__main__":
             print(f"[SYSTEM] Error while sub-process shut down: {exc}")
 
         print("[SYSTEM] Sub-processes closed.")
+
+        print("[SYSTEM] Hold mode & DISARM the AUV...")
+
+        try:
+            call_trigger_service(None, None, "HOLD", timeout_sec=3.0)
+            call_trigger_service(None, None, "DISARM", timeout_sec=3.0)
+        except Exception as exc:
+            print(f"[SYSTEM] Error while sending HOLD/DISARM commands: {exc}")
+
 
         if capture_stop_event is not None:
             capture_stop_event.set()
