@@ -124,7 +124,6 @@ if __name__ == "__main__":
     frame_ready_event = None
     p_bridge = None
     p_vision = None
-    p_njord_task1 = None
 
     try:
         run_startup_cleanup()
@@ -170,28 +169,23 @@ if __name__ == "__main__":
         njord_task1_path = os.path.join(PROJECT_ROOT, "missions", "task1_maneuvering_and_path_finding.py")
         njord_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_collision_avoidance.py")
         njord_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_docking.py")
+        njord_task1_waypoint_path = os.path.join(PROJECT_ROOT, "waypoints", "njord1_2_maneuvering.waypoints")
 
         ################################################################################################################
+        mission_env_setup = (
+            "export MAVLINK_MISSION_LAUNCH_ENABLED=1 && "
+            f"export MAVLINK_MISSION_1_PATH={shlex.quote(njord_task1_path)} && "
+            f"export MAVLINK_MISSION_1_WAYPOINT_PATH={shlex.quote(njord_task1_waypoint_path)} && "
+            f"export MAVLINK_MISSION_2_PATH={shlex.quote(njord_task2_path)} && "
+            f"export MAVLINK_MISSION_3_PATH={shlex.quote(njord_task3_path)}"
+        )
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
         )
         cmd_bridge = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
+            f"{ros2_setup} && {python_path_setup} && {mission_env_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
-        ################################################################################################################
-        # SETUP NJORD MISSION COMMANDS
-        ################################################################################################################
-        cmd_njord_task1 = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task1_path)}"
-        )
-        # cmd_njord_task2 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task2_path)}"
-        # )
-        # cmd_njord_task3 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task3_path)}"
-        # )
-        ################################################################################################################
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
@@ -202,18 +196,11 @@ if __name__ == "__main__":
         time.sleep(2)
 
         ################################################################################################################
-        #   NJORD MISSION START CMD
+        #   NJORD MISSION START
+        #   Mission nodes are started by bridge when Pixhawk sends MAV_CMD_USER_1:
+        #   param1=1 -> M1, param1=2 -> M2, param1=3 -> M3, param1=4 -> unsupported.
         ################################################################################################################
-        p_njord_task1 = launch_child_process(cmd_njord_task1)
-        print(f" -> NJORD Mission 1 Node launched (PID: {p_njord_task1.pid})\n")
-
-        # p_njord_task2 = subprocess.Popen(cmd_njord_task2, shell=True, executable="/bin/bash")
-        # child_processes.append(p_njord_task2)
-        # print(f" -> NJORD Mission 2 Node launched (PID: {p_njord_task2.pid})\n")
-        #
-        # p_njord_task3 = subprocess.Popen(cmd_njord_task3, shell=True, executable="/bin/bash")
-        # child_processes.append(p_njord_task3)
-        # print(f" -> NJORD Mission 3 Node launched (PID: {p_njord_task3.pid})\n")
+        print(" -> NJORD missions are waiting for MAVLink start command (M1/M2/M3).\n")
         ################################################################################################################
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
@@ -229,7 +216,6 @@ if __name__ == "__main__":
         print("[SYSTEM] Cleaning process was started...")
 
         try:
-            stop_child_process("NJORD Mission 1 Node", p_njord_task1, timeout_sec=7.0)
             stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
             stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
         except Exception as exc:
