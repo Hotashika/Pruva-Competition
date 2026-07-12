@@ -115,7 +115,6 @@ if __name__ == "__main__":
     frame_ready_event = None
     p_bridge = None
     p_vision = None
-    p_teknofest_task1 = None
 
     try:
         (
@@ -158,26 +157,20 @@ if __name__ == "__main__":
         teknofest_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_point_tracking_task_in_an_environment_with_obstacle.py")
         teknofest_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_kamikaze_engagement.py")
         ################################################################################################################
+        mission_env_setup = (
+            "export MAVLINK_MISSION_LAUNCH_ENABLED=1 && "
+            "export MAVLINK_MISSION_SEQUENCE=1,2,3 && "
+            f"export MAVLINK_MISSION_1_PATH={shlex.quote(teknofest_task1_path)} && "
+            f"export MAVLINK_MISSION_2_PATH={shlex.quote(teknofest_task2_path)} && "
+            f"export MAVLINK_MISSION_3_PATH={shlex.quote(teknofest_task3_path)}"
+        )
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
         )
         cmd_bridge = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
+            f"{ros2_setup} && {python_path_setup} && {mission_env_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
-        ################################################################################################################
-        # SETUP TEKNOFEST MISSION COMMANDS
-        ################################################################################################################
-        cmd_teknofest_task1 = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task1_path)}"
-        )
-        # cmd_teknofest_task2 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task2_path)}"
-        # )
-        # cmd_teknofest_task3 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task3_path)}"
-        # )
-        ################################################################################################################
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
@@ -188,18 +181,11 @@ if __name__ == "__main__":
         time.sleep(2)
 
         ################################################################################################################
-        #   TEKNOFEST MISSION START CMD
+        #   TEKNOFEST MISSION START
+        #   Mission nodes are started by bridge when Pixhawk sends MAV_CMD_USER_1.
+        #   TEKNOFEST uses its existing waypoint files and continues M1 -> M2 -> M3 automatically.
         ################################################################################################################
-        p_teknofest_task1 = launch_child_process(cmd_teknofest_task1)
-        print(f" -> TEKNOFEST Mission 1 Node launched (PID: {p_teknofest_task1.pid})\n")
-
-        # p_teknofest_task2 = subprocess.Popen(cmd_teknofest_task2, shell=True, executable="/bin/bash")
-        # child_processes.append(p_teknofest_task2)
-        # print(f" -> TEKNOFEST Mission 2 Node launched (PID: {p_teknofest_task2.pid})\n")
-        #
-        # p_teknofest_task3 = subprocess.Popen(cmd_teknofest_task3, shell=True, executable="/bin/bash")
-        # child_processes.append(p_teknofest_task3)
-        # print(f" -> TEKNOFEST Mission 3 Node launched (PID: {p_teknofest_task3.pid})\n")
+        print(" -> TEKNOFEST missions are waiting for MAVLink start command (M1 -> M2 -> M3).\n")
         ################################################################################################################
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
@@ -215,7 +201,6 @@ if __name__ == "__main__":
         print("[SYSTEM] Cleaning process was started...")
 
         try:
-            stop_child_process("TEKNOFEST Mission 1 Node", p_teknofest_task1, timeout_sec=7.0)
             stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
             stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
         except Exception as exc:
