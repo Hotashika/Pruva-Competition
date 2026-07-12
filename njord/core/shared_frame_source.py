@@ -3,9 +3,9 @@ import time
 import cv2
 import numpy as np
 
-from config.camera_config import DEPTH_SHAPE, RGB_SHAPE
-from core import shared_state
-from core.shared_memory_utils import attach_existing_shared_memory
+from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
+from njord.core import shared_state
+from njord.core.shared_memory_utils import attach_existing_shared_memory
 
 
 def attach_shared_memory(name, retries=50, delay=0.1):
@@ -16,7 +16,7 @@ def open_or_start_capture_source(retries=5, delay=0.1):
     try:
         return SharedFrameSource(retries=retries, delay=delay), None, None
     except RuntimeError:
-        from main import start_capture_process
+        from njord.main import start_capture_process
 
         capture_process, frame_lock, frame_ready_event, stop_event, _, _ = start_capture_process()
         source = SharedFrameSource(frame_lock, frame_ready_event)

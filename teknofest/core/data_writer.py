@@ -9,9 +9,9 @@ from multiprocessing import shared_memory
 import cv2
 import numpy as np
 
-from config.camera_config import DEPTH_SHAPE, RGB_SHAPE
-from core import shared_state
-from vision.detector import BuoyDetector
+from teknofest.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
+from teknofest.core import shared_state
+from teknofest.vision.detector import BuoyDetector
 
 OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")

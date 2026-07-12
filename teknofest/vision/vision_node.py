@@ -1,20 +1,26 @@
 import argparse
 import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from config.camera_config import DEPTH_SHAPE, RGB_SHAPE
-from config.vision_config import BUOY_MODEL_PATH
-from core import shared_state
-from core.shared_memory_utils import attach_existing_shared_memory, close_shared_memory_handles
-from vision.detector import BuoyDetector
+from teknofest.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
+from teknofest.config.vision_config import BUOY_MODEL_PATH
+from teknofest.core import shared_state
+from teknofest.core.shared_memory_utils import attach_existing_shared_memory, close_shared_memory_handles
+from teknofest.vision.detector import BuoyDetector
 
 try:
-    from config.vision_config import VESSEL_MODEL_PATH
-    from vision.detector import VesselDetector
+    from teknofest.config.vision_config import VESSEL_MODEL_PATH
+    from teknofest.vision.detector import VesselDetector
 except ImportError:
     VESSEL_MODEL_PATH = None
     VesselDetector = None

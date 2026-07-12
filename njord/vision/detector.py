@@ -4,9 +4,9 @@ from pathlib import Path
 import numpy as np
 from ultralytics import YOLO
 
-from config.camera_config import CAMERA_WIDTH
-from config.vision_config import DEVICE, BUOY_MODEL_PATH, VESSEL_MODEL_PATH, TOLERANCE_RATIO, TOLARANCE_DEG
-from vision.depth_utils import get_distance_from_bbox
+from njord.config.camera_config import CAMERA_WIDTH
+from njord.config.vision_config import DEVICE, BUOY_MODEL_PATH, VESSEL_MODEL_PATH, TOLERANCE_RATIO, TOLARANCE_DEG
+from njord.vision.depth_utils import get_distance_from_bbox
 
 
 class BaseYOLODetector:

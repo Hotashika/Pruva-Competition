@@ -8,9 +8,9 @@ import time
 import cv2
 import numpy as np
 
-from config.camera_config import DEPTH_SHAPE, RGB_SHAPE
-from core import shared_state
-from core.shared_memory_utils import attach_existing_shared_memory
+from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
+from njord.core import shared_state
+from njord.core.shared_memory_utils import attach_existing_shared_memory
 
 OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")

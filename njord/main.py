@@ -8,13 +8,15 @@ import threading
 import time
 from multiprocessing import get_context
 
-from core import capture_proc
-from core import data_writer
-from servers import data_server
-from servers import video_server
-
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
+if COMPETITION_ROOT not in sys.path:
+    sys.path.insert(0, COMPETITION_ROOT)
+
+from njord.core import capture_proc
+from njord.core import data_writer
+from njord.servers import data_server
+from njord.servers import video_server
 
 
 def launch_child_process(command):

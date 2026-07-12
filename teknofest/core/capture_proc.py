@@ -4,7 +4,7 @@ from multiprocessing import shared_memory
 import numpy as np
 import pyzed.sl as sl
 
-from config.camera_config import (
+from teknofest.config.camera_config import (
     CAMERA_RESOLUTION,
     CAMERA_FPS,
     DEPTH_MODE,
@@ -13,7 +13,7 @@ from config.camera_config import (
     RGB_SHAPE,
     DEPTH_SHAPE,
 )
-from core import shared_state
+from teknofest.core import shared_state
 
 
 def _create_owned_shared_memory(name, size):

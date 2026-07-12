@@ -2,6 +2,7 @@
     python3 tests/test_angle.py --device cuda
 """
 import argparse
+import importlib
 import json
 import os
 import re
@@ -11,29 +12,47 @@ import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import psutil
 
-COMPETITION_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROJECT_NAME = os.environ.get("COMPETITION_PROJECT", "../njord").lower()
-PROJECT_ROOT = os.path.join(COMPETITION_ROOT, PROJECT_NAME)
+COMPETITION_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_PACKAGE = Path(os.environ.get("COMPETITION_PROJECT", "njord")).name.lower()
+PROJECT_ROOT = COMPETITION_ROOT / PROJECT_PACKAGE
 
-for path in (COMPETITION_ROOT, PROJECT_ROOT):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+if str(COMPETITION_ROOT) not in sys.path:
+    sys.path.insert(0, str(COMPETITION_ROOT))
 
-from config.camera_config import *
-from config.vision_config import *
-from core.shared_frame_source import close_capture_source, open_or_start_capture_source
-from vision.detector import BuoyDetector
+camera_config = importlib.import_module(f"{PROJECT_PACKAGE}.config.camera_config")
+vision_config = importlib.import_module(f"{PROJECT_PACKAGE}.config.vision_config")
+shared_frame_source = importlib.import_module(f"{PROJECT_PACKAGE}.core.shared_frame_source")
+detector_module = importlib.import_module(f"{PROJECT_PACKAGE}.vision.detector")
+
+globals().update(
+    {
+        name: getattr(camera_config, name)
+        for name in dir(camera_config)
+        if name.isupper()
+    }
+)
+globals().update(
+    {
+        name: getattr(vision_config, name)
+        for name in dir(vision_config)
+        if name.isupper()
+    }
+)
+close_capture_source = shared_frame_source.close_capture_source
+open_or_start_capture_source = shared_frame_source.open_or_start_capture_source
+BuoyDetector = detector_module.BuoyDetector
 
 # ---------------- Settings ----------------
 LOG_INTERVAL_SEC = 2.0  # Terminal reporting interval (seconds)
 MAX_DEPTH_M = 40.0
 
 # JSON log settings
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "angle")
+LOG_DIR = os.path.join(str(PROJECT_ROOT), "logs", "angle")
 SESSION_START_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_FILE_PATH = os.path.join(LOG_DIR, f"angle_log_{SESSION_START_TS}.json")
 

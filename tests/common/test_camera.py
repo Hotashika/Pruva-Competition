@@ -1,19 +1,24 @@
+import importlib
 import os
 import sys
 import unittest
+from pathlib import Path
 
 import numpy as np
 
-COMPETITION_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROJECT_NAME = os.environ.get("COMPETITION_PROJECT", "../njord").lower()
-PROJECT_ROOT = os.path.join(COMPETITION_ROOT, PROJECT_NAME)
+COMPETITION_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_PACKAGE = Path(os.environ.get("COMPETITION_PROJECT", "njord")).name.lower()
 
-for path in (COMPETITION_ROOT, PROJECT_ROOT):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+if str(COMPETITION_ROOT) not in sys.path:
+    sys.path.insert(0, str(COMPETITION_ROOT))
 
-from config.camera_config import CAMERA_HEIGHT, CAMERA_WIDTH
-from core.shared_frame_source import close_capture_source, open_or_start_capture_source
+camera_config = importlib.import_module(f"{PROJECT_PACKAGE}.config.camera_config")
+shared_frame_source = importlib.import_module(f"{PROJECT_PACKAGE}.core.shared_frame_source")
+
+CAMERA_HEIGHT = camera_config.CAMERA_HEIGHT
+CAMERA_WIDTH = camera_config.CAMERA_WIDTH
+close_capture_source = shared_frame_source.close_capture_source
+open_or_start_capture_source = shared_frame_source.open_or_start_capture_source
 
 
 class TestCameraHardware(unittest.TestCase):

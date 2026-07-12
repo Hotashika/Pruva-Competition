@@ -3,7 +3,7 @@ import json
 import numpy as np
 from flask import Flask, Response
 
-from core import shared_state
+from njord.core import shared_state
 
 app = Flask(__name__)
 

@@ -9,12 +9,14 @@ import threading
 import time
 from multiprocessing import get_context
 
-from core import capture_proc
-from core import data_writer
-from servers import data_server
-
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
+if COMPETITION_ROOT not in sys.path:
+    sys.path.insert(0, COMPETITION_ROOT)
+
+from teknofest.core import capture_proc
+from teknofest.core import data_writer
+from teknofest.servers import data_server
 
 
 def launch_child_process(command):

@@ -5,9 +5,9 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from config.camera_config import CAMERA_WIDTH
-from config.vision_config import DEVICE, BUOY_MODEL_PATH, TOLERANCE_RATIO, TOLARANCE_DEG
-from vision.depth_utils import get_distance_from_bbox
+from teknofest.config.camera_config import CAMERA_WIDTH
+from teknofest.config.vision_config import DEVICE, BUOY_MODEL_PATH, TOLERANCE_RATIO, TOLARANCE_DEG
+from teknofest.vision.depth_utils import get_distance_from_bbox
 
 
 class BaseYOLODetector:
