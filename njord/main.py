@@ -8,12 +8,12 @@ import threading
 import time
 from multiprocessing import get_context
 
-from utils.mavlink_utilities import call_trigger_service
-
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
 if COMPETITION_ROOT not in sys.path:
     sys.path.insert(0, COMPETITION_ROOT)
+
+from utils.mavlink_utilities import call_trigger_service
 
 from njord.core import capture_proc
 from njord.core import data_writer
@@ -171,8 +171,10 @@ if __name__ == "__main__":
         njord_task1_path = os.path.join(PROJECT_ROOT, "missions", "task1_maneuvering_and_path_finding.py")
         njord_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_collision_avoidance.py")
         njord_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_docking.py")
+        njord_task4_path = os.path.join(PROJECT_ROOT, "missions", "task4_surprise.py")
         njord_task1_waypoint_path = os.path.join(PROJECT_ROOT, "waypoints", "njord1_2_maneuvering.waypoints")
         njord_task2_waypoint_path = os.path.join(PROJECT_ROOT, "waypoints", "njord_task2.waypoints")
+        njord_task4_waypoint_path = os.path.join(PROJECT_ROOT, "waypoints", "njord_task4.waypoints")
 
         ################################################################################################################
         mission_env_setup = (
@@ -181,7 +183,10 @@ if __name__ == "__main__":
             f"export MAVLINK_MISSION_1_WAYPOINT_PATH={shlex.quote(njord_task1_waypoint_path)} && "
             f"export MAVLINK_MISSION_2_PATH={shlex.quote(njord_task2_path)} && "
             f"export MAVLINK_MISSION_2_WAYPOINT_PATH={shlex.quote(njord_task2_waypoint_path)} && "
-            f"export MAVLINK_MISSION_3_PATH={shlex.quote(njord_task3_path)}"
+            f"export MAVLINK_MISSION_3_PATH={shlex.quote(njord_task3_path)} && "
+            f"export MAVLINK_MISSION_4_PATH={shlex.quote(njord_task4_path)} && "
+            f"export MAVLINK_MISSION_4_WAYPOINT_PATH={shlex.quote(njord_task4_waypoint_path)} && "
+            f"export NJORD_TASK4_WAYPOINT_PATH={shlex.quote(njord_task4_waypoint_path)}"
         )
 
         cmd_vision = (
@@ -202,9 +207,9 @@ if __name__ == "__main__":
         ################################################################################################################
         #   NJORD MISSION START
         #   Mission nodes are started by bridge when Pixhawk sends MAV_CMD_USER_1:
-        #   param1=1 -> M1, param1=2 -> M2, param1=3 -> M3, param1=4 -> unsupported.
+        #   param1=1 -> M1, param1=2 -> M2, param1=3 -> M3, param1=4 -> M4.
         ################################################################################################################
-        print(" -> NJORD missions are waiting for MAVLink start command (M1/M2/M3).\n")
+        print(" -> NJORD missions are waiting for MAVLink start command (M1/M2/M3/M4).\n")
         ################################################################################################################
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")

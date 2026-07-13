@@ -23,8 +23,9 @@ VIDEO_FPS = 5
 
 TASK_DETECTOR_MAP = {
     "task1": ("buoy",),
-    "task2": ("buoy", "vessel"),
+    "task2": ("vessel",),
     "task3": ("vessel",),
+    "task4": ("buoy",),
     "none": ("buoy", "vessel"),
 }
 

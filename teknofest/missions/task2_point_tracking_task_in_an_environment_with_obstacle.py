@@ -37,6 +37,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import rclpy
+from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
@@ -64,7 +65,9 @@ WAYPOINT_PATH = BASE_DIR / "waypoints" / "teknofest_task2.waypoints"
 # ============================================================
 DETECTION_TOPIC = "/vision/detections"
 DETECTION_STALE_SEC = 0.75
+VISION_HEALTH_TIMEOUT_SEC = 2.0
 VISION_WARNING_SEC = 5.0
+ACTIVE_TASK_NAME = "task2"
 
 # Model yalnızca engel dubasını algılıyorsa boş bırakılabilir; bu durumda geçerli
 # mesafesi olan bütün tespitler engel kabul edilir.
@@ -78,8 +81,10 @@ MIN_OBSTACLE_CONFIDENCE = 0.45
 # ============================================================
 GPS_TIMEOUT_SEC = 2.0
 HEADING_TIMEOUT_SEC = 2.0
+BRIDGE_STATE_TIMEOUT_SEC = 2.0
 GEOFENCE_RADIUS_M = 150.0
 MIN_VALID_ABS_COORD = 1e-6
+HOLD_MODE_NAME = "HOLD"
 
 # ============================================================
 # KAÇINMA PARAMETRELERİ
@@ -127,6 +132,11 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.last_heading_time = None
         self.home_lat = None
         self.home_lon = None
+        self.bridge_connected = False
+        self.bridge_mode = None
+        self.last_bridge_state_time = None
+        self.hold_mode_requested = False
+        self.hold_mode_future = None
 
         self.last_angular_z = 0.0
         self.finished = False
@@ -157,6 +167,59 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.current_heading = float(heading) % 360.0
         self.last_heading_time = time.monotonic()
 
+    def update_bridge_state(self, state_text):
+        state_map = {}
+        for part in str(state_text).split(","):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            state_map[key.strip().lower()] = value.strip()
+
+        connected_text = state_map.get("connected")
+        if connected_text is not None:
+            self.bridge_connected = connected_text.lower() == "true"
+
+        mode_text = state_map.get("mode")
+        if mode_text:
+            self.bridge_mode = mode_text.upper()
+
+        self.last_bridge_state_time = time.monotonic()
+
+    def _request_hold_mode(self):
+        if self.hold_mode_requested:
+            return
+
+        self.hold_mode_requested = True
+        request = SetMode.Request()
+        request.base_mode = 0
+        request.custom_mode = HOLD_MODE_NAME
+
+        try:
+            self.hold_mode_future = self.clients.set_mode_client.call_async(request)
+            self.hold_mode_future.add_done_callback(self._hold_mode_done)
+            self.logger.warn(f"Failsafe: {HOLD_MODE_NAME} mode requested.")
+        except Exception as exc:  # noqa: BLE001 - failsafe request must be logged
+            self.logger.error(f"Failed to request {HOLD_MODE_NAME} mode: {exc}")
+
+    def _hold_mode_done(self, future):
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001 - ROS future error must be logged
+            self.logger.error(f"{HOLD_MODE_NAME} mode request failed: {exc}")
+            return
+
+        if response is not None and getattr(response, "mode_sent", False):
+            self.logger.warn(f"{HOLD_MODE_NAME} mode request accepted; awaiting telemetry confirmation.")
+        else:
+            self.logger.error(f"{HOLD_MODE_NAME} mode request rejected.")
+
+    def _enter_failsafe(self, reason):
+        if self.state != MissionState.FAILSAFE:
+            self.logger.error(reason)
+        self.state = MissionState.FAILSAFE
+        stop_vehicle(self.topics.cmd_vel_pub)
+        self._request_hold_mode()
+
     # ========================================================
     # GÜVENLİK
     # ========================================================
@@ -166,18 +229,32 @@ class Task2PointTrackingWithObstacleAvoidance:
         if self.last_gps_time is None or self.last_heading_time is None:
             return False
 
-        if now - self.last_gps_time > GPS_TIMEOUT_SEC:
-            self.logger.error(
-                f"GPS verisi {GPS_TIMEOUT_SEC:.1f} saniyeden uzun süredir gelmiyor. FAILSAFE."
+        if self.last_bridge_state_time is None:
+            return False
+
+        if now - self.last_bridge_state_time > BRIDGE_STATE_TIMEOUT_SEC:
+            self._enter_failsafe(
+                f"Bridge state {BRIDGE_STATE_TIMEOUT_SEC:.1f} saniyeden uzun suredir gelmiyor. "
+                "FAILSAFE + HOLD."
             )
-            self.state = MissionState.FAILSAFE
+            return False
+
+        if not self.bridge_connected:
+            self._enter_failsafe("MAVLink bridge baglantisi kesildi. FAILSAFE + HOLD.")
+            return False
+
+        if now - self.last_gps_time > GPS_TIMEOUT_SEC:
+            self._enter_failsafe(
+                f"GPS verisi {GPS_TIMEOUT_SEC:.1f} saniyeden uzun suredir gelmiyor. "
+                "FAILSAFE + HOLD."
+            )
             return False
 
         if now - self.last_heading_time > HEADING_TIMEOUT_SEC:
-            self.logger.error(
-                f"Heading verisi {HEADING_TIMEOUT_SEC:.1f} saniyeden uzun süredir gelmiyor. FAILSAFE."
+            self._enter_failsafe(
+                f"Heading verisi {HEADING_TIMEOUT_SEC:.1f} saniyeden uzun suredir gelmiyor. "
+                "FAILSAFE + HOLD."
             )
-            self.state = MissionState.FAILSAFE
             return False
 
         return True
@@ -194,11 +271,10 @@ class Task2PointTrackingWithObstacleAvoidance:
         )
 
         if distance_from_home > GEOFENCE_RADIUS_M:
-            self.logger.error(
+            self._enter_failsafe(
                 f"Geofence ihlali: home noktasından {distance_from_home:.1f} m uzaklıkta "
-                f"(limit={GEOFENCE_RADIUS_M:.1f} m). FAILSAFE."
+                f"(limit={GEOFENCE_RADIUS_M:.1f} m). FAILSAFE + HOLD."
             )
-            self.state = MissionState.FAILSAFE
             return False
 
         return True
@@ -493,9 +569,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             return
 
         if not self.waypoints:
-            self.logger.error("Waypoint listesi boş. Araç durduruldu.")
-            self.state = MissionState.FAILSAFE
-            stop_vehicle(self.topics.cmd_vel_pub)
+            self._enter_failsafe("Waypoint listesi bos. FAILSAFE + HOLD.")
             return
 
         if self.current_target_index >= len(self.waypoints):
@@ -533,9 +607,9 @@ class Task2PointTrackingWithObstacleAvoidance:
         # ----------------------------------------------------
         if self.state == MissionState.AVOIDING:
             if self.avoidance_target is None:
-                self.logger.error("AVOIDING durumunda geçici waypoint yok. FAILSAFE.")
-                self.state = MissionState.FAILSAFE
-                stop_vehicle(self.topics.cmd_vel_pub)
+                self._enter_failsafe(
+                    "AVOIDING durumunda gecici waypoint yok. FAILSAFE + HOLD."
+                )
                 return
 
             reached_avoidance_wp = self._navigate_to_gps_target(
@@ -633,8 +707,10 @@ class Task2Node(Node):
             self.detection_callback,
             detection_qos,
         )
+        self.active_task_pub = self.create_publisher(String, "/mission/active_task", 10)
 
         self.control_timer = self.create_timer(0.1, self.timer_callback)
+        self.active_task_timer = self.create_timer(1.0, self.publish_active_task)
 
     # ========================================================
     # CALLBACKS
@@ -666,7 +742,13 @@ class Task2Node(Node):
         self.task.update_heading(heading)
 
     def state_callback(self, msg):
-        self.bridge_connected = "connected=True" in msg.data
+        self.task.update_bridge_state(msg.data)
+        self.bridge_connected = self.task.bridge_connected
+
+    def publish_active_task(self):
+        message = String()
+        message.data = ACTIVE_TASK_NAME
+        self.active_task_pub.publish(message)
 
     @staticmethod
     def _parse_detections_payload(payload):
@@ -708,6 +790,14 @@ class Task2Node(Node):
 
         return list(self.latest_detections)
 
+    def _vision_is_healthy(self):
+        if self.last_detection_message_time is None:
+            return False
+        return (
+            time.monotonic() - self.last_detection_message_time
+            <= VISION_HEALTH_TIMEOUT_SEC
+        )
+
     # ========================================================
     # BAŞLANGIÇ BEKLEMELERİ
     # ========================================================
@@ -741,11 +831,59 @@ class Task2Node(Node):
 
         return False
 
+    def wait_for_vision(self, timeout_sec=30.0):
+        deadline = time.monotonic() + timeout_sec
+
+        while rclpy.ok() and time.monotonic() < deadline:
+            self.publish_active_task()
+            if self._vision_is_healthy():
+                self.get_logger().info("Vision detection stream is healthy.")
+                return True
+
+            self.get_logger().info(
+                f"{DETECTION_TOPIC} vision stream bekleniyor...",
+                throttle_duration_sec=2.0,
+            )
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        return False
+
+    def wait_for_hold_confirmation(self, timeout_sec=3.0):
+        self.task._request_hold_mode()
+
+        future = self.task.hold_mode_future
+        if future is not None and not future.done():
+            rclpy.spin_until_future_complete(self, future, timeout_sec=min(timeout_sec, 2.0))
+
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self.task.bridge_mode == HOLD_MODE_NAME:
+                self.get_logger().warn(f"Failsafe mode confirmed: {HOLD_MODE_NAME}.")
+                return True
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        self.get_logger().error(
+            f"Failsafe mode could not be confirmed as {HOLD_MODE_NAME}; "
+            f"last reported mode={self.task.bridge_mode}."
+        )
+        return False
+
     # ========================================================
     # ANA TIMER
     # ========================================================
     def timer_callback(self):
         if not self.mission_active:
+            return
+
+        if not self._vision_is_healthy():
+            age_text = (
+                "never received"
+                if self.last_detection_message_time is None
+                else f"{time.monotonic() - self.last_detection_message_time:.2f}s old"
+            )
+            self.task._enter_failsafe(
+                f"Vision stream unhealthy ({age_text}). FAILSAFE + HOLD."
+            )
             return
 
         if (
@@ -765,11 +903,7 @@ class Task2Node(Node):
             self.task.update(detections=current_detections)
         except Exception as exc:  # noqa: BLE001 - failsafe için geniş yakalama
             self.get_logger().error(f"Görev timer hatası: {exc}")
-            try:
-                stop_vehicle(self.mission_topics.cmd_vel_pub)
-            except Exception as stop_exc:  # noqa: BLE001
-                self.get_logger().error(f"Araç durdurulamadı: {stop_exc}")
-            self.task.state = MissionState.FAILSAFE
+            self.task._enter_failsafe(f"Unexpected Task 2 control error: {exc}")
 
 
 def main(args=None):
@@ -786,6 +920,12 @@ def main(args=None):
         if not node.wait_for_valid_navigation_data(timeout_sec=30.0):
             node.get_logger().error(
                 "Geçerli GPS/heading verisi yok. Görev başlatılmadı."
+            )
+            return
+
+        if not node.wait_for_vision(timeout_sec=30.0):
+            node.get_logger().error(
+                "Vision detection stream hazir degil. Gorev ARM edilmeden durduruldu."
             )
             return
 
@@ -810,6 +950,7 @@ def main(args=None):
             return
 
         node.mission_active = True
+        node.publish_active_task()
         node.get_logger().info("Görev 2 kontrol döngüsü başladı.")
 
         while (
@@ -824,6 +965,8 @@ def main(args=None):
 
         if node.task.state == MissionState.FAILSAFE:
             node.get_logger().error("Görev FAILSAFE nedeniyle sonlandırıldı.")
+            node.wait_for_hold_confirmation(timeout_sec=3.0)
+            return
         else:
             node.get_logger().info("Görev tamamlandı; araç durduruldu.")
 
