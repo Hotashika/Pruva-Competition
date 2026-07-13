@@ -28,7 +28,7 @@ except ImportError:
 TASK_DETECTOR_MAP = {
     "task1": {"buoy"},
     "task2": {"buoy", "vessel"} if VESSEL_MODEL_PATH and VesselDetector else {"buoy"},
-    "task3": {"vessel"} if VESSEL_MODEL_PATH and VesselDetector else set(),
+    "task3": {"buoy"},  # DÜZELTME: hedef duba, "vessel" değil "buoy" olmalı
 }
 
 DETECTOR_REGISTRY = {

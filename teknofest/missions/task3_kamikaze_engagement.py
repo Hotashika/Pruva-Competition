@@ -22,6 +22,9 @@ from utils.mavlink_utilities import (
     calculate_gps_distance, publish_cmd_vel,
 )
 
+# YENİ: arama aşaması bu modülden geliyor
+from teknofest.missions.arama import AramaGorevi
+
 # ============================================================
 # GÜVENLİK PARAMETRELERİ
 # ============================================================
@@ -30,6 +33,21 @@ GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından maksimum uzaklık sınır
 
 DRIVE_MODE = "GUIDED"
 
+# ------------------------------------------------------------
+# ÇARPILACAK DUBA RENGİ
+# ------------------------------------------------------------
+# Yarışma günü renk hakem tarafından belirlenir ve 'carpilacak_duba'
+# parametresiyle dışarıdan verilir (ör. --ros-args -p carpilacak_duba:=black).
+#
+# ŞİMDİLİK: Gerçek sahada/teknede test yapabilmek için geçici bir varsayılan
+# renk tanımlıyoruz -> "red". Yani parametre hiç verilmezse sistem artık
+# hata verip durmuyor, doğrudan red_buoy ile çalışmaya başlıyor.
+# Yarışma günü bu varsayılanı kullanmayın -- hakemin söylediği rengi MUTLAKA
+# parametre olarak açıkça verin, aşağıdaki TEST_DEFAULT_TARGET_COLOR'ı
+# değiştirmeyin (o gün unutma riskini azaltmak için).
+TEST_DEFAULT_TARGET_COLOR = "red"
+VALID_TARGET_COLORS = ("red", "green", "black")
+
 
 class MissionState(Enum):
     INIT = auto()  # Başlangıç konumu bekleniyor
@@ -37,13 +55,17 @@ class MissionState(Enum):
 
 
 class Task3KamikazeEngagement:
-    def __init__(self, node, mission_topics, mission_clients):
+    def __init__(self, node, mission_topics, mission_clients, target_class):
         self.node = node
         self.is_armed = False
         self.logger = node.get_logger()
 
         self.topics = mission_topics
         self.clients = mission_clients
+
+        # Hedef duba sınıfı (ör. "red_buoy"), Task3Node üzerinden,
+        # 'carpilacak_duba' ROS2 parametresinden gelir. ZORUNLUDUR.
+        self.target_class = target_class
 
         # Anlık konum verileri
         self.current_lat = None
@@ -62,6 +84,10 @@ class Task3KamikazeEngagement:
         self.bridge_armed = None
         self.bridge_mode = None
 
+        # Arama aşaması nesnesi. handle_vision_detections ile AYNI
+        # target_class'ı kullanıyor, böylece renk her yerde tutarlı olur.
+        self.arama = AramaGorevi(node, mission_topics, target_class=self.target_class)
+
     def update_gps(self, lat, lon, heading):
         self.current_lat = lat
         self.current_lon = lon
@@ -73,6 +99,8 @@ class Task3KamikazeEngagement:
             self.home_lat = lat
             self.home_lon = lon
             self.logger.info(f"Home konumu ayarlandı: {lat:.6f}, {lon:.6f}")
+
+        self.arama.update_gps(lat, lon, heading)
 
     def _check_watchdog(self):
         now = time.monotonic()
@@ -127,15 +155,14 @@ class Task3KamikazeEngagement:
 
     def handle_vision_detections(self, detections):
         if not detections:
-            # TODO: ARAMA ALGORİTMASI
+            stop_vehicle(self.topics.cmd_vel_pub)
             return
 
         targets = [
             d for d in detections
-            if d.get("class") == "red_buoy"
-            # TODO: BUOY RENGİ YKİ ÜZERİNDEN GELECEK
-               and d.get("distance") is not None
-               and d.get("Buoy angle: ") is not None
+            if d.get("class") == self.target_class
+            and d.get("distance") is not None
+            and d.get("Buoy angle: ") is not None
         ]
 
         if not targets:
@@ -161,10 +188,6 @@ class Task3KamikazeEngagement:
             linear_x=linear_x,
             angular_z=angular_z,
         )
-
-
-
-
 
     # noinspection D
     def update(self, detections):
@@ -193,6 +216,11 @@ class Task3KamikazeEngagement:
             stop_vehicle(self.topics.cmd_vel_pub)
             return
 
+        # Hedef bulunana kadar ARAMA çalışır; bulununca YAKLAŞMA/ÇARPMA'ya geçilir
+        if not self.arama.finished:
+            self.arama.update(detections)
+            return
+
         self.handle_vision_detections(detections)
 
 
@@ -203,6 +231,39 @@ class Task3Node(Node):
     def __init__(self):
         super().__init__('task3_kamikaze_engagement_node')
         self.get_logger().info("Task 3 Kamikaze Engagement düğümü başlatılıyor...")
+
+        # ------------------------------------------------------
+        # ÇARPILACAK DUBA rengi, node çalıştırılırken dışarıdan verilir.
+        # Örnek kullanım:
+        #   ros2 run teknofest task3_kamikaze_engagement --ros-args -p carpilacak_duba:=black
+        #
+        # ŞİMDİLİK (gerçek sahada/teknede test aşaması): parametre hiç
+        # verilmezse ROS2, declare_parameter'a burada verdiğimiz
+        # TEST_DEFAULT_TARGET_COLOR ("red") değerini otomatik/sessizce
+        # kullanır -- yani şu an parametre vermeden de doğrudan
+        # test edebilirsiniz.
+        #
+        # Geçersiz bir değer girilirse (red/green/black dışında bir şey,
+        # ör. yazım hatasıyla "blue" veya "mavi") görev YİNE DE
+        # BAŞLATILMAZ -- hata basılır, motorlar arm edilmez.
+        #
+        # YARIŞMA GÜNÜ: Hakemin söylediği rengi MUTLAKA parametre olarak
+        # açıkça verin (ör. carpilacak_duba:=black), varsayılana güvenmeyin.
+        # ------------------------------------------------------
+        self.declare_parameter('carpilacak_duba', TEST_DEFAULT_TARGET_COLOR)
+        color = self.get_parameter('carpilacak_duba').get_parameter_value().string_value
+        color = color.strip().lower()
+
+        if color not in VALID_TARGET_COLORS:
+            self.get_logger().error(
+                f"'carpilacak_duba' parametresi geçersiz (girilen: '{color}'). "
+                f"Geçerli değerler: {VALID_TARGET_COLORS}. "
+                f"Örnek: --ros-args -p carpilacak_duba:=red"
+            )
+            raise SystemExit(1)
+
+        self.target_class = f"{color}_buoy"
+        self.get_logger().info(f"Bu tur için çarpılacak duba: {self.target_class}")
 
         self.mission_clients = create_mission_clients(self)
         wait_for_mission_services(self, self.mission_clients)
@@ -221,7 +282,12 @@ class Task3Node(Node):
             10
         )
 
-        self.task = Task3KamikazeEngagement(self, self.mission_topics, self.mission_clients)
+        self.task = Task3KamikazeEngagement(
+            self,
+            self.mission_topics,
+            self.mission_clients,
+            target_class=self.target_class,
+        )
         self.current_heading = 0.0
         self.current_detections = []
         self.current_vision_frame_id = None
@@ -273,7 +339,14 @@ class Task3Node(Node):
 # ============================================================
 def main(args=None):
     rclpy.init(args=args)
-    node = Task3Node()
+
+    try:
+        node = Task3Node()
+    except SystemExit:
+        # 'carpilacak_duba' parametresi eksik/geçersizdi; Task3Node.__init__
+        # içinde zaten hata mesajı basıldı. Görev başlatılmadan çıkılıyor.
+        rclpy.shutdown()
+        return
 
     try:
         node.get_logger().info(f"Aracı {DRIVE_MODE} moduna alınıyor...")
