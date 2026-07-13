@@ -421,7 +421,8 @@ def publish_cmd_vel(cmd_vel_pub, linear_x, angular_z):
 
     angular_z:
         sag/sol donus komutu
-        Açıklama: Pozitif degerler saat yönünün tersine (sola), negatif degerler saat yönünde (sağa) donus anlamina gelir.
+        Açıklama: Bridge sözleşmesinde pozitif değerler sağa/starboard,
+        negatif değerler sola/port dönüş anlamına gelir.
     """
 
     msg = Twist()
@@ -518,7 +519,10 @@ def align_heading_to_gps_target(
             )
         return True
 
-    angular_z = max(-max_angular_z, min(max_angular_z, -kp * heading_error))
+    # Bridge, positive angular_z komutunu pozitif yaw (starboard/right) olarak
+    # uygular. Compass bearing hatasi da hedef sagdaysa pozitiftir; bu nedenle
+    # iki isaret dogrudan ayni yönde kullanilmalidir.
+    angular_z = max(-max_angular_z, min(max_angular_z, kp * heading_error))
     publish_cmd_vel(cmd_vel_pub, linear_x=0.0, angular_z=angular_z)
 
     if logger is not None:

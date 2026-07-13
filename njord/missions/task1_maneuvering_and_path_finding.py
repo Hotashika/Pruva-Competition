@@ -15,6 +15,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 from utils.mavlink_utilities import (
+    align_heading_to_gps_target,
     create_mission_topics,
     create_mission_clients,
     wait_for_mission_services,
@@ -37,6 +38,8 @@ ACTIVE_TASK_NAME = "task1"
 GPS_TIMEOUT_SEC = 2.0  # Bu sure GPS gelmezse dur ve HOLD moda gecmeyi dene
 HEADING_TIMEOUT_SEC = 2.0  # Bu sure heading gelmezse dur ve HOLD moda gecmeyi dene
 GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
+WAYPOINT_SETTLE_SEC = 0.75  # Her ana GPS noktasinda kesin durus suresi
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0  # Kucuk heading farklarinda gereksiz salinimi onler
 
 AVOID_ENTER_DIST_M = 3.0  # Kaçınma tetiklenme mesafesi
 AVOID_EXIT_DIST_M = 5.0  # Kaçınma için dikkate alınacak maksimum engel mesafesi
@@ -96,7 +99,7 @@ class Task1Maneuvering:
         # Anlık konum verileri
         self.current_lat = None
         self.current_lon = None
-        self.current_heading = 0.0
+        self.current_heading = None
         self.last_angular_z = 0.0
         self.finished = False
 
@@ -109,7 +112,10 @@ class Task1Maneuvering:
         self.avoiding_class = None  # RELEVANT_OBSTACLE_CLASSES icinden biri veya None
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
-        self.avoid_turn_direction = 0.0  # -1.0 right/starboard, +1.0 left/port
+        self.avoid_turn_direction = 0.0  # +1.0 right/starboard, -1.0 left/port
+        self.aligned_target_key = None
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
         self.waiting_for_sensor_text = "GPS Data"
         self.hold_mode_requested = False
         self.hold_mode_future = None
@@ -300,33 +306,30 @@ class Task1Maneuvering:
         return min(candidates, key=lambda item: item[0])[1]
 
     def _avoid_turn_direction_for_obstacle(self, obstacle):
-        """Kaçınma için dönüş yönünü seçer: -1 sağ/starboard, +1 sol/port."""
+        """Kaçınma yönü: kırmızı/east sağ, yeşil/west sol."""
         obstacle_class = obstacle.get("class")
 
         if obstacle_class == "red_buoy":
-            return -1.0
-        if obstacle_class == "green_buoy":
             return 1.0
-
-        if obstacle_class in ("east_cardinal", "west_cardinal"):
-            desired_east = 1.0 if obstacle_class == "east_cardinal" else -1.0
-            heading_rad = math.radians(self.current_heading)
-            starboard_east_component = math.cos(heading_rad)
-            side_score = desired_east * starboard_east_component
-            if abs(side_score) >= 0.15:
-                return -1.0 if side_score > 0 else 1.0
+        if obstacle_class == "green_buoy":
+            return -1.0
+        if obstacle_class == "east_cardinal":
+            return 1.0
+        if obstacle_class == "west_cardinal":
+            return -1.0
 
         angle_deg = self._detection_angle_deg(obstacle)
         if angle_deg is not None:
-            return 1.0 if angle_deg > 0 else -1.0
+            # Engel sagdaysa sola, soldaysa saga acil.
+            return -1.0 if angle_deg > 0 else 1.0
 
-        return -1.0
+        return 1.0
 
     @staticmethod
     def _avoid_direction_text(turn_direction, obstacle_class):
-        if turn_direction < 0:
+        if turn_direction > 0:
             turn_text = "starboard/right"
-        elif turn_direction > 0:
+        elif turn_direction < 0:
             turn_text = "port/left"
         else:
             turn_text = "straight"
@@ -346,9 +349,9 @@ class Task1Maneuvering:
         if angle_deg is None:
             return False
 
-        if self.avoid_turn_direction < 0:
-            return angle_deg < -AVOID_CLEAR_ANGLE_DEG
         if self.avoid_turn_direction > 0:
+            return angle_deg < -AVOID_CLEAR_ANGLE_DEG
+        if self.avoid_turn_direction < 0:
             return angle_deg > AVOID_CLEAR_ANGLE_DEG
         return abs(angle_deg) > AVOID_CLEAR_ANGLE_DEG
 
@@ -357,6 +360,7 @@ class Task1Maneuvering:
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = 0.0
+        self.aligned_target_key = None
         self.state = MissionState.NAVIGATING
 
     def _publish_avoidance_maneuver(self):
@@ -367,6 +371,40 @@ class Task1Maneuvering:
             linear_x=AVOID_LINEAR_X,
             angular_z=angular_z
         )
+
+    def _begin_waypoint_hold(self, waypoint_name):
+        """Ana GPS noktasinda araci durdurup heading gecisi icin sabitler."""
+        stop_vehicle(self.topics.cmd_vel_pub)
+        self.waypoint_hold_until = time.monotonic() + WAYPOINT_SETTLE_SEC
+        self.waypoint_hold_name = waypoint_name
+        self.aligned_target_key = None
+        self.logger.info(
+            f"{waypoint_name} reached; vehicle stopped for "
+            f"{WAYPOINT_SETTLE_SEC:.2f}s before next heading alignment."
+        )
+
+    def _waypoint_hold_active(self):
+        """Planli waypoint durusu devam ediyorsa sifir hareket komutu basar."""
+        if self.waypoint_hold_until is None:
+            return False
+
+        remaining = self.waypoint_hold_until - time.monotonic()
+        if remaining > 0.0:
+            publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
+            self.logger.info(
+                f"Holding at {self.waypoint_hold_name}: {remaining:.2f}s remaining.",
+                throttle_duration_sec=0.5,
+            )
+            return True
+
+        completed_name = self.waypoint_hold_name
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
+        self.logger.info(
+            f"{completed_name} stop stabilized; proceeding to next mission step."
+        )
+        return False
+
     # GPS hedefine MAVLink position target komutu basar.
     def _set_position_to_gps_target(self, target_lat, target_lon, target_name, tolerance_m):
         """Verilen GPS hedefine SET_POSITION_TARGET_GLOBAL_INT ile gider."""
@@ -378,6 +416,26 @@ class Task1Maneuvering:
         if distance < tolerance_m:
             self.logger.info(f"Reached {target_name}! Remaining: {distance:.2f}m")
             return True
+
+        target_key = (
+            target_name,
+            round(float(target_lat), 7),
+            round(float(target_lon), 7),
+        )
+        if self.aligned_target_key != target_key:
+            if not align_heading_to_gps_target(
+                    self.topics.cmd_vel_pub,
+                    self.current_lat,
+                    self.current_lon,
+                    self.current_heading,
+                    target_lat,
+                    target_lon,
+                    logger=self.logger,
+                    target_name=target_name,
+                    tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
+            ):
+                return False
+            self.aligned_target_key = target_key
 
         publish_set_position(
             self.topics.position_target_pub,
@@ -420,6 +478,9 @@ class Task1Maneuvering:
         if not self.waypoints:
             self.logger.warn("Mission list is empty! Please check the route.", throttle_duration_sec=5.0)
             stop_vehicle(self.topics.cmd_vel_pub)
+            return
+
+        if self._waypoint_hold_active():
             return
 
         if self.current_target_index >= len(self.waypoints):
@@ -504,6 +565,7 @@ class Task1Maneuvering:
         if self.state == MissionState.INIT:
             if self.current_target_index == 0 and distance < (self.waypoint_tolerance + 2.0):
                 self.logger.info("WP0 (Start) point verified, mission starting.")
+                self._begin_waypoint_hold("WP0 (Start)")
                 self.current_target_index += 1
                 self.state = MissionState.NAVIGATING
                 return
@@ -523,6 +585,7 @@ class Task1Maneuvering:
                 f"WP{self.current_target_index}",
                 self.waypoint_tolerance
         ):
+            self._begin_waypoint_hold(f"WP{self.current_target_index}")
             self.current_target_index += 1
             return
 
@@ -566,14 +629,16 @@ class Task1Node(Node):
         self.task = Task1Maneuvering(self, self.mission_topics, self.mission_clients)
 
         # Anlık Yönelim Değişkeni (GPS Callback'e aktarmak için)
-        self.current_heading = 0.0
+        self.current_heading = None
         self.bridge_connected = False
         self.mission_active = False
         self.valid_gps_received = False
+        self.valid_heading_received = False
 
         # 4. Ana Kontrol Döngüsünü Başlat (Saniyede 10 kez çalışır: 0.1 sn)
         self.control_timer = self.create_timer(0.1, self.timer_callback)
         self.active_task_timer = self.create_timer(1.0, self.publish_active_task)
+        self.publish_active_task()
 
     # Vision node'a aktif gorevin task1 oldugunu bildirir.
     def publish_active_task(self):
@@ -629,7 +694,21 @@ class Task1Node(Node):
     # Heading mesajini saklar ve watchdog zamanini tazeler.
     def heading_callback(self, msg):
         """Araçtan gelen Float32 yön verisini dinler."""
-        self.current_heading = msg.data
+        try:
+            heading = float(msg.data)
+        except (TypeError, ValueError):
+            heading = float("nan")
+
+        if not math.isfinite(heading):
+            self.get_logger().warn(
+                "Gecersiz heading verisi yok sayiliyor.",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        self.current_heading = heading % 360.0
+        self.valid_heading_received = True
+        self.task.current_heading = self.current_heading
         self.task.last_heading_time = time.monotonic()
 
     # Bridge durumundan MAVLink baglantisinin hazir olup olmadigini izler.
@@ -654,16 +733,35 @@ class Task1Node(Node):
         return False
 
     # ARM oncesi sifir olmayan gecerli GPS konumu bekler.
-    def wait_for_valid_gps(self, timeout_sec=30.0):
-        """Mission ARM olmadan once gercek GPS konumu bekler."""
+    def wait_for_valid_navigation_data(self, timeout_sec=30.0):
+        """Mission ARM olmadan once gercek GPS ve heading verisini bekler."""
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and time.monotonic() < deadline:
-            if self.valid_gps_received:
+            if self.valid_gps_received and self.valid_heading_received:
                 return True
 
             self.get_logger().info(
-                "Gecerli GPS konumu bekleniyor...",
+                "Gecerli GPS ve heading verisi bekleniyor...",
                 throttle_duration_sec=2.0
+            )
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        return False
+
+    def wait_for_vision(self, timeout_sec=30.0):
+        """ARM oncesi vision node'dan en az bir guncel frame mesaji bekler."""
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and time.monotonic() < deadline:
+            if (
+                    self.last_detection_time is not None
+                    and time.monotonic() - self.last_detection_time
+                    <= VISION_DETECTION_TIMEOUT_SEC
+            ):
+                return True
+
+            self.get_logger().info(
+                "Vision heartbeat bekleniyor...",
+                throttle_duration_sec=2.0,
             )
             rclpy.spin_once(self, timeout_sec=0.1)
 
@@ -680,6 +778,20 @@ class Task1Node(Node):
         """
         # Vision cache guncel degilse bos liste doner; eski detection ile manevra yapilmaz.
         if not self.mission_active:
+            return
+
+        vision_age = (
+            None
+            if self.last_detection_time is None
+            else time.monotonic() - self.last_detection_time
+        )
+        if vision_age is None or vision_age > VISION_DETECTION_TIMEOUT_SEC:
+            stop_vehicle(self.mission_topics.cmd_vel_pub)
+            age_text = "hic gelmedi" if vision_age is None else f"{vision_age:.2f}s eski"
+            self.task._enter_failsafe(
+                f"VISION HEARTBEAT LOST ({age_text})! FAILSAFE + HOLD.",
+                request_hold=True,
+            )
             return
 
         current_detections = self._current_detections()
@@ -710,8 +822,12 @@ def main(args=None):
             node.get_logger().error("Bridge MAVLink baglantisi hazir degil! Mission not starting.")
             return
 
-        if not node.wait_for_valid_gps(timeout_sec=30.0):
-            node.get_logger().error("Gecerli GPS konumu yok! Mission not starting.")
+        if not node.wait_for_valid_navigation_data(timeout_sec=30.0):
+            node.get_logger().error("Gecerli GPS/heading verisi yok! Mission not starting.")
+            return
+
+        if not node.wait_for_vision(timeout_sec=30.0):
+            node.get_logger().error("Vision heartbeat yok! Mission not starting.")
             return
 
         node.get_logger().info("Setting vehicle to GUIDED mode...")
