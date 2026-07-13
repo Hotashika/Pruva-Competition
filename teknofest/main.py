@@ -124,6 +124,9 @@ if __name__ == "__main__":
     frame_ready_event = None
     p_bridge = None
     p_vision = None
+    p_teknofest_task1 = None
+    p_teknofest_task2 = None
+    p_teknofest_task3 = None
 
     try:
         run_startup_cleanup()
@@ -224,11 +227,18 @@ if __name__ == "__main__":
     finally:
         print("[SYSTEM] Cleaning process was started...")
 
-        try:
-            stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
-            stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
-        except Exception as exc:
-            print(f"[SYSTEM] Error while sub-process shut down: {exc}")
+        # Mission once kapanir; SIGINT handler'i bridge hâlâ ayaktayken araci
+        # durdurup DISARM eder. Ardindan vision, en son bridge kapatilir.
+        subprocesses = (
+            ("TEKNOFEST Mission 1 Node", p_teknofest_task1, 7.0),
+            ("Vision Node", p_vision, 3.0),
+            ("Bridge Node", p_bridge, 5.0),
+        )
+        for process_name, process, timeout_sec in subprocesses:
+            try:
+                stop_child_process(process_name, process, timeout_sec=timeout_sec)
+            except Exception as exc:
+                print(f"[SYSTEM] Error while stopping {process_name}: {exc}")
 
         print("[SYSTEM] Sub-processes closed.")
 

@@ -1,3 +1,5 @@
+import json
+import math
 import sys
 import time
 from enum import Enum, auto
@@ -9,9 +11,12 @@ if str(REPO_ROOT) not in sys.path:
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from std_msgs.msg import String
 
 # Yardımcı fonksiyonlar (Kendi yazdıklarımız ve mavlink_utilities içindekiler)
 from utils.mavlink_utilities import (
+    align_heading_to_gps_target,
     create_mission_topics,
     create_mission_clients,
     wait_for_mission_services,
@@ -23,6 +28,7 @@ from utils.mavlink_utilities import (
     calculate_gps_distance,
 )
 from utils.read_waypoints import parse_qgc_waypoints
+from missions.utils.orange_boundary_guard import OrangeBoundaryGuard
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WAYPOINT_PATH = BASE_DIR / "waypoints" / "teknofest_task1.waypoints"
@@ -33,6 +39,9 @@ WAYPOINT_PATH = BASE_DIR / "waypoints" / "teknofest_task1.waypoints"
 GPS_TIMEOUT_SEC = 2.0  # Bu süre GPS/heading gelmezse dur
 GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
 MIN_VALID_ABS_COORD = 1e-6
+
+DETECTION_TOPIC = "/vision/detections"
+DETECTION_STALE_SEC = 0.75
 
 
 class MissionState(Enum):
@@ -65,9 +74,11 @@ class Task1Maneuvering:
         # Anlık konum verileri
         self.current_lat = None
         self.current_lon = None
-        self.current_heading = 0.0
+        self.current_heading = None
         self.last_angular_z = 0.0
         self.finished = False
+        self.boundary_guard = OrangeBoundaryGuard()
+        self.aligned_target_key = None
 
         # --- Güvenlik / state machine alanları ---
         self.state = MissionState.INIT
@@ -76,19 +87,22 @@ class Task1Maneuvering:
         self.home_lat = None
         self.home_lon = None
 
-    def update_gps(self, lat, lon, heading):
-        """ROS 2 Node'undan gelen güncel GPS ve yönelim verilerini kaydeder."""
+    def update_gps(self, lat, lon):
+        """ROS 2 Node'undan gelen güncel GPS verisini kaydeder."""
         self.current_lat = lat
         self.current_lon = lon
-        self.current_heading = heading
         self.last_gps_time = time.monotonic()
-        self.last_heading_time = time.monotonic()
 
         if self.home_lat is None:
             # İlk GPS okuması home/geofence merkezi olarak kaydedilir
             self.home_lat = lat
             self.home_lon = lon
             self.logger.info(f"Home position set: {lat:.6f}, {lon:.6f}")
+
+    def update_heading(self, heading):
+        """Koridor hedefini global GPS'e çevirmek için güncel heading'i kaydeder."""
+        self.current_heading = float(heading) % 360.0
+        self.last_heading_time = time.monotonic()
 
     def _check_watchdog(self):
         """GPS/heading verisi zamanında gelmiyorsa FAILSAFE'e geç. True dönerse devam edilebilir."""
@@ -102,6 +116,17 @@ class Task1Maneuvering:
             if self.state != MissionState.FAILSAFE:
                 self.logger.error(
                     f"GPS DATA NOT RECEIVED FOR OVER {GPS_TIMEOUT_SEC}s! FAILSAFE."
+                )
+            self.state = MissionState.FAILSAFE
+            return False
+
+        if self.last_heading_time is None:
+            return False
+
+        if (now - self.last_heading_time) > GPS_TIMEOUT_SEC:
+            if self.state != MissionState.FAILSAFE:
+                self.logger.error(
+                    f"HEADING DATA NOT RECEIVED FOR OVER {GPS_TIMEOUT_SEC}s! FAILSAFE."
                 )
             self.state = MissionState.FAILSAFE
             return False
@@ -129,8 +154,15 @@ class Task1Maneuvering:
 
         return True
 
-    def _set_position_to_gps_target(self, target_lat, target_lon, target_name, tolerance_m):
-        """Verilen GPS hedefine bridge set_position hattı ile gider."""
+    def _set_position_to_gps_target(
+            self,
+            target_lat,
+            target_lon,
+            target_name,
+            tolerance_m,
+            detections,
+    ):
+        """GPS hedefine yalnız turuncu duba koridorunun içinden gider."""
         distance = calculate_gps_distance(
             self.current_lat, self.current_lon,
             target_lat, target_lon
@@ -140,21 +172,68 @@ class Task1Maneuvering:
             self.logger.info(f"Reached {target_name}! Remaining: {distance:.2f}m")
             return True
 
+        boundary_decision = self._stay_in(detections, target_lat, target_lon)
+        if boundary_decision.should_stop:
+            publish_cmd_vel(
+                self.topics.cmd_vel_pub,
+                linear_x=0.0,
+                angular_z=0.0,
+            )
+            self.logger.warn(
+                f"Turuncu parkur sınırı güvenle hesaplanamadı "
+                f"({boundary_decision.reason}); araç bekletiliyor.",
+                throttle_duration_sec=1.0,
+            )
+            return False
+
+        target_key = (
+            target_name,
+            round(float(target_lat), 7),
+            round(float(target_lon), 7),
+        )
+        if self.aligned_target_key != target_key:
+            if not align_heading_to_gps_target(
+                    self.topics.cmd_vel_pub,
+                    self.current_lat,
+                    self.current_lon,
+                    self.current_heading,
+                    boundary_decision.target_lat,
+                    boundary_decision.target_lon,
+                    logger=self.logger,
+                    target_name=target_name,
+            ):
+                return False
+            self.aligned_target_key = target_key
+
         publish_set_position(
             self.topics.position_target_pub,
-            target_lat,
-            target_lon
+            boundary_decision.target_lat,
+            boundary_decision.target_lon,
         )
         self.last_angular_z = 0.0
 
         self.logger.info(
-            f"Target {target_name} | Distance: {distance:.2f}m | set_position sent",
+            f"Target {target_name} | Distance: {distance:.2f}m | "
+            f"boundary={boundary_decision.status}/{boundary_decision.reason} | "
+            f"safe_angle={boundary_decision.relative_bearing_deg:.1f}° | "
+            f"corridor={boundary_decision.corridor_width_m:.1f}m",
             throttle_duration_sec=1.0
         )
         return False
 
+    def _stay_in(self, detections, target_lat, target_lon):
+        """Turuncu dubalardan koridor çıkarıp güvenli kısa GPS hedefi üretir."""
+        return self.boundary_guard.compute(
+            detections=detections,
+            current_lat=self.current_lat,
+            current_lon=self.current_lon,
+            current_heading=self.current_heading,
+            main_target_lat=target_lat,
+            main_target_lon=target_lon,
+        )
+
     # noinspection D
-    def update(self):
+    def update(self, detections):
         """Sürekli çalışan ana kontrol döngüsü."""
 
         # ---------------------------------------------------------
@@ -222,7 +301,8 @@ class Task1Maneuvering:
                 target_lat,
                 target_lon,
                 f"WP{self.current_target_index}",
-                self.waypoint_tolerance
+                self.waypoint_tolerance,
+                detections,
         ):
             self.current_target_index += 1
             return
@@ -252,10 +332,34 @@ class Task1Node(Node):
         self.task = Task1Maneuvering(self, self.mission_topics, self.mission_clients)
 
         # Anlık Yönelim Değişkeni (GPS Callback'e aktarmak için)
-        self.current_heading = 0.0
+        self.current_heading = None
         self.bridge_connected = False
         self.mission_active = False
         self.valid_gps_received = False
+        self.valid_heading_received = False
+
+        self.latest_detections = []
+        self.last_detection_message_time = None
+
+        detection_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+        self.detection_sub = self.create_subscription(
+            String,
+            DETECTION_TOPIC,
+            self.detection_callback,
+            detection_qos,
+        )
+
+        self.active_task_pub = self.create_publisher(
+            String,
+            "/mission/active_task",
+            10,
+        )
+        self.active_task_timer = self.create_timer(1.0, self._publish_active_task)
+        self._publish_active_task()
 
         # 4. Ana Kontrol Döngüsünü Başlat (Saniyede 10 kez çalışır: 0.1 sn)
         self.control_timer = self.create_timer(0.1, self.timer_callback)
@@ -270,16 +374,65 @@ class Task1Node(Node):
             return
 
         self.valid_gps_received = True
-        self.task.update_gps(msg.latitude, msg.longitude, self.current_heading)
+        self.task.update_gps(msg.latitude, msg.longitude)
 
     def heading_callback(self, msg):
         """Araçtan gelen Float32 yön verisini dinler."""
-        self.current_heading = msg.data
-        self.task.last_heading_time = time.monotonic()
+        try:
+            heading = float(msg.data)
+        except (TypeError, ValueError):
+            heading = float("nan")
+
+        if not math.isfinite(heading):
+            self.get_logger().warn(
+                "Geçersiz heading verisi yok sayılıyor.",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        self.current_heading = heading % 360.0
+        self.valid_heading_received = True
+        self.task.update_heading(self.current_heading)
 
     def state_callback(self, msg):
         """Bridge'den gelen durum mesajlarını dinler (Gerekirse kullanılır)."""
         self.bridge_connected = "connected=True" in msg.data
+
+    def _publish_active_task(self):
+        msg = String()
+        msg.data = "task1"
+        self.active_task_pub.publish(msg)
+
+    @staticmethod
+    def _parse_detections_payload(payload):
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("detections", "objects"):
+                if isinstance(payload.get(key), list):
+                    return payload[key]
+        return []
+
+    def detection_callback(self, msg):
+        try:
+            parsed = json.loads(msg.data)
+            detections = self._parse_detections_payload(parsed)
+        except (json.JSONDecodeError, TypeError) as exc:
+            self.get_logger().error(
+                f"Detection JSON ayrıştırılamadı: {exc}",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        self.latest_detections = detections
+        self.last_detection_message_time = time.monotonic()
+
+    def _get_fresh_detections(self):
+        if self.last_detection_message_time is None:
+            return []
+        if time.monotonic() - self.last_detection_message_time > DETECTION_STALE_SEC:
+            return []
+        return list(self.latest_detections)
 
     def wait_for_bridge_connection(self, timeout_sec=30.0):
         """Bridge servisleri hazir olsa bile MAVLink heartbeat gelene kadar bekler."""
@@ -296,16 +449,35 @@ class Task1Node(Node):
 
         return False
 
-    def wait_for_valid_gps(self, timeout_sec=30.0):
-        """Mission ARM olmadan once gercek GPS konumu bekler."""
+    def wait_for_valid_navigation_data(self, timeout_sec=30.0):
+        """Mission ARM olmadan önce gerçek GPS ve heading verisini bekler."""
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and time.monotonic() < deadline:
-            if self.valid_gps_received:
+            if self.valid_gps_received and self.valid_heading_received:
                 return True
 
             self.get_logger().info(
-                "Gecerli GPS konumu bekleniyor...",
+                "Geçerli GPS ve heading verisi bekleniyor...",
                 throttle_duration_sec=2.0
+            )
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        return False
+
+    def wait_for_vision(self, timeout_sec=30.0):
+        """ARM öncesinde vision pipeline'dan güncel heartbeat bekler."""
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and time.monotonic() < deadline:
+            if (
+                    self.last_detection_message_time is not None
+                    and time.monotonic() - self.last_detection_message_time
+                    <= DETECTION_STALE_SEC
+            ):
+                return True
+
+            self.get_logger().info(
+                "Vision heartbeat bekleniyor...",
+                throttle_duration_sec=2.0,
             )
             rclpy.spin_once(self, timeout_sec=0.1)
 
@@ -322,8 +494,24 @@ class Task1Node(Node):
         if not self.mission_active:
             return
 
+        vision_age = (
+            None
+            if self.last_detection_message_time is None
+            else time.monotonic() - self.last_detection_message_time
+        )
+        if vision_age is None or vision_age > DETECTION_STALE_SEC:
+            stop_vehicle(self.mission_topics.cmd_vel_pub)
+            self.task.state = MissionState.FAILSAFE
+            age_text = "hiç gelmedi" if vision_age is None else f"{vision_age:.2f}s eski"
+            self.get_logger().error(
+                f"VISION HEARTBEAT KAYBI ({age_text}). Araç durduruldu; FAILSAFE."
+            )
+            return
+
+        current_detections = self._get_fresh_detections()
+
         try:
-            self.task.update()
+            self.task.update(detections=current_detections)
         except Exception as exc:  # noqa: BLE001 - kasıtlı geniş yakalama, failsafe için
             self.get_logger().error(f"Unexpected error in timer_callback: {exc}")
             try:
@@ -346,8 +534,12 @@ def main(args=None):
             node.get_logger().error("Bridge MAVLink baglantisi hazir degil! Mission not starting.")
             return
 
-        if not node.wait_for_valid_gps(timeout_sec=30.0):
-            node.get_logger().error("Gecerli GPS konumu yok! Mission not starting.")
+        if not node.wait_for_valid_navigation_data(timeout_sec=30.0):
+            node.get_logger().error("Geçerli GPS/heading verisi yok! Mission not starting.")
+            return
+
+        if not node.wait_for_vision(timeout_sec=30.0):
+            node.get_logger().error("Vision heartbeat yok! Mission not starting.")
             return
 
         node.get_logger().info("Setting vehicle to GUIDED mode...")
@@ -395,4 +587,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

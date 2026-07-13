@@ -42,6 +42,7 @@ from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
 
 from utils.mavlink_utilities import (
+    align_heading_to_gps_target,
     calculate_bearing,
     calculate_gps_distance,
     call_set_mode,
@@ -54,7 +55,10 @@ from utils.mavlink_utilities import (
     wait_for_mission_services,
 )
 from utils.read_waypoints import parse_qgc_waypoints
-
+from missions.utils.orange_boundary_guard import (
+    OrangeBoundaryGuard,
+    is_orange_boundary_detection,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WAYPOINT_PATH = BASE_DIR / "waypoints" / "teknofest_task2.waypoints"
@@ -64,13 +68,10 @@ WAYPOINT_PATH = BASE_DIR / "waypoints" / "teknofest_task2.waypoints"
 # ============================================================
 DETECTION_TOPIC = "/vision/detections"
 DETECTION_STALE_SEC = 0.75
-VISION_WARNING_SEC = 5.0
 
-# Model yalnızca engel dubasını algılıyorsa boş bırakılabilir; bu durumda geçerli
-# mesafesi olan bütün tespitler engel kabul edilir.
-# Model başka nesneleri de algılıyorsa örneğin:
-# OBSTACLE_CLASS_NAMES = ("obstacle_buoy", "yellow_buoy")
-OBSTACLE_CLASS_NAMES = ()
+# Görev 2 parkurundaki bütün engeller sarı dubadır. Mevcut buoy.pt modelinin
+# class adı dışında hiçbir tespit engel kaçınmasını tetiklemez.
+OBSTACLE_CLASS_NAMES = ("yellow_buoy",)
 MIN_OBSTACLE_CONFIDENCE = 0.45
 
 # ============================================================
@@ -89,7 +90,6 @@ AVOID_EXIT_DIST_M = 4.0
 AVOID_FORWARD_DIST_M = 5.0
 AVOID_SIDE_DIST_M = 3.0
 AVOID_WAYPOINT_TOLERANCE_M = 1.0
-AVOID_RETRIGGER_DELAY_SEC = 3.0
 
 # Duba kameranın tam ortasındaysa seçilecek kaçış yönü.
 DEFAULT_CENTER_AVOIDANCE_SIDE = "right"
@@ -131,12 +131,14 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.last_angular_z = 0.0
         self.finished = False
         self.state = MissionState.INIT
+        self.boundary_guard = OrangeBoundaryGuard()
+        self.aligned_target_key = None
 
         # Kaçınma durumu
         self.avoidance_target = None
         self.avoidance_side = None
         self.avoided_obstacle_side = None
-        self.avoidance_block_until = 0.0
+        self.obstacle_data_uncertain = False
 
     # ========================================================
     # VERİ GÜNCELLEME
@@ -233,6 +235,7 @@ class Task2PointTrackingWithObstacleAvoidance:
 
         return None
 
+    # noinspection D
     def _normalize_detection(self, obj):
         if not isinstance(obj, dict):
             return None
@@ -242,7 +245,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             class_name = obj.get("class_name")
         if class_name is None:
             class_name = obj.get("label", "obstacle")
-        class_name = str(class_name)
+        class_name = str(class_name).strip().lower()
 
         confidence = self._safe_float(obj.get("confidence"))
         if confidence is None:
@@ -281,11 +284,11 @@ class Task2PointTrackingWithObstacleAvoidance:
         bbox = obj.get("bbox")
         image_width = self._safe_float(obj.get("image_width"))
         if (
-            side is None
-            and isinstance(bbox, (list, tuple))
-            and len(bbox) >= 4
-            and image_width is not None
-            and image_width > 0
+                side is None
+                and isinstance(bbox, (list, tuple))
+                and len(bbox) >= 4
+                and image_width is not None
+                and image_width > 0
         ):
             x1 = self._safe_float(bbox[0])
             x2 = self._safe_float(bbox[2])
@@ -312,8 +315,14 @@ class Task2PointTrackingWithObstacleAvoidance:
 
     def _nearest_relevant_obstacle(self, detections):
         candidates = []
+        self.obstacle_data_uncertain = False
 
         for raw_detection in detections or []:
+            # Turuncu dubalar engel değil parkur sınırıdır; aşağıdaki kaçınma
+            # hedefi yerine OrangeBoundaryGuard tarafından ele alınırlar.
+            if is_orange_boundary_detection(raw_detection):
+                continue
+
             obstacle = self._normalize_detection(raw_detection)
             if obstacle is None:
                 continue
@@ -325,11 +334,15 @@ class Task2PointTrackingWithObstacleAvoidance:
                 continue
 
             distance = obstacle["distance"]
-            if distance is None or not (0.0 < distance < AVOID_EXIT_DIST_M):
+            if distance is None or distance <= 0.0:
+                self.obstacle_data_uncertain = True
+                continue
+            if distance >= AVOID_EXIT_DIST_M:
                 continue
 
-            # Sağ/sol bilgisi yoksa güvenli karar veremeyiz.
+            # Yakın sarı dubanın sağ/sol bilgisi yoksa ilerlemek güvenli değildir.
             if obstacle["side"] is None:
+                self.obstacle_data_uncertain = True
                 continue
 
             candidates.append(obstacle)
@@ -431,14 +444,20 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.avoidance_target = None
         self.avoidance_side = None
         self.avoided_obstacle_side = None
-        self.avoidance_block_until = time.monotonic() + AVOID_RETRIGGER_DELAY_SEC
         self.last_angular_z = 0.0
         self.state = MissionState.NAVIGATING
 
     # ========================================================
     # GPS HEDEF TAKİBİ
     # ========================================================
-    def _navigate_to_gps_target(self, target_lat, target_lon, target_name, tolerance_m):
+    def _navigate_to_gps_target(
+            self,
+            target_lat,
+            target_lon,
+            target_name,
+            tolerance_m,
+            detections,
+    ):
         distance = calculate_gps_distance(
             self.current_lat,
             self.current_lon,
@@ -450,15 +469,58 @@ class Task2PointTrackingWithObstacleAvoidance:
             self.logger.info(f"{target_name} ulaşıldı. Kalan mesafe: {distance:.2f} m")
             return True
 
+        boundary_decision = self.boundary_guard.compute(
+            detections=detections,
+            current_lat=self.current_lat,
+            current_lon=self.current_lon,
+            current_heading=self.current_heading,
+            main_target_lat=target_lat,
+            main_target_lon=target_lon,
+        )
+        if boundary_decision.should_stop:
+            publish_cmd_vel(
+                self.topics.cmd_vel_pub,
+                linear_x=0.0,
+                angular_z=0.0,
+            )
+            self.logger.warn(
+                f"Turuncu parkur sınırı güvenle hesaplanamadı "
+                f"({boundary_decision.reason}); araç bekletiliyor.",
+                throttle_duration_sec=1.0,
+            )
+            return False
+
+        target_key = (
+            target_name,
+            round(float(target_lat), 7),
+            round(float(target_lon), 7),
+        )
+        if self.aligned_target_key != target_key:
+            if not align_heading_to_gps_target(
+                    self.topics.cmd_vel_pub,
+                    self.current_lat,
+                    self.current_lon,
+                    self.current_heading,
+                    boundary_decision.target_lat,
+                    boundary_decision.target_lon,
+                    logger=self.logger,
+                    target_name=target_name,
+            ):
+                return False
+            self.aligned_target_key = target_key
+
         publish_set_position(
             self.topics.position_target_pub,
-            target_lat,
-            target_lon,
+            boundary_decision.target_lat,
+            boundary_decision.target_lon,
         )
         self.last_angular_z = 0.0
 
         self.logger.info(
-            f"Hedef={target_name} | mesafe={distance:.2f} m | set_position gönderildi",
+            f"Hedef={target_name} | mesafe={distance:.2f} m | "
+            f"boundary={boundary_decision.status}/{boundary_decision.reason} | "
+            f"safe_angle={boundary_decision.relative_bearing_deg:.1f}° | "
+            f"corridor={boundary_decision.corridor_width_m:.1f}m",
             throttle_duration_sec=1.0,
         )
         return False
@@ -466,6 +528,7 @@ class Task2PointTrackingWithObstacleAvoidance:
     # ========================================================
     # ANA STATE MACHINE
     # ========================================================
+    # noinspection D
     def update(self, detections):
         if self.state == MissionState.FAILSAFE:
             stop_vehicle(self.topics.cmd_vel_pub)
@@ -509,6 +572,16 @@ class Task2PointTrackingWithObstacleAvoidance:
         target_gps = self.waypoints[self.current_target_index]
         target_lat = target_gps["lat"]
         target_lon = target_gps["lon"]
+        nearest_obstacle = self._nearest_relevant_obstacle(detections)
+
+        if self.obstacle_data_uncertain:
+            stop_vehicle(self.topics.cmd_vel_pub)
+            self.logger.warn(
+                "Yakın sarı duba görüldü fakat mesafe/yön güvenilir değil; "
+                "araç veri düzelene kadar bekletiliyor.",
+                throttle_duration_sec=1.0,
+            )
+            return
 
         # ----------------------------------------------------
         # 1. BAŞLANGIÇ WP0 KONTROLÜ
@@ -519,6 +592,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                 target_lon,
                 "WP0 (başlangıç)",
                 self.waypoint_tolerance + 2.0,
+                detections,
             )
 
             if reached_wp0:
@@ -543,6 +617,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                 self.avoidance_target["lon"],
                 f"kaçınma WP ({self.avoidance_side})",
                 AVOID_WAYPOINT_TOLERANCE_M,
+                detections,
             )
 
             if reached_avoidance_wp:
@@ -552,12 +627,9 @@ class Task2PointTrackingWithObstacleAvoidance:
         # ----------------------------------------------------
         # 3. YENİ ENGEL TETİKLEME
         # ----------------------------------------------------
-        nearest_obstacle = self._nearest_relevant_obstacle(detections)
-
         if (
-            nearest_obstacle is not None
-            and nearest_obstacle["distance"] < AVOID_ENTER_DIST_M
-            and time.monotonic() >= self.avoidance_block_until
+                nearest_obstacle is not None
+                and nearest_obstacle["distance"] < AVOID_ENTER_DIST_M
         ):
             self._start_avoidance(
                 nearest_obstacle,
@@ -571,6 +643,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                 self.avoidance_target["lon"],
                 f"kaçınma WP ({self.avoidance_side})",
                 AVOID_WAYPOINT_TOLERANCE_M,
+                detections,
             )
             return
 
@@ -582,6 +655,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             target_lon,
             f"WP{self.current_target_index}",
             self.waypoint_tolerance,
+            detections,
         )
 
         if reached_main_wp:
@@ -619,8 +693,6 @@ class Task2Node(Node):
 
         self.latest_detections = []
         self.last_detection_message_time = None
-        self.node_start_time = time.monotonic()
-        self.vision_warning_emitted = False
 
         detection_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -634,6 +706,14 @@ class Task2Node(Node):
             detection_qos,
         )
 
+        self.active_task_pub = self.create_publisher(
+            String,
+            "/mission/active_task",
+            10,
+        )
+        self.active_task_timer = self.create_timer(1.0, self._publish_active_task)
+        self._publish_active_task()
+
         self.control_timer = self.create_timer(0.1, self.timer_callback)
 
     # ========================================================
@@ -641,8 +721,8 @@ class Task2Node(Node):
     # ========================================================
     def gps_callback(self, msg):
         if (
-            abs(msg.latitude) < MIN_VALID_ABS_COORD
-            and abs(msg.longitude) < MIN_VALID_ABS_COORD
+                abs(msg.latitude) < MIN_VALID_ABS_COORD
+                and abs(msg.longitude) < MIN_VALID_ABS_COORD
         ):
             self.get_logger().warn(
                 "Geçersiz GPS (0,0) yok sayıldı.",
@@ -667,6 +747,11 @@ class Task2Node(Node):
 
     def state_callback(self, msg):
         self.bridge_connected = "connected=True" in msg.data
+
+    def _publish_active_task(self):
+        msg = String()
+        msg.data = "task2"
+        self.active_task_pub.publish(msg)
 
     @staticmethod
     def _parse_detections_payload(payload):
@@ -741,6 +826,26 @@ class Task2Node(Node):
 
         return False
 
+    def wait_for_vision(self, timeout_sec=30.0):
+        """ARM öncesinde vision pipeline'dan güncel heartbeat bekler."""
+        deadline = time.monotonic() + timeout_sec
+
+        while rclpy.ok() and time.monotonic() < deadline:
+            if (
+                    self.last_detection_message_time is not None
+                    and time.monotonic() - self.last_detection_message_time
+                    <= DETECTION_STALE_SEC
+            ):
+                return True
+
+            self.get_logger().info(
+                "Vision heartbeat bekleniyor...",
+                throttle_duration_sec=2.0,
+            )
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        return False
+
     # ========================================================
     # ANA TIMER
     # ========================================================
@@ -748,16 +853,19 @@ class Task2Node(Node):
         if not self.mission_active:
             return
 
-        if (
-            self.last_detection_message_time is None
-            and not self.vision_warning_emitted
-            and time.monotonic() - self.node_start_time > VISION_WARNING_SEC
-        ):
-            self.vision_warning_emitted = True
-            self.get_logger().warn(
-                f"{DETECTION_TOPIC} topic'inden henüz detection mesajı gelmedi. "
-                "Waypoint takibi devam eder fakat kaçınma tetiklenemez."
+        vision_age = (
+            None
+            if self.last_detection_message_time is None
+            else time.monotonic() - self.last_detection_message_time
+        )
+        if vision_age is None or vision_age > DETECTION_STALE_SEC:
+            stop_vehicle(self.mission_topics.cmd_vel_pub)
+            self.task.state = MissionState.FAILSAFE
+            age_text = "hiç gelmedi" if vision_age is None else f"{vision_age:.2f}s eski"
+            self.get_logger().error(
+                f"VISION HEARTBEAT KAYBI ({age_text}). Araç durduruldu; FAILSAFE."
             )
+            return
 
         current_detections = self._get_fresh_detections()
 
@@ -789,6 +897,12 @@ def main(args=None):
             )
             return
 
+        if not node.wait_for_vision(timeout_sec=30.0):
+            node.get_logger().error(
+                "Vision heartbeat yok. Görev başlatılmadı."
+            )
+            return
+
         node.get_logger().info("Araç GUIDED moda alınıyor...")
         mode_ok = call_set_mode(
             node,
@@ -813,9 +927,9 @@ def main(args=None):
         node.get_logger().info("Görev 2 kontrol döngüsü başladı.")
 
         while (
-            rclpy.ok()
-            and not node.task.finished
-            and node.task.state != MissionState.FAILSAFE
+                rclpy.ok()
+                and not node.task.finished
+                and node.task.state != MissionState.FAILSAFE
         ):
             rclpy.spin_once(node, timeout_sec=0.1)
 
