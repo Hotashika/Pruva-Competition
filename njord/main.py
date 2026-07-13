@@ -170,6 +170,7 @@ if __name__ == "__main__":
         njord_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_collision_avoidance.py")
         njord_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_docking.py")
         njord_task1_waypoint_path = os.path.join(PROJECT_ROOT, "waypoints", "njord1_2_maneuvering.waypoints")
+        njord_task2_waypoint_path = os.path.join(PROJECT_ROOT, "waypoints", "njord_task2.waypoints")
 
         ################################################################################################################
         mission_env_setup = (
@@ -177,6 +178,7 @@ if __name__ == "__main__":
             f"export MAVLINK_MISSION_1_PATH={shlex.quote(njord_task1_path)} && "
             f"export MAVLINK_MISSION_1_WAYPOINT_PATH={shlex.quote(njord_task1_waypoint_path)} && "
             f"export MAVLINK_MISSION_2_PATH={shlex.quote(njord_task2_path)} && "
+            f"export MAVLINK_MISSION_2_WAYPOINT_PATH={shlex.quote(njord_task2_waypoint_path)} && "
             f"export MAVLINK_MISSION_3_PATH={shlex.quote(njord_task3_path)}"
         )
 
