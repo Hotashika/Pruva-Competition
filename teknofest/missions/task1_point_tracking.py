@@ -39,6 +39,8 @@ WAYPOINT_PATH = BASE_DIR / "waypoints" / "teknofest_task1.waypoints"
 GPS_TIMEOUT_SEC = 2.0  # Bu süre GPS/heading gelmezse dur
 GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
 MIN_VALID_ABS_COORD = 1e-6
+WAYPOINT_SETTLE_SEC = 0.75
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 
 DETECTION_TOPIC = "/vision/detections"
 DETECTION_STALE_SEC = 0.75
@@ -79,6 +81,8 @@ class Task1Maneuvering:
         self.finished = False
         self.boundary_guard = OrangeBoundaryGuard()
         self.aligned_target_key = None
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
 
         # --- Güvenlik / state machine alanları ---
         self.state = MissionState.INIT
@@ -154,6 +158,38 @@ class Task1Maneuvering:
 
         return True
 
+    def _begin_waypoint_hold(self, waypoint_name):
+        """Ana waypoint'e varista araci durdurup sonraki heading icin sabitler."""
+        stop_vehicle(self.topics.cmd_vel_pub)
+        self.waypoint_hold_until = time.monotonic() + WAYPOINT_SETTLE_SEC
+        self.waypoint_hold_name = waypoint_name
+        self.aligned_target_key = None
+        self.logger.info(
+            f"{waypoint_name} reached; vehicle stopped for "
+            f"{WAYPOINT_SETTLE_SEC:.2f}s before next heading alignment."
+        )
+
+    def _waypoint_hold_active(self):
+        if self.waypoint_hold_until is None:
+            return False
+
+        remaining = self.waypoint_hold_until - time.monotonic()
+        if remaining > 0.0:
+            publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
+            self.logger.info(
+                f"Holding at {self.waypoint_hold_name}: {remaining:.2f}s remaining.",
+                throttle_duration_sec=0.5,
+            )
+            return True
+
+        completed_name = self.waypoint_hold_name
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
+        self.logger.info(
+            f"{completed_name} stop stabilized; proceeding to next mission step."
+        )
+        return False
+
     def _set_position_to_gps_target(
             self,
             target_lat,
@@ -201,6 +237,7 @@ class Task1Maneuvering:
                     boundary_decision.target_lon,
                     logger=self.logger,
                     target_name=target_name,
+                    tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
             ):
                 return False
             self.aligned_target_key = target_key
@@ -261,6 +298,9 @@ class Task1Maneuvering:
             stop_vehicle(self.topics.cmd_vel_pub)
             return
 
+        if self._waypoint_hold_active():
+            return
+
         if self.current_target_index >= len(self.waypoints):
             if not self.finished:
                 self.logger.info("ALL WAYPOINTS REACHED! MISSION COMPLETED!")
@@ -284,6 +324,7 @@ class Task1Maneuvering:
         if self.state == MissionState.INIT:
             if self.current_target_index == 0 and distance < (self.waypoint_tolerance + 2.0):
                 self.logger.info("WP0 (Start) point verified, mission starting.")
+                self._begin_waypoint_hold("WP0 (Start)")
                 self.current_target_index += 1
                 self.state = MissionState.NAVIGATING
                 return
@@ -304,6 +345,7 @@ class Task1Maneuvering:
                 self.waypoint_tolerance,
                 detections,
         ):
+            self._begin_waypoint_hold(f"WP{self.current_target_index}")
             self.current_target_index += 1
             return
 

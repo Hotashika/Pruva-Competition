@@ -81,6 +81,8 @@ GPS_TIMEOUT_SEC = 2.0
 HEADING_TIMEOUT_SEC = 2.0
 GEOFENCE_RADIUS_M = 150.0
 MIN_VALID_ABS_COORD = 1e-6
+WAYPOINT_SETTLE_SEC = 0.75
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 
 # ============================================================
 # KAÇINMA PARAMETRELERİ
@@ -133,6 +135,8 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.state = MissionState.INIT
         self.boundary_guard = OrangeBoundaryGuard()
         self.aligned_target_key = None
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
 
         # Kaçınma durumu
         self.avoidance_target = None
@@ -204,6 +208,37 @@ class Task2PointTrackingWithObstacleAvoidance:
             return False
 
         return True
+
+    def _begin_waypoint_hold(self, waypoint_name):
+        """Ana veya kacinma waypoint'inde araci durdurup heading icin sabitler."""
+        stop_vehicle(self.topics.cmd_vel_pub)
+        self.waypoint_hold_until = time.monotonic() + WAYPOINT_SETTLE_SEC
+        self.waypoint_hold_name = waypoint_name
+        self.aligned_target_key = None
+        self.logger.info(
+            f"{waypoint_name} ulaşıldı; araç {WAYPOINT_SETTLE_SEC:.2f}s durduruldu."
+        )
+
+    def _waypoint_hold_active(self):
+        if self.waypoint_hold_until is None:
+            return False
+
+        remaining = self.waypoint_hold_until - time.monotonic()
+        if remaining > 0.0:
+            publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
+            self.logger.info(
+                f"{self.waypoint_hold_name} noktasında bekleniyor: {remaining:.2f}s.",
+                throttle_duration_sec=0.5,
+            )
+            return True
+
+        completed_name = self.waypoint_hold_name
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
+        self.logger.info(
+            f"{completed_name} duruşu sabitlendi; sonraki görev adımına geçiliyor."
+        )
+        return False
 
     # ========================================================
     # DETECTION NORMALİZASYONU
@@ -437,6 +472,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         )
 
     def _finish_avoidance(self):
+        completed_name = f"kaçınma WP ({self.avoidance_side})"
         self.logger.info(
             f"Kaçınma WP'sine ulaşıldı. {self.avoidance_side} taraftan geçiş tamamlandı; "
             "ana rotaya dönülüyor."
@@ -446,6 +482,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.avoided_obstacle_side = None
         self.last_angular_z = 0.0
         self.state = MissionState.NAVIGATING
+        self._begin_waypoint_hold(completed_name)
 
     # ========================================================
     # GPS HEDEF TAKİBİ
@@ -505,6 +542,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                     boundary_decision.target_lon,
                     logger=self.logger,
                     target_name=target_name,
+                    tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
             ):
                 return False
             self.aligned_target_key = target_key
@@ -561,6 +599,9 @@ class Task2PointTrackingWithObstacleAvoidance:
             stop_vehicle(self.topics.cmd_vel_pub)
             return
 
+        if self._waypoint_hold_active():
+            return
+
         if self.current_target_index >= len(self.waypoints):
             if not self.finished:
                 self.logger.info("BÜTÜN WAYPOINT'LER TAMAMLANDI. GÖREV BİTTİ.")
@@ -597,6 +638,7 @@ class Task2PointTrackingWithObstacleAvoidance:
 
             if reached_wp0:
                 self.logger.info("WP0 doğrulandı; görev navigasyonu başlıyor.")
+                self._begin_waypoint_hold("WP0 (başlangıç)")
                 self.current_target_index += 1
                 self.last_angular_z = 0.0
                 self.state = MissionState.NAVIGATING
@@ -659,6 +701,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         )
 
         if reached_main_wp:
+            self._begin_waypoint_hold(f"WP{self.current_target_index}")
             self.current_target_index += 1
             self.last_angular_z = 0.0
 

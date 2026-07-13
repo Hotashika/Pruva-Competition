@@ -38,6 +38,8 @@ ACTIVE_TASK_NAME = "task1"
 GPS_TIMEOUT_SEC = 2.0  # Bu sure GPS gelmezse dur ve HOLD moda gecmeyi dene
 HEADING_TIMEOUT_SEC = 2.0  # Bu sure heading gelmezse dur ve HOLD moda gecmeyi dene
 GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
+WAYPOINT_SETTLE_SEC = 0.75  # Her ana GPS noktasinda kesin durus suresi
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0  # Kucuk heading farklarinda gereksiz salinimi onler
 
 AVOID_ENTER_DIST_M = 3.0  # Kaçınma tetiklenme mesafesi
 AVOID_EXIT_DIST_M = 5.0  # Kaçınma için dikkate alınacak maksimum engel mesafesi
@@ -112,6 +114,8 @@ class Task1Maneuvering:
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = 0.0  # +1.0 right/starboard, -1.0 left/port
         self.aligned_target_key = None
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
         self.waiting_for_sensor_text = "GPS Data"
         self.hold_mode_requested = False
         self.hold_mode_future = None
@@ -367,6 +371,40 @@ class Task1Maneuvering:
             linear_x=AVOID_LINEAR_X,
             angular_z=angular_z
         )
+
+    def _begin_waypoint_hold(self, waypoint_name):
+        """Ana GPS noktasinda araci durdurup heading gecisi icin sabitler."""
+        stop_vehicle(self.topics.cmd_vel_pub)
+        self.waypoint_hold_until = time.monotonic() + WAYPOINT_SETTLE_SEC
+        self.waypoint_hold_name = waypoint_name
+        self.aligned_target_key = None
+        self.logger.info(
+            f"{waypoint_name} reached; vehicle stopped for "
+            f"{WAYPOINT_SETTLE_SEC:.2f}s before next heading alignment."
+        )
+
+    def _waypoint_hold_active(self):
+        """Planli waypoint durusu devam ediyorsa sifir hareket komutu basar."""
+        if self.waypoint_hold_until is None:
+            return False
+
+        remaining = self.waypoint_hold_until - time.monotonic()
+        if remaining > 0.0:
+            publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
+            self.logger.info(
+                f"Holding at {self.waypoint_hold_name}: {remaining:.2f}s remaining.",
+                throttle_duration_sec=0.5,
+            )
+            return True
+
+        completed_name = self.waypoint_hold_name
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
+        self.logger.info(
+            f"{completed_name} stop stabilized; proceeding to next mission step."
+        )
+        return False
+
     # GPS hedefine MAVLink position target komutu basar.
     def _set_position_to_gps_target(self, target_lat, target_lon, target_name, tolerance_m):
         """Verilen GPS hedefine SET_POSITION_TARGET_GLOBAL_INT ile gider."""
@@ -394,6 +432,7 @@ class Task1Maneuvering:
                     target_lon,
                     logger=self.logger,
                     target_name=target_name,
+                    tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
             ):
                 return False
             self.aligned_target_key = target_key
@@ -439,6 +478,9 @@ class Task1Maneuvering:
         if not self.waypoints:
             self.logger.warn("Mission list is empty! Please check the route.", throttle_duration_sec=5.0)
             stop_vehicle(self.topics.cmd_vel_pub)
+            return
+
+        if self._waypoint_hold_active():
             return
 
         if self.current_target_index >= len(self.waypoints):
@@ -523,6 +565,7 @@ class Task1Maneuvering:
         if self.state == MissionState.INIT:
             if self.current_target_index == 0 and distance < (self.waypoint_tolerance + 2.0):
                 self.logger.info("WP0 (Start) point verified, mission starting.")
+                self._begin_waypoint_hold("WP0 (Start)")
                 self.current_target_index += 1
                 self.state = MissionState.NAVIGATING
                 return
@@ -542,6 +585,7 @@ class Task1Maneuvering:
                 f"WP{self.current_target_index}",
                 self.waypoint_tolerance
         ):
+            self._begin_waypoint_hold(f"WP{self.current_target_index}")
             self.current_target_index += 1
             return
 
