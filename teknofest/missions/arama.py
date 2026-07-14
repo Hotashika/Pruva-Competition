@@ -1,6 +1,19 @@
 """
 Task-3 Kamikaze Angajman Görevi — Aşama 1: ARAMA
-GERÇEK HAYAT TESTİ İÇİN DÜZENLENMİŞ VERSİYON
+GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON
+
+Yapılan düzeltmeler (bkz. sohbet açıklaması):
+  1. Tespit onayı artık sadece "art arda kaçırınca sıfırla" değil,
+     pencere-içi (windowed) oran ile çalışıyor -> dalga/parıltı gibi
+     tek karelik gürültüye karşı çok daha dayanıklı.
+  2. MAX_DETECTION_GAP artık gerçekten "kaç tick/kare" anlamında,
+     saniyeye çevrilmiyor; isim ile davranış tutarlı.
+  3. Dönüş adımına üst süre sınırı eklendi (STEP_MAX_DURATION_SEC),
+     heading verisi donarsa/gecikirse arama sonsuza kadar takılı kalmaz.
+  4. search_retry_count artık gerçekten artıyor ve
+     max_search_retries aşılınca uyarı + arama alanını genişletme
+     tetikleniyor (dead code değil).
+  5. total_rotation_completed gerçekten güncelleniyor (istatistik/telemetri).
 """
 
 import math
@@ -21,6 +34,9 @@ from utils.mavlink_utilities import (
 SEARCH_STEP_DEG = 20.0             # Her adımda dönülecek açı
 SEARCH_ANGULAR_SPEED = 0.3         # Dönüş sırasında angular_z (rad/s)
 STEP_SETTLE_SEC = 1.5              # Her adımdan sonra bekleme (tespit için)
+STEP_MAX_DURATION_SEC = 6.0        # Bir dönüş adımı için üst süre sınırı
+                                    # (heading feedback gecikirse/donarsa
+                                    # arama burada takılı kalmasın)
 STATION_TIMEOUT_SEC = 20.0         # Bir konumda en fazla kalma süresi
 MAX_SEARCH_ROTATION_DEG = 360.0    # Bir konumda toplam taranacak açı
 
@@ -29,17 +45,20 @@ STATION_MIN_SEPARATION_M = 8.0     # Yeni konum ziyaret edilenlerden uzak olmal�
 RELOCATE_TOLERANCE_M = 3.0         # Yeni konuma "ulaşıldı" sayılacak mesafe
 
 SEARCH_AREA_RADIUS_M = 80.0        # Arama alanı yarıçapı
+SEARCH_AREA_EXPAND_FACTOR = 1.3    # max_search_retries aşılınca alan büyütme
 GOLDEN_ANGLE_DEG = 137.5           # Yeni istasyon yönleri arasında iyi dağılım
 
 # HEDEF TESPİT GÜVENİRLİK PARAMETRELERİ
-MIN_CONSECUTIVE_DETECTIONS = 5     # Hedef sayılması için kaç ardışık karede görülmeli
-MAX_DETECTION_GAP = 10             # Kaç kare boyunca hedef görülmezse yeniden aramaya dön
+MIN_CONSECUTIVE_DETECTIONS = 5     # Pencere içinde en az kaç pozitif kare olmalı
 DETECTION_HISTORY_SIZE = 15        # Son kaç karelik tespit hafızada tutulacak
+MAX_DETECTION_GAP = 10             # Onaylı hedef, kaç TICK boyunca görülmezse
+                                    # yeniden aramaya dönülsün (saniye DEĞİL)
 
 # GERÇEK HAYAT TESTİ İÇİN EK PARAMETRELER
-TEST_MODE = True                   # Test modu aktif mi?
-SIMULATE_VISION = False            # Vision simülasyonu (gerçek sensör yoksa)
-MANUAL_OVERRIDE = False            # Manuel müdahale için
+TEST_MODE = True
+MAX_SEARCH_RETRIES = 5             # Bu kadar "hedef kayboldu -> yeniden arama"
+                                    # döngüsünden sonra arama alanı genişletilir
+                                    # ve durum loglanır
 
 
 class SearchState(Enum):
@@ -66,11 +85,9 @@ class AramaGorevi:
         self.finished = False
         self.found_target = None
 
-        # Hedef tespit geçmişi (ardışık tespit kontrolü için)
+        # Hedef tespit geçmişi (pencere-içi onay için)
         self.detection_history = deque(maxlen=DETECTION_HISTORY_SIZE)
-        self.consecutive_detections = 0
-        self.last_detection_frame = 0
-        self.frame_counter = 0
+        self.ticks_since_last_detection = 0
         self.target_confirmed = False
 
         # Konum verileri
@@ -85,19 +102,21 @@ class AramaGorevi:
         # Tarama takibi
         self.rotated_deg_this_station = 0.0
         self.step_start_heading = None
+        self.step_start_time = None
         self.station_start_time = None
         self.step_pause_until = None
 
         # Yer değiştirme hedefi
         self.relocation_target = None
 
-        # Hedef kaybı takibi
+        # Hedef kaybı / yeniden arama takibi
         self.target_lost_start_time = None
         self.search_retry_count = 0
-        self.max_search_retries = 5
+        self.max_search_retries = MAX_SEARCH_RETRIES
+        self.current_search_radius = SEARCH_AREA_RADIUS_M
 
         # Test modu için ek bilgiler
-        self.total_rotation_completed = 0
+        self.total_rotation_completed = 0.0
         self.search_start_time = None
 
     def update_gps(self, lat, lon, heading):
@@ -140,47 +159,76 @@ class AramaGorevi:
         return min(candidates, key=lambda d: d["distance"])
 
     def _update_detection_history(self, target):
-        """Hedef tespit geçmişini günceller ve ardışık tespit sayısını hesaplar."""
-        self.frame_counter += 1
+        """
+        Hedef tespit geçmişini pencere (window) mantığıyla günceller.
+
+        Eski davranış: tek karelik kaçırma bile consecutive_detections'ı
+        sıfırlıyordu -> dalga/parıltı gibi gerçek deniz koşullarında hedef
+        neredeyse hiç "confirmed" olamıyordu.
+
+        Yeni davranış: son DETECTION_HISTORY_SIZE tick içinde en az
+        MIN_CONSECUTIVE_DETECTIONS pozitif tespit VARSA ve şu anki tick de
+        pozitifse hedef onaylanır. Tek karelik kaçırmalar onayı bozmaz.
+        """
         self.detection_history.append(target is not None)
 
+        positive_count = sum(self.detection_history)
+
         if target is not None:
-            self.consecutive_detections += 1
-            self.last_detection_frame = self.frame_counter
+            self.ticks_since_last_detection = 0
             self.target_lost_start_time = None
 
-            if self.consecutive_detections >= MIN_CONSECUTIVE_DETECTIONS:
+            if not self.target_confirmed and positive_count >= MIN_CONSECUTIVE_DETECTIONS:
                 self.target_confirmed = True
                 if self.test_mode:
-                    self.logger.info(f"[TEST] Hedef {MIN_CONSECUTIVE_DETECTIONS} ardışık karede görüldü, onaylandı!")
-                return True
+                    self.logger.info(
+                        f"[TEST] Son {len(self.detection_history)} karede {positive_count} "
+                        f"pozitif tespit, hedef onaylandı!"
+                    )
+            return self.target_confirmed
         else:
-            self.consecutive_detections = 0
+            self.ticks_since_last_detection += 1
             if self.target_confirmed:
-                if self.target_lost_start_time is None:
-                    self.target_lost_start_time = time.monotonic()
-                    self.logger.warning("[ARAMA] Hedef kayboldu, yeniden tespit edilmeye çalışılıyor...")
-
-                # Belirli süre boyunca hedef görülmezse yeniden aramaya dön
-                if time.monotonic() - self.target_lost_start_time > MAX_DETECTION_GAP * 0.1:
-                    self.logger.warning("[ARAMA] Hedef çok uzun süredir görülmüyor, yeniden aramaya dönülüyor...")
+                if self.ticks_since_last_detection >= MAX_DETECTION_GAP:
+                    self.logger.warning(
+                        f"[ARAMA] Hedef {MAX_DETECTION_GAP} tick boyunca görülmedi, "
+                        f"yeniden aramaya dönülüyor..."
+                    )
                     self.target_confirmed = False
                     self.state = SearchState.TARGET_LOST
                     self.finished = False
                     self.found_target = None
+                    self._register_search_retry()
                     self._reset_search()
                     return False
+            return False
 
-        return self.target_confirmed and target is not None
+    def _register_search_retry(self):
+        """Her 'hedef kayboldu -> yeniden arama' döngüsünü sayar.
+        Belirli bir eşiği aşarsa arama alanını genişletir ve loglar.
+        Bu sayaç artık gerçekten kullanılıyor (önceki versiyonda tanımlı
+        ama hiç artırılmıyordu)."""
+        self.search_retry_count += 1
+        if self.search_retry_count > 0 and self.search_retry_count % self.max_search_retries == 0:
+            self.current_search_radius = min(
+                self.current_search_radius * SEARCH_AREA_EXPAND_FACTOR,
+                SEARCH_AREA_RADIUS_M * 2.5,
+            )
+            self.logger.warning(
+                f"[ARAMA] {self.search_retry_count} kez hedef kaybedildi. "
+                f"Arama yarıçapı {self.current_search_radius:.1f}m'ye genişletildi. "
+                f"Operatör bilgilendirilmeli."
+            )
 
     def _reset_search(self):
         """Aramayı sıfırla, yeniden başlangıç durumuna getir."""
         self.rotated_deg_this_station = 0.0
         self.step_start_heading = None
+        self.step_start_time = None
         self.station_start_time = time.monotonic()
         self.state = SearchState.SCANNING
         self.finished = False
-        self.consecutive_detections = 0
+        self.ticks_since_last_detection = 0
         self.detection_history.clear()
         self.target_confirmed = False
 
@@ -224,7 +272,7 @@ class AramaGorevi:
             bearing = (idx * GOLDEN_ANGLE_DEG) % 360.0
             distance = min(
                 STATION_MOVE_DISTANCE_M * (1 + idx * 0.3),
-                SEARCH_AREA_RADIUS_M * 0.8,
+                self.current_search_radius * 0.8,
             )
             target_lat, target_lon = self._project_gps(
                 self.home_lat, self.home_lon, bearing, distance
@@ -242,6 +290,7 @@ class AramaGorevi:
         self.state = SearchState.RELOCATING
         self.rotated_deg_this_station = 0.0
         self.step_start_heading = None
+        self.step_start_time = None
 
         target_lat, target_lon = self._next_station_target()
         self.relocation_target = (target_lat, target_lon)
@@ -304,7 +353,8 @@ class AramaGorevi:
             self.state = SearchState.SCANNING
             self.finished = False
             self.rotated_deg_this_station = 0.0
-            self.step_start_heading = self.current_heading
+            self.step_start_heading = None
+            self.step_start_time = None
             self.station_start_time = time.monotonic()
             return False
 
@@ -330,12 +380,28 @@ class AramaGorevi:
 
             if self.step_start_heading is None:
                 self.step_start_heading = self.current_heading
+                self.step_start_time = now
 
             rotated_now = abs(self._heading_diff(self.step_start_heading, self.current_heading))
+            step_elapsed = now - self.step_start_time if self.step_start_time else 0.0
 
-            if rotated_now >= SEARCH_STEP_DEG:
-                self.rotated_deg_this_station += rotated_now
+            # Heading feedback donarsa/gecikirse adım sonsuza kadar takılı
+            # kalmasın diye üst süre sınırı: süre dolunca adım "tamamlandı"
+            # sayılır ve bir sonraki adıma geçilir.
+            step_done = rotated_now >= SEARCH_STEP_DEG
+            step_timed_out = step_elapsed >= STEP_MAX_DURATION_SEC
+
+            if step_done or step_timed_out:
+                if step_timed_out and not step_done:
+                    self.logger.warning(
+                        f"[ARAMA] Dönüş adımı {STEP_MAX_DURATION_SEC:.1f}sn'de "
+                        f"tamamlanamadı (heading güncellenmiyor olabilir), "
+                        f"adım zorla ilerletiliyor."
+                    )
+                self.rotated_deg_this_station += max(rotated_now, SEARCH_STEP_DEG if step_timed_out else 0.0)
+                self.total_rotation_completed += rotated_now
                 self.step_start_heading = None
+                self.step_start_time = None
                 stop_vehicle(self.topics.cmd_vel_pub)
                 self.state = SearchState.STEP_PAUSE
                 self.step_pause_until = now + STEP_SETTLE_SEC
@@ -360,18 +426,23 @@ class AramaGorevi:
             "state": self.state.name,
             "finished": self.finished,
             "target_confirmed": self.target_confirmed,
-            "consecutive_detections": self.consecutive_detections,
+            "positive_in_window": sum(self.detection_history),
+            "window_size": len(self.detection_history),
             "rotated_deg": self.rotated_deg_this_station,
+            "total_rotation_completed": self.total_rotation_completed,
             "visited_positions": len(self.visited_positions),
             "search_retry_count": self.search_retry_count,
+            "current_search_radius": self.current_search_radius,
             "elapsed_time": elapsed,
             "current_position": (self.current_lat, self.current_lon),
             "target_class": self.target_class
         }
 
     def reset_search(self):
-        """Arama görevini tamamen sıfırlar (dışarıdan çağrılabilir)."""
+        """Arama görevini tamamen sıfırlar (dışarıdan çağrılabilir).
+        NOT: visited_positions bilinçli olarak korunuyor; aksi halde
+        tekne daha önce dolaştığı yerleri tekrar tekrar taramaya
+        çalışabilir."""
         self._reset_search()
         self.search_start_time = time.monotonic()
-        self.visited_positions = [(self.current_lat, self.current_lon)] if self.current_lat else []
         self.logger.info("[ARAMA] Arama tamamen sıfırlandı, yeniden başlıyor.")

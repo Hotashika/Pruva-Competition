@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
 """
 Task-3 Kamikaze Angajman Görevi — Aşama 2: YAKLAŞMA + EMİN OLMA
-GERÇEK HAYATTA ÇALIŞACAK ŞEKİLDE İYİLEŞTİRİLMİŞ VERSİYON
+GERÇEK HAYATTA ÇALIŞACAK ŞEKİLDE İYİLEŞTİRİLMİŞ VERSİYON (DÜZELTİLMİŞ)
 
 Bu modül bağımsızdır ve arama.py ile aynı mimariyi kullanır.
 Hedef kaybolursa otomatik olarak aramaya dönülmesi için sinyal gönderir.
+
+DÜZELTİLEN NOKTALAR:
+  1. EMERGENCY_STOP_DISTANCE_M bloğu SAFE_STOP_DISTANCE_M'den (1.0m) sonra
+     kontrol ediliyordu; 0.5m her zaman 1.0m şartını da sağladığından acil
+     durma bloğuna asla sıra gelmiyordu (dead code). Sıra değiştirildi.
+  2. "Emin olma" (CONFIRMING) mesafe kapısı işlevsizdi: target_confirmed
+     zaten _update_detection_history içinde, mesafeden bağımsız olarak
+     uzaktan da True oluyordu. Artık iki ayrı bayrak var:
+       - target_confirmed: genel takip güveni (uzaktan da olabilir)
+       - final_confirmed:  sadece CONFIRM_TRIGGER_DISTANCE_M içinde,
+         CONFIRM_HOLD_SEC kadar KESİNTİSİZ tutulursa açılır ve asıl
+         "dur/çarp" kararı buna bakar.
+     CONFIRM_HOLD_SEC artık gerçekten kullanılıyor.
+  3. TARGET_LOST_TOLERANCE_SEC tanımlı ama hiç kullanılmıyordu; artık
+     gerçek zaman + kare sayısı birlikte (ilk tetiklenen kazanır) kontrol
+     ediliyor -> sabit 10Hz varsayımına daha az bağımlı.
+  4. Acil durma bloğu state'i set edip bir sonraki tick'e bırakıyordu;
+     normal STOPPING ile tutarlı olacak şekilde aynı tick'te uygulanıyor.
 """
 
 import time
@@ -23,18 +41,18 @@ from utils.mavlink_utilities import (
 # ============================================================
 
 # --- GÜVENLİK MESAFELERİ ---
-SAFE_STOP_DISTANCE_M = 1.0          # Bu mesafede dur
-EMERGENCY_STOP_DISTANCE_M = 0.5     # Acil durma mesafesi (güvenlik)
-CONFIRM_TRIGGER_DISTANCE_M = 3.0    # Emin olma başlangıç mesafesi
+SAFE_STOP_DISTANCE_M = 1.0
+EMERGENCY_STOP_DISTANCE_M = 0.5
+CONFIRM_TRIGGER_DISTANCE_M = 3.0
 
 # --- EMİN OLMA (CONFIRMATION) ---
-MIN_CONSECUTIVE_DETECTIONS = 5      # Kaç ardışık karede görülmeli
-CONFIRM_HOLD_SEC = 1.5              # En az bu süre boyunca görülmeli
-DETECTION_HISTORY_SIZE = 10         # Kaç karelik geçmiş tutulacak
+MIN_CONSECUTIVE_DETECTIONS = 5
+CONFIRM_HOLD_SEC = 1.5
+DETECTION_HISTORY_SIZE = 10
 
 # --- HEDEF KAYBI TOLERANSI ---
-TARGET_LOST_TOLERANCE_SEC = 0.8     # Bu süre kaybolursa aramaya dön
-MAX_LOST_FRAMES = 8                 # Maksimum kayıp frame sayısı
+TARGET_LOST_TOLERANCE_SEC = 0.8
+MAX_LOST_FRAMES = 8
 
 # --- PID KATSAYILARI (YÖN KONTROLÜ) ---
 YAW_KP = 0.035
@@ -44,9 +62,9 @@ YAW_I_LIMIT = 0.15
 MAX_ANGULAR_Z = 0.5
 
 # --- HIZ KONTROLÜ ---
-SURGE_MAX_LINEAR_X = 0.55           # Maksimum ileri hız
-SURGE_MIN_LINEAR_X = 0.12           # Minimum ileri hız
-SURGE_SLOWDOWN_START_M = 5.0        # Yavaşlama başlangıç mesafesi
+SURGE_MAX_LINEAR_X = 0.55
+SURGE_MIN_LINEAR_X = 0.12
+SURGE_SLOWDOWN_START_M = 5.0
 
 # --- RÜZGAR/AKINTI TELAFİSİ ---
 DRIFT_KP = 0.04
@@ -61,69 +79,64 @@ DISTANCE_SMOOTH_WINDOW = 5
 
 
 class ApproachState(Enum):
-    TRACKING = auto()          # Normal takip
-    CONFIRMING = auto()        # Emin olma aşaması
-    TARGET_LOST_WAIT = auto()  # Hedef kayboldu, bekleniyor
-    STOPPING = auto()          # Durma manevrası
-    DONE = auto()              # Yaklaşma tamamlandı
-    LOST = auto()              # Hedef kayboldu (aramaya dön)
+    TRACKING = auto()
+    CONFIRMING = auto()
+    TARGET_LOST_WAIT = auto()
+    STOPPING = auto()
+    DONE = auto()
+    LOST = auto()
 
 
 class YaklasmaGorevi:
     """Yaklaşma ve emin olma görevi - GERÇEK HAYAT İÇİN OPTİMİZE"""
-    
+
     def __init__(self, node, mission_topics, target_class):
         self.node = node
         self.logger = node.get_logger()
         self.topics = mission_topics
         self.target_class = target_class
 
-        # Durum
         self.state = ApproachState.TRACKING
         self.finished = False
         self.target_lost = False
         self.approach_start_time = None
 
-        # Hedef tespit geçmişi (ARDİŞIK KONTROL İÇİN)
         self.detection_history = deque(maxlen=DETECTION_HISTORY_SIZE)
         self.consecutive_detections = 0
         self.last_detection_frame = 0
         self.frame_counter = 0
+
+        # YENİ: iki ayrı bayrak. target_confirmed genel takip güveni,
+        # final_confirmed ise yalnızca yakın mesafede + hold süresi
+        # boyunca kesintisiz tutulan gerçek "emin olma" onayı.
         self.target_confirmed = False
+        self.final_confirmed = False
         self.confirm_start_time = None
 
-        # Mesafe yumuşatma
         self.distance_buffer = deque(maxlen=DISTANCE_SMOOTH_WINDOW)
 
-        # PID durumu
         self.yaw_integral = 0.0
         self.yaw_prev_error = None
         self.prev_tick_time = None
 
-        # Kayıp takibi
         self.lost_since = None
         self.lost_frame_count = 0
 
-        # Son komutlar (rate limiting)
         self.last_angular_z = 0.0
         self.last_linear_x = 0.0
 
-        # Durma (STOPPING) fazı
         self.stopping_since = None
         self.reverse_start_time = None
         self.reverse_active = False
 
-        # IMU verisi
         self.gyro_z = 0.0
         self.accel_x = 0.0
         self.accel_y = 0.0
 
-        # Konum
         self.current_lat = None
         self.current_lon = None
         self.current_heading = 0.0
 
-        # İstatistikler
         self.total_detections = 0
         self.total_frames = 0
 
@@ -131,14 +144,12 @@ class YaklasmaGorevi:
 
     # --------------------------------------------------------
     def update_gps(self, lat, lon, heading):
-        """GPS verilerini güncelle."""
         self.current_lat = lat
         self.current_lon = lon
         self.current_heading = heading
 
     # --------------------------------------------------------
     def update_imu(self, gyro_z, accel_x, accel_y):
-        """IMU verilerini güncelle."""
         self.gyro_z = gyro_z
         self.accel_x = accel_x
         self.accel_y = accel_y
@@ -150,6 +161,7 @@ class YaklasmaGorevi:
         self.finished = False
         self.target_lost = False
         self.target_confirmed = False
+        self.final_confirmed = False
         self.consecutive_detections = 0
         self.confirm_start_time = None
         self.lost_since = None
@@ -165,32 +177,33 @@ class YaklasmaGorevi:
 
     # --------------------------------------------------------
     def should_return_to_search(self):
-        """Hedef kayboldu mu? Aramaya dönülmeli mi?"""
         return self.state == ApproachState.LOST or self.target_lost
 
     # --------------------------------------------------------
     def _select_target(self, detections):
-        """Tespitler arasından hedefi seç."""
         if not detections:
             return None
 
         candidates = [
             d for d in detections
             if d.get("class") == self.target_class
-            and d.get("distance") is not None
-            and d.get("distance", -1) > 0.3
-            and d.get("Buoy angle: ") is not None
+               and d.get("distance") is not None
+               and d.get("distance", -1) > 0.3
+               and d.get("Buoy angle: ") is not None
         ]
 
         if not candidates:
             return None
 
-        # En yakın hedefi seç
         return min(candidates, key=lambda d: d["distance"])
 
     # --------------------------------------------------------
     def _update_detection_history(self, target):
-        """Tespit geçmişini güncelle ve ardışık tespit kontrolü yap."""
+        """Tespit geçmişini güncelle ve genel takip güvenini
+        (target_confirmed) hesapla. Bu, yalnızca 'bu nesneye güvenerek
+        peşinden gidebilirim miyim' sorusuna cevap verir; asıl güvenlik
+        kararı (dur/çarp) final_confirmed'e bakar, o da update() içinde
+        mesafe + hold süresiyle ayrıca kontrol edilir."""
         self.frame_counter += 1
         self.total_frames += 1
 
@@ -201,21 +214,18 @@ class YaklasmaGorevi:
             self.lost_frame_count = 0
             self.lost_since = None
 
-            # Ardışık tespit sayısı yeterli mi?
             if self.consecutive_detections >= MIN_CONSECUTIVE_DETECTIONS:
                 if not self.target_confirmed:
                     self.target_confirmed = True
-                    self.confirm_start_time = time.monotonic()
                     self.logger.info(
-                        f"[EMİN OLMA] {MIN_CONSECUTIVE_DETECTIONS} ardışık tespit! "
-                        f"Hedef doğrulandı."
+                        f"[TAKİP] {MIN_CONSECUTIVE_DETECTIONS} ardışık tespit, "
+                        f"hedef takibe alındı (henüz nihai onay değil)."
                     )
                 return True
         else:
             self.detection_history.append(False)
             self.consecutive_detections = 0
 
-            # Hedef kaybı kontrolü
             if self.target_confirmed:
                 self.lost_frame_count += 1
                 if self.lost_since is None:
@@ -226,13 +236,11 @@ class YaklasmaGorevi:
 
     # --------------------------------------------------------
     def _smoothed_distance(self, raw_distance):
-        """Mesafeyi yumuşat."""
         self.distance_buffer.append(raw_distance)
         return sum(self.distance_buffer) / len(self.distance_buffer)
 
     # --------------------------------------------------------
     def _compute_yaw_command(self, angle_error_deg, dt):
-        """Yaw PID kontrolü."""
         self.yaw_integral += angle_error_deg * dt
         self.yaw_integral = max(-YAW_I_LIMIT, min(YAW_I_LIMIT, self.yaw_integral))
 
@@ -248,7 +256,6 @@ class YaklasmaGorevi:
 
     # --------------------------------------------------------
     def _compute_surge_command(self, distance_m):
-        """Hız komutunu hesapla."""
         if distance_m >= SURGE_SLOWDOWN_START_M:
             return SURGE_MAX_LINEAR_X
 
@@ -262,13 +269,11 @@ class YaklasmaGorevi:
 
     # --------------------------------------------------------
     def _drift_compensation(self):
-        """Rüzgar/akıntı telafisi."""
         comp = -DRIFT_KP * self.accel_y
         return max(-MAX_DRIFT_COMPENSATION, min(MAX_DRIFT_COMPENSATION, comp))
 
     # --------------------------------------------------------
     def _rate_limit(self, target, last, max_step):
-        """Komut yumuşatma."""
         delta = target - last
         if delta > max_step:
             return last + max_step
@@ -278,7 +283,6 @@ class YaklasmaGorevi:
 
     # --------------------------------------------------------
     def _start_stopping(self, now):
-        """Durma manevrasını başlat."""
         self.state = ApproachState.STOPPING
         self.stopping_since = now
         self.reverse_active = True
@@ -287,18 +291,15 @@ class YaklasmaGorevi:
 
     # --------------------------------------------------------
     def _do_stopping(self, now):
-        """Durma manevrasını uygula."""
-        # İlk olarak ters itki (0.5 sn)
         if self.reverse_active:
             reverse_duration = 0.5
             if now - self.reverse_start_time < reverse_duration:
                 publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=-0.15, angular_z=0.0)
                 return False
-            
+
             self.reverse_active = False
             self.logger.info("[YAKLAŞMA] Ters itki tamamlandı, duruluyor...")
 
-        # Tam dur
         stop_vehicle(self.topics.cmd_vel_pub)
         self.state = ApproachState.DONE
         self.finished = True
@@ -312,36 +313,40 @@ class YaklasmaGorevi:
         dt = 0.1 if self.prev_tick_time is None else max(0.01, now - self.prev_tick_time)
         self.prev_tick_time = now
 
-        # Başlangıç zamanını kaydet
         if self.approach_start_time is None:
             self.approach_start_time = now
 
-        # --- DURUM KONTROLLERİ ---
         if self.state == ApproachState.STOPPING:
             return self._do_stopping(now)
 
         if self.state in (ApproachState.DONE, ApproachState.LOST):
             return True
 
-        # --- HEDEF TESPİTİ ---
         target = self._select_target(detections)
-        is_confirmed = self._update_detection_history(target)
+        self._update_detection_history(target)
 
-        # HEDEF KAYBI KONTROLÜ
+        # --- HEDEF KAYBI KONTROLÜ ---
+        # DÜZELTME: artık hem gerçek geçen süre (TARGET_LOST_TOLERANCE_SEC)
+        # hem de kare sayısı (MAX_LOST_FRAMES) birlikte kontrol ediliyor;
+        # hangisi önce dolarsa aramaya dönülüyor. Böylece sabit 10Hz tick
+        # varsayımına daha az bağımlı oluyoruz.
         if target is None:
             if self.target_confirmed:
-                # Hedef onaylanmış ama kayboldu
-                if self.lost_frame_count >= MAX_LOST_FRAMES:
+                lost_elapsed = (now - self.lost_since) if self.lost_since else 0.0
+                if self.lost_frame_count >= MAX_LOST_FRAMES or lost_elapsed >= TARGET_LOST_TOLERANCE_SEC * 4:
+                    # Not: TARGET_LOST_TOLERANCE_SEC kısa bir tolerans
+                    # penceresidir (coast/yumuşatma için); gerçek "vazgeç"
+                    # kararını MAX_LOST_FRAMES ile birlikte, ondan biraz
+                    # daha uzun bir süre penceresinde veriyoruz.
                     self.logger.error(
-                        f"[YAKLAŞMA] Hedef {MAX_LOST_FRAMES} frame kayboldu! "
-                        f"Aramaya dönülüyor."
+                        f"[YAKLAŞMA] Hedef {self.lost_frame_count} karedir / "
+                        f"{lost_elapsed:.1f}sn'dir kayıp! Aramaya dönülüyor."
                     )
                     stop_vehicle(self.topics.cmd_vel_pub)
                     self.state = ApproachState.LOST
                     self.target_lost = True
                     return True
 
-                # Tolerans içinde: son komutla devam et
                 coast_linear = self.last_linear_x * 0.7
                 coast_angular = self.last_angular_z * 0.7
                 publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=coast_linear, angular_z=coast_angular)
@@ -349,7 +354,6 @@ class YaklasmaGorevi:
                 self.last_angular_z = coast_angular
                 return False
 
-            # Hedef hiç görülmemiş veya onaylanmamış
             stop_vehicle(self.topics.cmd_vel_pub)
             self.last_linear_x = 0.0
             self.last_angular_z = 0.0
@@ -360,25 +364,42 @@ class YaklasmaGorevi:
         angle_error = target["Buoy angle: "]
         distance = self._smoothed_distance(raw_distance)
 
-        # --- EMİN OLMA (CONFIRMATION) KONTROLÜ ---
-        if not self.target_confirmed and distance <= CONFIRM_TRIGGER_DISTANCE_M:
+        # --- EMİN OLMA (CONFIRMING) — nihai onay burada veriliyor ---
+        if not self.final_confirmed and distance <= CONFIRM_TRIGGER_DISTANCE_M:
             if self.state != ApproachState.CONFIRMING:
                 self.state = ApproachState.CONFIRMING
+                self.confirm_start_time = None
                 self.logger.info(
                     f"[EMİN OLMA] {CONFIRM_TRIGGER_DISTANCE_M:.1f}m içinde, "
                     f"doğrulama başlıyor..."
                 )
 
-            # Ardışık tespit sayısı kontrolü
             if self.consecutive_detections >= MIN_CONSECUTIVE_DETECTIONS:
-                self.target_confirmed = True
-                self.state = ApproachState.TRACKING
-                self.logger.info(
-                    f"[EMİN OLMA] ✅ Hedef doğrulandı! "
-                    f"({self.consecutive_detections} ardışık tespit)"
-                )
+                if self.confirm_start_time is None:
+                    self.confirm_start_time = now
+
+                held = now - self.confirm_start_time
+                if held >= CONFIRM_HOLD_SEC:
+                    self.final_confirmed = True
+                    self.state = ApproachState.TRACKING
+                    self.logger.info(
+                        f"[EMİN OLMA] ✅ Hedef nihai onaylandı! "
+                        f"({held:.1f}sn kesintisiz tutuldu)"
+                    )
+                else:
+                    yaw_cmd = self._compute_yaw_command(angle_error, dt)
+                    angular_z = self._rate_limit(yaw_cmd, self.last_angular_z, MAX_ANGULAR_STEP)
+                    publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=angular_z)
+                    self.last_angular_z = angular_z
+                    self.last_linear_x = 0.0
+                    self.logger.info(
+                        f"[EMİN OLMA] Tutuluyor... ({held:.1f}/{CONFIRM_HOLD_SEC:.1f}sn)",
+                        throttle_duration_sec=0.5
+                    )
+                    return False
             else:
-                # Doğrulama tamamlanmadı, ilerleme yok
+                # Ardışık tespit zinciri bozuldu -> hold süresi sıfırlanır
+                self.confirm_start_time = None
                 yaw_cmd = self._compute_yaw_command(angle_error, dt)
                 angular_z = self._rate_limit(yaw_cmd, self.last_angular_z, MAX_ANGULAR_STEP)
                 publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=angular_z)
@@ -390,31 +411,29 @@ class YaklasmaGorevi:
                 )
                 return False
 
+        # --- ACİL DURMA (EMERGENCY STOP) ---
+        # DÜZELTME: bu kontrol artık SAFE_STOP_DISTANCE_M kontrolünden ÖNCE
+        # yapılıyor. Eskiden 0.5m her zaman 1.0m şartını da sağladığından
+        # bu blok hiçbir zaman çalışmıyordu (dead code).
+        if distance <= EMERGENCY_STOP_DISTANCE_M:
+            self.logger.error(f"[ACİL] Çok yakın! {distance:.2f}m, acil dur!")
+            self._start_stopping(now)
+            return self._do_stopping(now)
+
         # --- GÜVENLİ MESAFE KONTROLÜ ---
         if distance <= SAFE_STOP_DISTANCE_M:
-            if self.target_confirmed:
+            if self.final_confirmed:
                 self._start_stopping(now)
                 return self._do_stopping(now)
             else:
-                # HEDEF DOĞRULANMADAN ÇOK YAKLAŞMA (GÜVENLİK)
                 self.logger.warn(
-                    f"[GÜVENLİK] Hedef doğrulanmadı ama {distance:.2f}m yakınında! "
-                    f"Durduruluyor, aramaya dönülüyor."
+                    f"[GÜVENLİK] Hedef nihai olarak doğrulanmadı ama {distance:.2f}m "
+                    f"yakınında! Durduruluyor, aramaya dönülüyor."
                 )
                 stop_vehicle(self.topics.cmd_vel_pub)
                 self.state = ApproachState.LOST
                 self.target_lost = True
                 return True
-
-        # --- ACİL DURMA (EMERGENCY STOP) ---
-        if distance <= EMERGENCY_STOP_DISTANCE_M:
-            self.logger.error(f"[ACİL] Çok yakın! {distance:.2f}m, acil dur!")
-            stop_vehicle(self.topics.cmd_vel_pub)
-            self.state = ApproachState.STOPPING
-            self.stopping_since = now
-            self.reverse_active = True
-            self.reverse_start_time = now
-            return False
 
         # --- PID KONTROL (NORMAL YAKLAŞMA) ---
         yaw_cmd = self._compute_yaw_command(angle_error, dt)
@@ -424,7 +443,6 @@ class YaklasmaGorevi:
         surge_cmd = self._compute_surge_command(distance)
         linear_x = self._rate_limit(surge_cmd, self.last_linear_x, MAX_LINEAR_STEP)
 
-        # Komutları uygula
         publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=linear_x, angular_z=angular_z)
         self.last_angular_z = angular_z
         self.last_linear_x = linear_x
@@ -433,12 +451,12 @@ class YaklasmaGorevi:
 
     # --------------------------------------------------------
     def get_status(self):
-        """Durum bilgilerini döndür."""
         return {
             "state": self.state.name,
             "finished": self.finished,
             "target_lost": self.target_lost,
             "target_confirmed": self.target_confirmed,
+            "final_confirmed": self.final_confirmed,
             "consecutive_detections": self.consecutive_detections,
             "distance": list(self.distance_buffer)[-1] if self.distance_buffer else None,
             "total_frames": self.total_frames,
