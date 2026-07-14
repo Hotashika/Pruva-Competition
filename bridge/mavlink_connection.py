@@ -5,9 +5,7 @@ from pymavlink import mavutil
 # Jetson 40-pin header UART (8N1, flow control disabled by pymavlink/pyserial defaults).
 DEFAULT_CONNECTION_STRING = "/dev/ttyTHS0"
 DEFAULT_BAUD = 921600
-
 DEFAULT_HEARTBEAT_TIMEOUT = 15
-
 
 def _close_mavlink(master):
     try:

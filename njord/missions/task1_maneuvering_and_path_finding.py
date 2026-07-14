@@ -21,6 +21,7 @@ from utils.mavlink_utilities import (
     wait_for_mission_services,
     call_set_mode,
     call_trigger_service,
+    parse_bridge_state,
     publish_cmd_vel,
     publish_set_position,
     stop_vehicle,
@@ -37,6 +38,7 @@ ACTIVE_TASK_NAME = "task1"
 # ============================================================
 GPS_TIMEOUT_SEC = 2.0  # Bu sure GPS gelmezse dur ve HOLD moda gecmeyi dene
 HEADING_TIMEOUT_SEC = 2.0  # Bu sure heading gelmezse dur ve HOLD moda gecmeyi dene
+BRIDGE_STATE_TIMEOUT_SEC = 10.0  # /cube/state bu sure gelmezse FAILSAFE + HOLD
 GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
 WAYPOINT_SETTLE_SEC = 0.75  # Her ana GPS noktasinda kesin durus suresi
 WAYPOINT_HEADING_TOLERANCE_DEG = 15.0  # Kucuk heading farklarinda gereksiz salinimi onler
@@ -82,7 +84,6 @@ class Task1Maneuvering:
     # Gorev durumunu, waypointleri ve guvenlik degiskenlerini hazirlar.
     def __init__(self, node, mission_topics, mission_clients):
         self.node = node
-        self.is_armed = False
         self.logger = node.get_logger()
 
         self.topics = mission_topics
@@ -107,6 +108,10 @@ class Task1Maneuvering:
         self.state = MissionState.INIT
         self.last_gps_time = None
         self.last_heading_time = None
+        self.bridge_connected = False
+        self.bridge_armed = False
+        self.bridge_mode = "UNKNOWN"
+        self.last_bridge_state_time = None
         self.home_lat = None
         self.home_lon = None
         self.avoiding_class = None  # RELEVANT_OBSTACLE_CLASSES icinden biri veya None
@@ -133,6 +138,15 @@ class Task1Maneuvering:
             self.home_lat = lat
             self.home_lon = lon
             self.logger.info(f"Home position set: {lat:.6f}, {lon:.6f}")
+
+    def update_bridge_state(self, connected, armed, mode, now=None):
+        """Bridge heartbeat durumunu görev güvenlik denetimine aktarır."""
+        self.bridge_connected = bool(connected)
+        self.bridge_armed = bool(armed)
+        self.bridge_mode = str(mode or "UNKNOWN").strip().upper()
+        self.last_bridge_state_time = (
+            time.monotonic() if now is None else float(now)
+        )
 
     # GPS veya heading verisi gecikirse gorevi FAILSAFE durumuna alir.
     def _request_hold_mode(self):
@@ -161,9 +175,13 @@ class Task1Maneuvering:
             return
 
         if res is not None and getattr(res, "mode_sent", False):
-            self.logger.warn(f"{HOLD_MODE_NAME} mode request accepted.")
+            self.logger.warn(
+                f"{HOLD_MODE_NAME} mode confirmed by Orange Cube heartbeat."
+            )
         else:
-            self.logger.error(f"{HOLD_MODE_NAME} mode request rejected.")
+            self.logger.error(
+                f"{HOLD_MODE_NAME} mode could not be confirmed by Orange Cube."
+            )
 
     def _enter_failsafe(self, reason, request_hold=False):
         """Araci FAILSAFE'e alir; gerekirse HOLD moda gecis istegi yollar."""
@@ -176,7 +194,7 @@ class Task1Maneuvering:
             self._request_hold_mode()
 
     def _check_watchdog(self):
-        """GPS/heading verisi zamanında gelmiyorsa FAILSAFE'e geç. True dönerse devam edilebilir."""
+        """Navigasyon ve araç durumu güvenliyse True döndürür."""
         now = time.monotonic()
 
         if self.last_gps_time is None:
@@ -198,6 +216,44 @@ class Task1Maneuvering:
             self._enter_failsafe(
                 f"HEADING DATA NOT RECEIVED FOR OVER {HEADING_TIMEOUT_SEC}s! FAILSAFE + HOLD.",
                 request_hold=True
+            )
+            return False
+
+        if self.last_bridge_state_time is None:
+            self._enter_failsafe(
+                "BRIDGE STATE NOT RECEIVED! FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            return False
+
+        bridge_state_age = now - self.last_bridge_state_time
+        if bridge_state_age > BRIDGE_STATE_TIMEOUT_SEC:
+            self._enter_failsafe(
+                f"BRIDGE STATE NOT RECEIVED FOR {bridge_state_age:.2f}s "
+                f"(limit {BRIDGE_STATE_TIMEOUT_SEC:.1f}s)! FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            return False
+
+        if not self.bridge_connected:
+            self._enter_failsafe(
+                "MAVLINK BRIDGE DISCONNECTED! FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            return False
+
+        if self.bridge_mode != "GUIDED":
+            self._enter_failsafe(
+                f"ORANGE CUBE LEFT GUIDED MODE (mode={self.bridge_mode})! "
+                "FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            return False
+
+        if not self.bridge_armed:
+            self._enter_failsafe(
+                "ORANGE CUBE IS NO LONGER ARMED! FAILSAFE + HOLD.",
+                request_hold=True,
             )
             return False
 
@@ -458,15 +514,15 @@ class Task1Maneuvering:
         # ---------------------------------------------------------
         # 0. GÜVENLİK KONTROLLERİ (her şeyden önce)
         # ---------------------------------------------------------
-        gps_ok = self._check_watchdog()
+        safety_ok = self._check_watchdog()
 
         if self.state == MissionState.FAILSAFE:
             stop_vehicle(self.topics.cmd_vel_pub)
             self.logger.warn("FAILSAFE active, vehicle stopped.", throttle_duration_sec=2.0)
             return
 
-        if not gps_ok:
-            # Henüz hiç GPS gelmedi (başlangıç), bekle
+        if not safety_ok:
+            # Henüz zorunlu sensörlerden biri gelmediyse bekle.
             self.logger.info(f"Waiting for {self.waiting_for_sensor_text}...", throttle_duration_sec=2.0)
             publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
             return
@@ -631,6 +687,9 @@ class Task1Node(Node):
         # Anlık Yönelim Değişkeni (GPS Callback'e aktarmak için)
         self.current_heading = None
         self.bridge_connected = False
+        self.bridge_armed = False
+        self.bridge_mode = "UNKNOWN"
+        self._last_logged_bridge_state = None
         self.mission_active = False
         self.valid_gps_received = False
         self.valid_heading_received = False
@@ -713,15 +772,51 @@ class Task1Node(Node):
 
     # Bridge durumundan MAVLink baglantisinin hazir olup olmadigini izler.
     def state_callback(self, msg):
-        """Bridge'den gelen durum mesajlarını dinler (Gerekirse kullanılır)."""
-        self.bridge_connected = "connected=True" in msg.data
+        """Bridge durumunu ayrıştırır, değişiklikleri loglar ve göreve aktarır."""
+        state = parse_bridge_state(msg.data)
+        required_keys = {"connected", "armed", "mode"}
+        if not required_keys.issubset(state):
+            self.get_logger().warn(
+                f"Incomplete /cube/state ignored: {msg.data}",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        self.bridge_connected = state["connected"] is True
+        self.bridge_armed = state["armed"] is True
+        self.bridge_mode = str(state["mode"] or "UNKNOWN").strip().upper()
+
+        current_state = (
+            self.bridge_connected,
+            self.bridge_armed,
+            self.bridge_mode,
+        )
+        if current_state != self._last_logged_bridge_state:
+            self.get_logger().info(
+                "Task1 bridge state: "
+                f"connected={self.bridge_connected}, "
+                f"armed={self.bridge_armed}, mode={self.bridge_mode}"
+            )
+            self._last_logged_bridge_state = current_state
+
+        self.task.update_bridge_state(
+            self.bridge_connected,
+            self.bridge_armed,
+            self.bridge_mode,
+        )
 
     # Mission baslamadan once bridge heartbeat bilgisini bekler.
     def wait_for_bridge_connection(self, timeout_sec=30.0):
         """Bridge servisleri hazir olsa bile MAVLink heartbeat gelene kadar bekler."""
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and time.monotonic() < deadline:
-            if self.bridge_connected:
+            now = time.monotonic()
+            state_fresh = (
+                self.task.last_bridge_state_time is not None
+                and now - self.task.last_bridge_state_time
+                <= BRIDGE_STATE_TIMEOUT_SEC
+            )
+            if self.bridge_connected and state_fresh:
                 return True
 
             self.get_logger().info(
@@ -737,7 +832,21 @@ class Task1Node(Node):
         """Mission ARM olmadan once gercek GPS ve heading verisini bekler."""
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and time.monotonic() < deadline:
-            if self.valid_gps_received and self.valid_heading_received:
+            now = time.monotonic()
+            gps_fresh = (
+                self.task.last_gps_time is not None
+                and now - self.task.last_gps_time <= GPS_TIMEOUT_SEC
+            )
+            heading_fresh = (
+                self.task.last_heading_time is not None
+                and now - self.task.last_heading_time <= HEADING_TIMEOUT_SEC
+            )
+            if (
+                    self.valid_gps_received
+                    and self.valid_heading_received
+                    and gps_fresh
+                    and heading_fresh
+            ):
                 return True
 
             self.get_logger().info(
@@ -746,6 +855,108 @@ class Task1Node(Node):
             )
             rclpy.spin_once(self, timeout_sec=0.1)
 
+        return False
+
+    def wait_for_vehicle_state(
+            self,
+            expected_mode=None,
+            expected_armed=None,
+            timeout_sec=6.0,
+    ):
+        """Beklenen mode/armed değerlerini taze /cube/state üzerinden doğrular."""
+        expected_mode = (
+            None
+            if expected_mode is None
+            else str(expected_mode).strip().upper()
+        )
+        deadline = time.monotonic() + float(timeout_sec)
+        expected_parts = ["connected=True"]
+        if expected_mode is not None:
+            expected_parts.append(f"mode={expected_mode}")
+        if expected_armed is not None:
+            expected_parts.append(f"armed={bool(expected_armed)}")
+        expected_text = ", ".join(expected_parts)
+
+        self.get_logger().info(
+            f"Task1 waiting for confirmed vehicle state: {expected_text}"
+        )
+
+        while rclpy.ok() and time.monotonic() < deadline:
+            now = time.monotonic()
+            state_fresh = (
+                self.task.last_bridge_state_time is not None
+                and now - self.task.last_bridge_state_time
+                <= BRIDGE_STATE_TIMEOUT_SEC
+            )
+            mode_ok = expected_mode is None or self.bridge_mode == expected_mode
+            armed_ok = (
+                expected_armed is None
+                or self.bridge_armed == bool(expected_armed)
+            )
+            if self.bridge_connected and state_fresh and mode_ok and armed_ok:
+                self.get_logger().info(
+                    f"Task1 vehicle state confirmed: {expected_text}"
+                )
+                return True
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        self.get_logger().error(
+            "Task1 vehicle-state confirmation timeout: "
+            f"expected=({expected_text}), actual=(connected={self.bridge_connected}, "
+            f"armed={self.bridge_armed}, mode={self.bridge_mode})"
+        )
+        return False
+
+    def wait_for_operational_readiness(self, timeout_sec=3.0):
+        """ARM sonrasında tüm görev girdilerinin hâlâ taze olduğunu doğrular."""
+        deadline = time.monotonic() + float(timeout_sec)
+        gps_fresh = False
+        heading_fresh = False
+        state_fresh = False
+        vision_fresh = False
+        while rclpy.ok() and time.monotonic() < deadline:
+            now = time.monotonic()
+            gps_fresh = (
+                self.task.last_gps_time is not None
+                and now - self.task.last_gps_time <= GPS_TIMEOUT_SEC
+            )
+            heading_fresh = (
+                self.task.last_heading_time is not None
+                and now - self.task.last_heading_time <= HEADING_TIMEOUT_SEC
+            )
+            state_fresh = (
+                self.task.last_bridge_state_time is not None
+                and now - self.task.last_bridge_state_time
+                <= BRIDGE_STATE_TIMEOUT_SEC
+            )
+            vision_fresh = (
+                self.last_detection_time is not None
+                and now - self.last_detection_time
+                <= VISION_DETECTION_TIMEOUT_SEC
+            )
+            if (
+                    self.bridge_connected
+                    and self.bridge_armed
+                    and self.bridge_mode == "GUIDED"
+                    and gps_fresh
+                    and heading_fresh
+                    and state_fresh
+                    and vision_fresh
+            ):
+                self.get_logger().info(
+                    "Task1 operational readiness confirmed: "
+                    "GPS/heading/vision/bridge fresh, armed=True, mode=GUIDED"
+                )
+                return True
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        self.get_logger().error(
+            "Task1 operational-readiness timeout: "
+            f"connected={self.bridge_connected}, armed={self.bridge_armed}, "
+            f"mode={self.bridge_mode}, gps_fresh={gps_fresh}, "
+            f"heading_fresh={heading_fresh}, state_fresh={state_fresh}, "
+            f"vision_fresh={vision_fresh}"
+        )
         return False
 
     def wait_for_vision(self, timeout_sec=30.0):
@@ -836,6 +1047,14 @@ def main(args=None):
         if mode_ok is False:
             node.get_logger().error("Failed to switch to GUIDED mode! Mission not starting.")
             return
+        if not node.wait_for_vehicle_state(
+                expected_mode="GUIDED",
+                timeout_sec=6.0,
+        ):
+            node.get_logger().error(
+                "GUIDED was not confirmed on /cube/state; mission not starting."
+            )
+            return
 
         node.get_logger().info("Force arming vehicle...")
         arm_ok = call_trigger_service(
@@ -848,9 +1067,30 @@ def main(args=None):
             node.get_logger().error("FORCE ARM failed! Mission not starting.")
             return
 
+        if not node.wait_for_vehicle_state(
+                expected_mode="GUIDED",
+                expected_armed=True,
+                timeout_sec=6.0,
+        ):
+            node.get_logger().error(
+                "armed=True and mode=GUIDED were not confirmed; mission not starting."
+            )
+            return
+
+        if not node.wait_for_operational_readiness(timeout_sec=3.0):
+            node.get_logger().error(
+                "Fresh GPS/heading/vision/bridge data was not restored after arming; "
+                "mission not starting."
+            )
+            return
+
         node.mission_active = True
         node.publish_active_task()
-        node.get_logger().info("Mission loop started.")
+        node.get_logger().info(
+            "Task 1 mission loop started with confirmed vehicle state: "
+            f"connected={node.bridge_connected}, armed={node.bridge_armed}, "
+            f"mode={node.bridge_mode}"
+        )
 
         while rclpy.ok() and not node.task.finished and node.task.state != MissionState.FAILSAFE:
             rclpy.spin_once(node, timeout_sec=0.1)

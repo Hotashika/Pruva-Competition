@@ -93,6 +93,10 @@ class OrangeCubeBridgeNode(Node):
             float(os.getenv("MAVLINK_RECONNECT_HEARTBEAT_TIMEOUT", "3.0")),
         )
         self.declare_parameter(
+            "command_confirmation_timeout_sec",
+            float(os.getenv("MAVLINK_COMMAND_CONFIRM_TIMEOUT", "4.0")),
+        )
+        self.declare_parameter(
             "disarm_on_shutdown",
             os.getenv("MAVLINK_DISARM_ON_SHUTDOWN", "1").lower()
             not in ("0", "false", "no", "off"),
@@ -110,6 +114,9 @@ class OrangeCubeBridgeNode(Node):
         self.reconnect_interval_sec = float(self.get_parameter("reconnect_interval_sec").value)
         self.reconnect_heartbeat_timeout = float(
             self.get_parameter("reconnect_heartbeat_timeout").value
+        )
+        self.command_confirmation_timeout_sec = float(
+            self.get_parameter("command_confirmation_timeout_sec").value
         )
         self.disarm_on_shutdown = bool(self.get_parameter("disarm_on_shutdown").value)
         self.mission_launch_enabled = bool(
@@ -142,6 +149,7 @@ class OrangeCubeBridgeNode(Node):
         self.cmd_timeout_sec = 0.5
         self.last_target_q = self._yaw_to_mavlink_quaternion(0.0)
         self.last_thrust = 0.0
+        self.last_attitude_tx_active = False
         self.last_position_target_time = 0.0
         self.position_target_timeout_sec = 0.5
         self.active_mission_name = None
@@ -573,6 +581,7 @@ class OrangeCubeBridgeNode(Node):
 
     def _neutralize_outputs(self):
         self.last_thrust = 0.0
+        self.last_attitude_tx_active = False
         self.last_position_target_time = 0.0
         if self.yaw is not None:
             self.last_target_q = self._yaw_to_mavlink_quaternion(self.yaw)
@@ -631,6 +640,125 @@ class OrangeCubeBridgeNode(Node):
         if not hasattr(msg, "get_srcComponent"):
             return True
         return msg.get_srcComponent() == self.master.target_component
+
+    @staticmethod
+    def _normalize_mode_name(mode_name):
+        return str(mode_name or "UNKNOWN").strip().upper()
+
+    @staticmethod
+    def _mav_result_name(result):
+        try:
+            return mavutil.mavlink.enums["MAV_RESULT"][int(result)].name
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return f"MAV_RESULT_{result}"
+
+    def _update_vehicle_state_from_heartbeat(self, msg, source="heartbeat"):
+        previous_state = (self.connected, self.armed, self.mode)
+        self.mode = mavutil.mode_string_v10(msg)
+        self.armed = bool(
+            msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+        )
+        self.last_heartbeat_time = time.time()
+        self.connected = True
+        self.connection_lost_reported = False
+        self.cmd_vel_ignored_reported = False
+
+        current_state = (self.connected, self.armed, self.mode)
+        if current_state != previous_state:
+            self.get_logger().info(
+                "Orange Cube state transition "
+                f"({source}): connected={self.connected}, "
+                f"armed={self.armed}, mode={self.mode}"
+            )
+
+    def _log_command_ack(self, msg):
+        command = int(getattr(msg, "command", -1))
+        result = int(getattr(msg, "result", -1))
+        result_name = self._mav_result_name(result)
+        log_text = f"MAVLink RX COMMAND_ACK: command={command}, result={result_name}({result})"
+        accepted_results = {
+            mavutil.mavlink.MAV_RESULT_ACCEPTED,
+            mavutil.mavlink.MAV_RESULT_IN_PROGRESS,
+        }
+        if result in accepted_results:
+            self.get_logger().info(log_text)
+        else:
+            self.get_logger().warn(log_text)
+        return command, result
+
+    def _wait_for_vehicle_state(
+            self,
+            predicate,
+            description,
+            expected_command=None,
+            timeout_sec=None,
+    ):
+        timeout_sec = (
+            self.command_confirmation_timeout_sec
+            if timeout_sec is None
+            else float(timeout_sec)
+        )
+        deadline = time.time() + timeout_sec
+        self.get_logger().info(
+            f"Orange Cube confirmation waiting: {description}, timeout={timeout_sec:.1f}s"
+        )
+
+        while time.time() < deadline:
+            if predicate():
+                self.get_logger().info(
+                    f"Orange Cube confirmation received: {description}"
+                )
+                return True
+
+            msg = self.master.recv_match(
+                type=["HEARTBEAT", "COMMAND_ACK", "STATUSTEXT"],
+                blocking=True,
+                timeout=min(0.25, max(0.0, deadline - time.time())),
+            )
+            if msg is None or not self._message_from_target(msg):
+                continue
+
+            msg_type = msg.get_type()
+            if msg_type == "HEARTBEAT":
+                self._update_vehicle_state_from_heartbeat(msg, source="command confirmation")
+                continue
+
+            if msg_type == "STATUSTEXT":
+                self._log_statustext(msg)
+                continue
+
+            command, result = self._log_command_ack(msg)
+            if expected_command is None or command != expected_command:
+                continue
+
+            accepted_results = {
+                mavutil.mavlink.MAV_RESULT_ACCEPTED,
+                mavutil.mavlink.MAV_RESULT_IN_PROGRESS,
+            }
+            if result not in accepted_results:
+                self.get_logger().error(
+                    f"Orange Cube command rejected before state confirmation: {description}"
+                )
+                return False
+
+        self.get_logger().error(
+            "Orange Cube confirmation timeout: "
+            f"expected={description}, connected={self.connected}, "
+            f"armed={self.armed}, mode={self.mode}"
+        )
+        return False
+
+    def _vehicle_ready_for_guided_motion(self, action_name):
+        mode_name = self._normalize_mode_name(self.mode)
+        if self.armed and mode_name == "GUIDED":
+            return True
+
+        self.get_logger().warn(
+            f"{action_name} ignored: Orange Cube is not motion-ready "
+            f"(connected={self.connected}, armed={self.armed}, mode={self.mode}).",
+            throttle_duration_sec=1.0,
+        )
+        return False
 
     def _try_reconnect(self):
         now = time.time()
@@ -773,16 +901,10 @@ class OrangeCubeBridgeNode(Node):
                     continue
 
                 if msg_type == "HEARTBEAT":
-                    self.mode = mavutil.mode_string_v10(msg)
-                    self.armed = bool(
-                        msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                    )
-                    self.last_heartbeat_time = time.time()
-                    if not self.connected or self.connection_lost_reported:
-                        self.get_logger().info("MAVLink heartbeat tekrar alindi.")
-                    self.connected = True
-                    self.connection_lost_reported = False
-                    self.cmd_vel_ignored_reported = False
+                    self._update_vehicle_state_from_heartbeat(msg)
+
+                elif msg_type == "COMMAND_ACK":
+                    self._log_command_ack(msg)
 
                 elif msg_type == "GLOBAL_POSITION_INT":
                     self.gps_lat = msg.lat / 1e7
@@ -924,21 +1046,34 @@ class OrangeCubeBridgeNode(Node):
             response.mode_sent = False
             return response
 
-        mode_name = request.custom_mode
+        mode_name = self._normalize_mode_name(request.custom_mode)
         mapping = self.master.mode_mapping()
         if mode_name not in mapping:
             self.get_logger().error(f"Bilinmeyen mod: {mode_name}")
             response.mode_sent = False
             return response
 
+        if self._normalize_mode_name(self.mode) == mode_name:
+            self.get_logger().info(
+                f"Mode confirmation already valid: mode={self.mode}"
+            )
+            response.mode_sent = True
+            return response
+
         try:
+            self.get_logger().info(
+                f"MAVLink TX SET_MODE: requested={mode_name}, current={self.mode}"
+            )
             self.master.mav.set_mode_send(
                 self.master.target_system,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
                 mapping[mode_name],
             )
-            self.get_logger().info(f"Mod komutu gonderildi: {mode_name}")
-            response.mode_sent = True
+            response.mode_sent = self._wait_for_vehicle_state(
+                lambda: self._normalize_mode_name(self.mode) == mode_name,
+                f"mode={mode_name}",
+                expected_command=mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            )
             return response
         except Exception as exc:
             self._publish_error(f"Mod degistirme hatasi: {exc}")
@@ -948,27 +1083,46 @@ class OrangeCubeBridgeNode(Node):
     def _arm_callback(self, request, response):
         success = self._arm_disarm(True)
         response.success = success
-        response.message = "ARM komutu gonderildi." if success else "ARM komutu basarisiz."
+        response.message = "ARM heartbeat ile dogrulandi." if success else "ARM dogrulanamadi."
         return response
 
     def _force_arm_callback(self, request, response):
         success = self._arm_disarm(True, force=True)
         response.success = success
-        response.message = "FORCE ARM komutu gonderildi." if success else "FORCE ARM komutu basarisiz."
+        response.message = (
+            "FORCE ARM heartbeat ile dogrulandi."
+            if success
+            else "FORCE ARM dogrulanamadi."
+        )
         return response
 
     def _disarm_callback(self, request, response):
         success = self._arm_disarm(False)
         response.success = success
-        response.message = "DISARM komutu gonderildi." if success else "DISARM komutu basarisiz."
+        response.message = (
+            "DISARM heartbeat ile dogrulandi."
+            if success
+            else "DISARM dogrulanamadi."
+        )
         return response
 
     def _arm_disarm(self, arm, force=False):
         if self._reject_without_link("ARM/DISARM komutu"):
             return False
 
+        requested_state = "armed=True" if arm else "armed=False"
+        if self.armed == bool(arm):
+            self.get_logger().info(
+                f"Arm-state confirmation already valid: {requested_state}"
+            )
+            return True
+
         force_code = 21196 if arm and force else 0
         try:
+            action_name = "FORCE ARM" if arm and force else ("ARM" if arm else "DISARM")
+            self.get_logger().info(
+                f"MAVLink TX {action_name}: current_armed={self.armed}, mode={self.mode}"
+            )
             self.master.mav.command_long_send(
                 self.master.target_system,
                 self.master.target_component,
@@ -982,11 +1136,11 @@ class OrangeCubeBridgeNode(Node):
                 0,
                 0,
             )
-            if arm and force:
-                self.get_logger().info("FORCE ARM komutu gonderildi.")
-            else:
-                self.get_logger().info("ARM komutu gonderildi." if arm else "DISARM komutu gonderildi.")
-            return True
+            return self._wait_for_vehicle_state(
+                lambda: self.armed == bool(arm),
+                requested_state,
+                expected_command=mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            )
         except Exception as exc:
             self._publish_error(f"ARM/DISARM hatasi: {exc}")
             return False
@@ -1074,6 +1228,9 @@ class OrangeCubeBridgeNode(Node):
             )
             return
 
+        if not self._vehicle_ready_for_guided_motion("/cube/set_position"):
+            return
+
         lat = float(msg.latitude)
         lon = float(msg.longitude)
         if abs(lat) < 1e-6 and abs(lon) < 1e-6:
@@ -1087,7 +1244,8 @@ class OrangeCubeBridgeNode(Node):
             set_position(self.master, (lat, lon), self.boot_time)
             self.last_position_target_time = time.time()
             self.get_logger().info(
-                f"set_position: lat={lat:.7f}, lon={lon:.7f}",
+                "MAVLink TX SET_POSITION_TARGET_GLOBAL_INT: "
+                f"lat={lat:.7f}, lon={lon:.7f}, armed={self.armed}, mode={self.mode}",
                 throttle_duration_sec=1.0,
             )
         except Exception as exc:
@@ -1104,6 +1262,10 @@ class OrangeCubeBridgeNode(Node):
                 )
             return
 
+        if not self._vehicle_ready_for_guided_motion("/cube/cmd_vel"):
+            self._neutralize_outputs()
+            return
+
         self.cmd_vel_ignored_reported = False
         self.last_position_target_time = 0.0
 
@@ -1117,9 +1279,9 @@ class OrangeCubeBridgeNode(Node):
         self.last_cmd_vel_time = time.time()
 
         self.get_logger().info(
-            f"cmd_vel: linear={linear_x:.2f}, angular={angular_z:.2f} | "
+            f"cmd_vel accepted: linear={linear_x:.2f}, angular={angular_z:.2f} | "
             f"target_yaw={math.degrees(target_yaw_rad):.1f}deg, "
-            f"thrust={self.last_thrust:.2f}",
+            f"thrust={self.last_thrust:.2f}, armed={self.armed}, mode={self.mode}",
             throttle_duration_sec=1.0,
         )
 
@@ -1131,10 +1293,18 @@ class OrangeCubeBridgeNode(Node):
             self._neutralize_outputs()
             return
 
+        command_age = time.time() - self.last_cmd_vel_time
+        if not self.armed or self._normalize_mode_name(self.mode) != "GUIDED":
+            if command_age <= self.cmd_timeout_sec or self.last_attitude_tx_active:
+                self._vehicle_ready_for_guided_motion("SET_ATTITUDE_TARGET TX")
+            self.last_attitude_tx_active = False
+            return
+
         if time.time() - self.last_position_target_time <= self.position_target_timeout_sec:
             return
 
-        if time.time() - self.last_cmd_vel_time > self.cmd_timeout_sec:
+        command_active = command_age <= self.cmd_timeout_sec
+        if not command_active:
             q = (
                 self._yaw_to_mavlink_quaternion(self.yaw)
                 if self.yaw is not None
@@ -1159,6 +1329,19 @@ class OrangeCubeBridgeNode(Node):
                 0,
                 thrust,
             )
+            if command_active:
+                self.get_logger().info(
+                    "MAVLink TX SET_ATTITUDE_TARGET: "
+                    f"thrust={thrust:.2f}, cmd_age={command_age:.2f}s, "
+                    f"armed={self.armed}, mode={self.mode}",
+                    throttle_duration_sec=1.0,
+                )
+            elif self.last_attitude_tx_active:
+                self.get_logger().info(
+                    "MAVLink TX SET_ATTITUDE_TARGET stop: "
+                    f"cmd_vel timeout ({command_age:.2f}s), thrust=0.00"
+                )
+            self.last_attitude_tx_active = command_active
         except Exception as exc:
             self._publish_error(f"Attitude target hatasi: {exc}")
 
