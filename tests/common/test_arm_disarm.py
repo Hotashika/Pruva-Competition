@@ -31,7 +31,7 @@ DEFAULT_MODE = "GUIDED"
 class BridgeMotorTestNode(Node):
     def __init__(self):
         super().__init__("bridge_motor_test_node")
-        self.clients = create_mission_clients(self)
+        self.mission_clients = create_mission_clients(self)
         self.cmd_vel_pub = self.create_publisher(Twist, "/cube/cmd_vel", 10)
 
 
@@ -74,13 +74,17 @@ def main():
     armed_by_test = False
 
     try:
-        wait_for_mission_services(node, node.clients)
+        wait_for_mission_services(node, node.mission_clients)
 
         node.get_logger().info(f"Setting vehicle to {args.mode} mode...")
-        if call_set_mode(node, node.clients.set_mode_client, args.mode) is False:
+        if call_set_mode(node, node.mission_clients.set_mode_client, args.mode) is False:
             raise RuntimeError(f"Failed to switch to {args.mode} mode.")
 
-        arm_client = node.clients.arm_client if args.normal_arm else node.clients.force_arm_client
+        arm_client = (
+            node.mission_clients.arm_client
+            if args.normal_arm
+            else node.mission_clients.force_arm_client
+        )
         arm_label = "ARM" if args.normal_arm else "FORCE ARM"
         node.get_logger().info(f"{arm_label} requested...")
         if call_trigger_service(node, arm_client, arm_label) is False:
@@ -101,7 +105,7 @@ def main():
         stop_vehicle(node.cmd_vel_pub)
 
         if armed_by_test and not args.no_disarm:
-            call_trigger_service(node, node.clients.disarm_client, "DISARM")
+            call_trigger_service(node, node.mission_clients.disarm_client, "DISARM")
             stop_vehicle(node.cmd_vel_pub)
 
         node.destroy_node()
