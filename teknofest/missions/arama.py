@@ -1,6 +1,6 @@
 """
 Task-3 Kamikaze Angajman Görevi — Aşama 1: ARAMA
-GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON
+GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v2)
 
 Yapılan düzeltmeler (bkz. sohbet açıklaması):
   1. Tespit onayı artık sadece "art arda kaçırınca sıfırla" değil,
@@ -14,6 +14,18 @@ Yapılan düzeltmeler (bkz. sohbet açıklaması):
      max_search_retries aşılınca uyarı + arama alanını genişletme
      tetikleniyor (dead code değil).
   5. total_rotation_completed gerçekten güncelleniyor (istatistik/telemetri).
+  6. [YENİ - v2] TARGET_LOST state'i artık gerçekten update() içinde
+     yakalanıyor. Önceki versiyonda _update_detection_history() önce
+     state'i TARGET_LOST yapıp hemen ardından _reset_search()'ü
+     kendi içinde çağırıyordu; _reset_search() ise state'i SCANNING'e
+     eziyordu. Bu yüzden update() içindeki
+         if self.state == SearchState.TARGET_LOST: ...
+     bloğu hiçbir zaman çalışmıyordu (dead code) -> "hedef kayboldu"
+     logu hiç basılmıyordu ve reset iki farklı yerde yarım yamalak
+     yapılıyordu. Artık _update_detection_history() sadece state'i
+     TARGET_LOST'a çekiyor, tüm resetleme işini update() içindeki
+     (artık gerçekten tetiklenen) TARGET_LOST bloğu tek noktadan,
+     _reset_search() üzerinden yapıyor.
 """
 
 import math
@@ -169,6 +181,12 @@ class AramaGorevi:
         Yeni davranış: son DETECTION_HISTORY_SIZE tick içinde en az
         MIN_CONSECUTIVE_DETECTIONS pozitif tespit VARSA ve şu anki tick de
         pozitifse hedef onaylanır. Tek karelik kaçırmalar onayı bozmaz.
+
+        NOT (v2 düzeltmesi): Bu fonksiyon artık kendi içinde _reset_search()
+        ÇAĞIRMIYOR. Sadece state'i TARGET_LOST'a çekiyor; asıl resetleme
+        işini update() içindeki TARGET_LOST bloğu tek noktadan yapıyor.
+        Böylece state, update() tarafından gerçekten görülebiliyor ve
+        "hedef kayboldu" logu/telemetri akışı doğru çalışıyor.
         """
         self.detection_history.append(target is not None)
 
@@ -190,16 +208,11 @@ class AramaGorevi:
             self.ticks_since_last_detection += 1
             if self.target_confirmed:
                 if self.ticks_since_last_detection >= MAX_DETECTION_GAP:
-                    self.logger.warning(
-                        f"[ARAMA] Hedef {MAX_DETECTION_GAP} tick boyunca görülmedi, "
-                        f"yeniden aramaya dönülüyor..."
-                    )
                     self.target_confirmed = False
                     self.state = SearchState.TARGET_LOST
                     self.finished = False
                     self.found_target = None
                     self._register_search_retry()
-                    self._reset_search()
                     return False
             return False
 
@@ -348,14 +361,12 @@ class AramaGorevi:
                                f"ziyaret edilen konum: {len(self.visited_positions)}")
             return True
 
+        # 2) Hedef az önce kayboldu (bkz. _update_detection_history) ->
+        #    tek noktadan, tam bir reset yapılıyor. (v2 düzeltmesi:
+        #    bu blok artık gerçekten tetikleniyor.)
         if self.state == SearchState.TARGET_LOST:
-            self.logger.info("[ARAMA] Hedef kayboldu, yeniden arama başlatılıyor...")
-            self.state = SearchState.SCANNING
-            self.finished = False
-            self.rotated_deg_this_station = 0.0
-            self.step_start_heading = None
-            self.step_start_time = None
-            self.station_start_time = time.monotonic()
+            self.logger.warning("[ARAMA] Hedef kayboldu, yeniden arama başlatılıyor...")
+            self._reset_search()
             return False
 
         # 3) Arama devam ediyor
