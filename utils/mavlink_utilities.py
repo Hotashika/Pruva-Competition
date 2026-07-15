@@ -1,4 +1,5 @@
 import math
+import time
 from dataclasses import dataclass
 
 import rclpy
@@ -42,6 +43,7 @@ class BridgeTopics:
     battery_pub: object
     state_pub: object
     error_pub: object
+    diagnostics_pub: object
     cmd_vel_sub: object
     position_target_sub: object
 
@@ -73,6 +75,7 @@ def create_bridge_topics(node, cmd_vel_callback, set_position_callback=None):
             /cube/battery
             /cube/state
             /cube/error
+            /cube/diagnostics
 
         Subscriber:
             /cube/cmd_vel
@@ -121,6 +124,12 @@ def create_bridge_topics(node, cmd_vel_callback, set_position_callback=None):
         10
     )
 
+    diagnostics_pub = node.create_publisher(
+        String,
+        '/cube/diagnostics',
+        10
+    )
+
     cmd_vel_sub = node.create_subscription(
         Twist,
         '/cube/cmd_vel',
@@ -145,6 +154,7 @@ def create_bridge_topics(node, cmd_vel_callback, set_position_callback=None):
         battery_pub=battery_pub,
         state_pub=state_pub,
         error_pub=error_pub,
+        diagnostics_pub=diagnostics_pub,
         cmd_vel_sub=cmd_vel_sub,
         position_target_sub=position_target_sub,
     )
@@ -358,14 +368,48 @@ def call_set_mode(node, set_mode_client, mode_name, timeout_sec=5.0):
     req.base_mode = 0
     req.custom_mode = str(mode_name)
 
-    future = set_mode_client.call_async(req)
-    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout_sec)
+    service_name = getattr(set_mode_client, 'srv_name', '/cube/set_mode_service')
+    started_at = time.monotonic()
+    node.get_logger().info(
+        f'SET_MODE servis istegi: service={service_name}, '
+        f'base_mode={req.base_mode}, custom_mode={req.custom_mode!r}, '
+        f'timeout={timeout_sec:.1f}s'
+    )
+
+    try:
+        future = set_mode_client.call_async(req)
+        rclpy.spin_until_future_complete(node, future, timeout_sec=timeout_sec)
+    except Exception as exc:
+        elapsed_sec = time.monotonic() - started_at
+        node.get_logger().error(
+            f'SET_MODE servis cagrisi baslatilamadi/tamamlanamadi: '
+            f'service={service_name}, elapsed={elapsed_sec:.3f}s, '
+            f'exception={exc!r}'
+        )
+        return False
+
+    elapsed_sec = time.monotonic() - started_at
 
     if not future.done():
-        node.get_logger().error(f'Mod degistirme zaman asimi: {mode_name}')
+        node.get_logger().error(
+            f'Mod degistirme zaman asimi: mode={mode_name}, '
+            f'service={service_name}, elapsed={elapsed_sec:.3f}s'
+        )
+        return False
+
+    exception = future.exception()
+    if exception is not None:
+        node.get_logger().error(
+            f'SET_MODE servis hatasi: service={service_name}, '
+            f'elapsed={elapsed_sec:.3f}s, exception={exception!r}'
+        )
         return False
 
     res = future.result()
+    node.get_logger().info(
+        f'SET_MODE ham servis cevabi: service={service_name}, '
+        f'elapsed={elapsed_sec:.3f}s, response={res!r}'
+    )
 
     if res is not None and res.mode_sent:
         node.get_logger().info(
@@ -374,7 +418,9 @@ def call_set_mode(node, set_mode_client, mode_name, timeout_sec=5.0):
         return True
 
     node.get_logger().error(
-        f'Mod degisikligi Orange Cube durumunda dogrulanamadi: {mode_name}'
+        f'Mod degisikligi Orange Cube durumunda dogrulanamadi: '
+        f'mode={mode_name}, mode_sent={getattr(res, "mode_sent", None)!r}. '
+        'Ayrinti icin BRIDGE ERROR ve BRIDGE RAW satirlarina bakin.'
     )
     return False
 
@@ -390,20 +436,55 @@ def call_trigger_service(node, client, name, timeout_sec=5.0):
 
     req = Trigger.Request()
 
-    future = client.call_async(req)
-    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout_sec)
+    service_name = getattr(client, 'srv_name', '<unknown>')
+    started_at = time.monotonic()
+    node.get_logger().info(
+        f'{name} servis istegi: service={service_name}, timeout={timeout_sec:.1f}s'
+    )
+
+    try:
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(node, future, timeout_sec=timeout_sec)
+    except Exception as exc:
+        elapsed_sec = time.monotonic() - started_at
+        node.get_logger().error(
+            f'{name} servis cagrisi baslatilamadi/tamamlanamadi: '
+            f'service={service_name}, elapsed={elapsed_sec:.3f}s, '
+            f'exception={exc!r}'
+        )
+        return False
+
+    elapsed_sec = time.monotonic() - started_at
 
     if not future.done():
-        node.get_logger().error(f'{name} servis zaman asimi.')
+        node.get_logger().error(
+            f'{name} servis zaman asimi: service={service_name}, '
+            f'elapsed={elapsed_sec:.3f}s'
+        )
+        return False
+
+    exception = future.exception()
+    if exception is not None:
+        node.get_logger().error(
+            f'{name} servis hatasi: service={service_name}, '
+            f'elapsed={elapsed_sec:.3f}s, exception={exception!r}'
+        )
         return False
 
     res = future.result()
 
     if res is None:
-        node.get_logger().error(f'{name} cevabi gelmedi.')
+        node.get_logger().error(
+            f'{name} cevabi gelmedi: service={service_name}, '
+            f'elapsed={elapsed_sec:.3f}s'
+        )
         return False
 
-    log_message = f'{name}: success={res.success}, message={res.message}'
+    log_message = (
+        f'{name} ham servis cevabi: service={service_name}, '
+        f'elapsed={elapsed_sec:.3f}s, success={res.success}, '
+        f'message={res.message!r}, response={res!r}'
+    )
     if res.success:
         node.get_logger().info(log_message)
     else:
