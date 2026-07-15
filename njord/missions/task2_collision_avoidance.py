@@ -72,9 +72,12 @@ AVOID_MAX_DURATION_SEC = 10.0
 VISION_DETECTION_TIMEOUT_SEC = 1.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
-VESSEL_ANGLE_KEYS = (
+RED_BUOY_TYPES = {"red_buoy", "red buoy", "red-buoy"}
+COLLISION_TARGET_ANGLE_KEYS = (
     "Vessel angle: ",
     "Vessel angle",
+    "Buoy angle: ",
+    "Buoy angle",
     "bearing",
     "angle_deg",
     "angle",
@@ -168,11 +171,17 @@ class Task2CollisionAvoidance:
     def _is_vessel(cls, detection):
         detector_type = str(detection.get("type", "")).strip().lower()
         model_class = str(detection.get("class", "")).strip().lower()
-        return detector_type == "vessel" or model_class in VESSEL_TYPES
+        is_vessel = detector_type == "vessel" or model_class in VESSEL_TYPES
+
+        # Task 2 water tests use a red buoy as the collision target. Keep
+        # vessel support for the real mission while accepting only the red
+        # buoy class from the buoy detector.
+        is_red_buoy = model_class in RED_BUOY_TYPES
+        return is_vessel or is_red_buoy
 
     @classmethod
     def _detection_angle_deg(cls, detection):
-        for key in VESSEL_ANGLE_KEYS:
+        for key in COLLISION_TARGET_ANGLE_KEYS:
             if key not in detection:
                 continue
             value = cls._finite_float(detection.get(key))
@@ -504,6 +513,8 @@ class Task2Node(Node):
         self.last_detection_time = None
         self.last_consumed_detection_time = None
         self.bridge_connected = False
+        self.vehicle_armed = False
+        self.vehicle_mode = "UNKNOWN"
         self.valid_gps_received = False
         self.valid_heading_received = False
         self.mission_active = False
@@ -576,7 +587,15 @@ class Task2Node(Node):
         self.task.update_heading(message.data)
 
     def state_callback(self, message):
-        self.bridge_connected = "connected=True" in message.data
+        state_fields = {}
+        for field in str(message.data).split(","):
+            key, separator, value = field.strip().partition("=")
+            if separator:
+                state_fields[key] = value
+
+        self.bridge_connected = state_fields.get("connected") == "True"
+        self.vehicle_armed = state_fields.get("armed") == "True"
+        self.vehicle_mode = state_fields.get("mode", "UNKNOWN").upper()
         self.task.update_bridge_state(self.bridge_connected)
 
     def wait_until_ready(self, timeout_sec=30.0):
@@ -589,6 +608,19 @@ class Task2Node(Node):
             ):
                 return True
             rclpy.spin_once(self, timeout_sec=0.1)
+        return False
+
+    def wait_for_vehicle_state(self, *, mode=None, armed=None, timeout_sec=8.0):
+        expected_mode = None if mode is None else str(mode).upper()
+        deadline = time.monotonic() + timeout_sec
+
+        while rclpy.ok() and time.monotonic() < deadline:
+            mode_ready = expected_mode is None or self.vehicle_mode == expected_mode
+            armed_ready = armed is None or self.vehicle_armed is bool(armed)
+            if self.bridge_connected and mode_ready and armed_ready:
+                return True
+            rclpy.spin_once(self, timeout_sec=0.1)
+
         return False
 
     def timer_callback(self):
@@ -618,12 +650,28 @@ def main(args=None):
         if call_set_mode(node, node.mission_clients.set_mode_client, "GUIDED") is False:
             node.get_logger().error("Failed to switch to GUIDED mode.")
             return
+        if not node.wait_for_vehicle_state(mode="GUIDED", timeout_sec=8.0):
+            node.get_logger().error(
+                f"Cube did not confirm GUIDED mode; current mode={node.vehicle_mode}."
+            )
+            return
+
         if call_trigger_service(
             node,
             node.mission_clients.force_arm_client,
             "FORCE ARM",
         ) is False:
             node.get_logger().error("FORCE ARM failed.")
+            return
+        if not node.wait_for_vehicle_state(
+            mode="GUIDED",
+            armed=True,
+            timeout_sec=8.0,
+        ):
+            node.get_logger().error(
+                "Cube did not confirm FORCE ARM; "
+                f"current mode={node.vehicle_mode}, armed={node.vehicle_armed}."
+            )
             return
 
         node.mission_active = True
