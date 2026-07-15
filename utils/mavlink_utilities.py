@@ -13,6 +13,22 @@ from std_msgs.msg import String, Float32
 from std_srvs.srv import Trigger
 
 
+def parse_bridge_state(text):
+    """Parse the bridge's ``connected/armed/mode`` status string."""
+    state = {}
+    for part in str(text).split(','):
+        if '=' not in part:
+            continue
+        key, value = part.split('=', 1)
+        key = key.strip()
+        value = value.strip()
+        if value.lower() in ('true', 'false'):
+            state[key] = value.lower() == 'true'
+        else:
+            state[key] = value
+    return state
+
+
 # ============================================================
 # TOPIC STRUCTURES
 # ============================================================
@@ -352,10 +368,14 @@ def call_set_mode(node, set_mode_client, mode_name, timeout_sec=5.0):
     res = future.result()
 
     if res is not None and res.mode_sent:
-        node.get_logger().info(f'Mod degistirildi: {mode_name}')
+        node.get_logger().info(
+            f'Mod bridge tarafindan heartbeat ile dogrulandi: {mode_name}'
+        )
         return True
 
-    node.get_logger().error(f'Mod degistirilemedi: {mode_name}')
+    node.get_logger().error(
+        f'Mod degisikligi Orange Cube durumunda dogrulanamadi: {mode_name}'
+    )
     return False
 
 
@@ -383,9 +403,11 @@ def call_trigger_service(node, client, name, timeout_sec=5.0):
         node.get_logger().error(f'{name} cevabi gelmedi.')
         return False
 
-    node.get_logger().info(
-        f'{name}: success={res.success}, message={res.message}'
-    )
+    log_message = f'{name}: success={res.success}, message={res.message}'
+    if res.success:
+        node.get_logger().info(log_message)
+    else:
+        node.get_logger().error(log_message)
 
     return bool(res.success)
 
@@ -421,7 +443,8 @@ def publish_cmd_vel(cmd_vel_pub, linear_x, angular_z):
 
     angular_z:
         sag/sol donus komutu
-        Açıklama: Pozitif degerler saat yönünün tersine (sola), negatif degerler saat yönünde (sağa) donus anlamina gelir.
+        Açıklama: Bridge sözleşmesinde pozitif değerler sağa/starboard,
+        negatif değerler sola/port dönüş anlamına gelir.
     """
 
     msg = Twist()
@@ -518,7 +541,10 @@ def align_heading_to_gps_target(
             )
         return True
 
-    angular_z = max(-max_angular_z, min(max_angular_z, -kp * heading_error))
+    # Bridge, positive angular_z komutunu pozitif yaw (starboard/right) olarak
+    # uygular. Compass bearing hatasi da hedef sagdaysa pozitiftir; bu nedenle
+    # iki isaret dogrudan ayni yönde kullanilmalidir.
+    angular_z = max(-max_angular_z, min(max_angular_z, kp * heading_error))
     publish_cmd_vel(cmd_vel_pub, linear_x=0.0, angular_z=angular_z)
 
     if logger is not None:

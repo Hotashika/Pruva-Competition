@@ -365,8 +365,8 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
             now_record_time_ms = int(time.monotonic() * 1000)
 
             should_record = (
-                last_record_time_ms is None
-                or now_record_time_ms - last_record_time_ms >= record_interval_ms
+                    last_record_time_ms is None
+                    or now_record_time_ms - last_record_time_ms >= record_interval_ms
             )
 
             if should_record:

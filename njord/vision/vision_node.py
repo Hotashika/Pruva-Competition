@@ -106,13 +106,14 @@ class VisionNode(Node):
                 d["type"] = name
             all_detections += dets
 
-        if all_detections:
-            msg = String()
-            msg.data = json.dumps({
-                "frame_id": frame_id,
-                "detections": all_detections,
-            })
-            self.pub.publish(msg)
+        # Bos detection listesi de vision pipeline'in calistigini gosteren bir
+        # heartbeat'tir. Mission, mesaj kesilirse bunu failsafe olarak ele alir.
+        msg = String()
+        msg.data = json.dumps({
+            "frame_id": frame_id,
+            "detections": all_detections,
+        })
+        self.pub.publish(msg)
 
     def destroy_node(self):
         self.rgb = None
