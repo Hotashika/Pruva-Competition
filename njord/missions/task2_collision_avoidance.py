@@ -73,9 +73,12 @@ AVOID_MAX_DURATION_SEC = 10.0
 VISION_DETECTION_TIMEOUT_SEC = 1.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
-VESSEL_ANGLE_KEYS = (
+RED_BUOY_TYPES = {"red_buoy", "red buoy", "red-buoy"}
+COLLISION_TARGET_ANGLE_KEYS = (
     "Vessel angle: ",
     "Vessel angle",
+    "Buoy angle: ",
+    "Buoy angle",
     "bearing",
     "angle_deg",
     "angle",
@@ -173,11 +176,17 @@ class Task2CollisionAvoidance:
     def _is_vessel(cls, detection):
         detector_type = str(detection.get("type", "")).strip().lower()
         model_class = str(detection.get("class", "")).strip().lower()
-        return detector_type == "vessel" or model_class in VESSEL_TYPES
+        is_vessel = detector_type == "vessel" or model_class in VESSEL_TYPES
+
+        # Task 2 water tests use a red buoy as the collision target. Keep
+        # vessel support for the real mission while accepting only the red
+        # buoy class from the buoy detector.
+        is_red_buoy = model_class in RED_BUOY_TYPES
+        return is_vessel or is_red_buoy
 
     @classmethod
     def _detection_angle_deg(cls, detection):
-        for key in VESSEL_ANGLE_KEYS:
+        for key in COLLISION_TARGET_ANGLE_KEYS:
             if key not in detection:
                 continue
             value = cls._finite_float(detection.get(key))
@@ -517,9 +526,8 @@ class Task2Node(Node):
         self.last_detection_time = None
         self.last_consumed_detection_time = None
         self.bridge_connected = False
-        self.bridge_armed = False
-        self.bridge_mode = "UNKNOWN"
-        self._last_logged_bridge_state = None
+        self.vehicle_armed = False
+        self.vehicle_mode = "UNKNOWN"
         self.valid_gps_received = False
         self.valid_heading_received = False
         self.mission_active = False
