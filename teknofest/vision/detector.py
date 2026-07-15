@@ -1,3 +1,4 @@
+import logging
 import time
 from pathlib import Path
 
@@ -8,6 +9,8 @@ from ultralytics import YOLO
 from teknofest.config.camera_config import CAMERA_WIDTH
 from teknofest.config.vision_config import DEVICE, BUOY_MODEL_PATH, TOLERANCE_RATIO, TOLARANCE_DEG
 from teknofest.vision.depth_utils import get_distance_from_bbox
+
+_logger = logging.getLogger("teknofest.vision")
 
 
 class BaseYOLODetector:
@@ -21,6 +24,14 @@ class BaseYOLODetector:
         self.model = YOLO(str(model_p))
         self.device = device
         self.class_names = self.model.names
+
+        # DÜZELTME: Modelin gerçek sınıf isimlerini sahaya çıkmadan önce
+        # görünür kılıyoruz. arama.py / task3_kamikaze.py "red_buoy",
+        # "green_buoy", "black_buoy" bekliyor — model bu isimleri farklı
+        # üretiyorsa (örn. sadece "buoy", ya da "red"), d.get("class") ==
+        # target_class eşleşmesi sessizce hiç tutmaz ve hiçbir tespit
+        # aday sayılmaz. Bu log, sorunu ilk çalıştırmada anında gösterir.
+        _logger.info(f"{self.__class__.__name__} model sınıfları yüklendi: {self.class_names}")
 
         # Takip istenirse True yapılabilir.
         # Ultralytics track() kullanır ve bbox yanında track_id üretmeye çalışır.
@@ -117,6 +128,20 @@ class BaseYOLODetector:
                 )
             except Exception:
                 distance = float("nan")
+
+            # DÜZELTME: distance NaN geldiğinde (derinlik verisi
+            # okunamadığında) arama.py'deki filtre
+            # (d.get("distance", -1) > 0.5) NaN karşılaştırmasında
+            # sessizce False döner (Python'da NaN > x her zaman False'tur)
+            # ve tespit hiçbir uyarı vermeden elenir. Sahada "hedefi
+            # görüyor ama bulmuyor" belirtisinin bir diğer olası kaynağı
+            # budur — derinlik kamerası menzil dışı/gürültülüyse bu satır
+            # tetiklenir.
+            if not np.isfinite(distance):
+                _logger.debug(
+                    f"{class_name} tespiti için mesafe NaN/sonsuz geldi "
+                    f"(bbox={bbox}); bu tespit arama filtresinde elenecek."
+                )
 
             track_id = None
 
@@ -237,6 +262,22 @@ class BuoyDetector(BaseYOLODetector):
 
         self.fx = fx
         self.cx = cx if cx is not None else CAMERA_WIDTH / 2
+
+        # DÜZELTME: fx=None sessizce geçilmesin. fx olmadan
+        # _compute_angle() HER ZAMAN None döner, bu da arama.py'deki
+        # d.get("Buoy angle: ") is not None filtresinin TÜM tespitleri
+        # elemesine yol açar — YOLO dubayı doğru tespit etse bile arama
+        # hiçbir aday bulamaz. Bu, sahada en sık karşılaşılan "arama
+        # gerekli bilgiyi almıyor" nedenlerinden biridir.
+        if self.fx is None:
+            _logger.warning(
+                "BuoyDetector fx=None ile başlatıldı! 'Buoy angle: ' alanı "
+                "HER ZAMAN None dönecek ve arama/task3 tarafındaki "
+                "d.get('Buoy angle: ') is not None filtresi TÜM tespitleri "
+                "eleyecek. vision_node'u --fx <kameranin_piksel_odak_uzakligi> "
+                "ile başlatın (--cx opsiyonel, verilmezse CAMERA_WIDTH/2 "
+                "kullanılıyor)."
+            )
 
     def detect(self, bgr_image, depth_array):
         detections = super().detect(bgr_image, depth_array)

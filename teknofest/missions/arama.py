@@ -1,9 +1,8 @@
 """
 Task-3 Kamikaze Angajman Görevi — Aşama 1: ARAMA
-GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v4)
+GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v5)
 
-v3'ten (senin yazdığın) devralınan, bridge_node.py ile uyumlu doğru
-tasarım kararları:
+v3'ten devralınan, bridge_node.py ile uyumlu doğru tasarım kararları:
   - angular_z, bridge'de "mevcut yaw'a eklenecek radyan ofset"tir
     (target_yaw_rad = bridge.yaw + angular_z). Bu yüzden SCANNING sırasında
     sabit bir angular_z göndermek yerine, her tick'te küçük bir delta
@@ -14,17 +13,28 @@ tasarım kararları:
     çevriliyor.
   - stop_vehicle(..., repeat_count=1): repeat_count=10 ile her çağrıda
     art arda 10 mesaj göndermenin fonksiyonel bir kazancı yok (bridge zaten
-    son mesajı işler), sadece gereksiz topic trafiği yaratıyor — SEARCHING
-    döngüsünde her tick çağrıldığından bu trafik anlamlı büyüyor.
+    son mesajı işler), sadece gereksiz topic trafiği yaratıyor.
 
-v4'te EKLENEN/DÜZELTİLEN:
-  - Tespit onay penceresi artık TICK sayısı değil GERÇEK ZAMAN
-    (DETECTION_WINDOW_SEC) bazlı. Önceki tick-tabanlı pencere, vision
-    kontrol döngüsünden (10Hz) daha yavaş geldiğinde (ör. 3Hz kamera)
-    neredeyse hiç onay veremiyordu — bunu kendi yazdığımız simülasyon
-    testinde (low_vision_rate senaryosu) yakaladık.
-  - "Hedef kayboldu" kontrolü de tick sayacı yerine gerçek zaman
-    (MAX_DETECTION_GAP_SEC) kullanıyor, aynı nedenle.
+v4'te eklenen:
+  - Tespit onay penceresi TICK sayısı değil GERÇEK ZAMAN
+    (DETECTION_WINDOW_SEC) bazlı.
+  - "Hedef kayboldu" kontrolü de gerçek zaman (MAX_DETECTION_GAP_SEC) bazlı.
+
+v5'te EKLENEN/DÜZELTİLEN:
+  - update_heading(): Bridge, /cube/gps/heading'i /cube/gps'ten BAĞIMSIZ
+    ayrı bir topic olarak yayınlıyor (bridge_node._publish_telemetry).
+    GPS fix'i geçici kaybolursa (_has_valid_gps() False) bridge GPS'i
+    yayınlamayı keser ama heading'i yayınlamaya devam eder. Eskiden
+    AramaGorevi'nin heading'i SADECE update_gps() üzerinden güncelleniyordu
+    — bu durumda current_heading_deg donuk kalıp dönüş komutları
+    (_send_rotation_command) yanlış delta üretebiliyordu. Artık heading
+    callback'i doğrudan buraya da bağlanıyor (bkz. task3.py
+    Task3KamikazeEngagement.update_heading).
+  - RELOCATING durumu için üst süre sınırı (STATION_RELOCATE_TIMEOUT_SEC)
+    eklendi. Eskiden _do_relocation() süresiz çalışıyordu; GPS drift,
+    akıntı veya hedefin RELOCATE_TOLERANCE_M içine hiç girememesi
+    durumunda araç sonsuza kadar aynı hedefe gitmeye çalışabiliyordu.
+    Artık zaman aşımında bulunduğu yerden taramaya devam ediyor.
 """
 
 import math
@@ -58,15 +68,16 @@ MAX_SEARCH_ROTATION_DEG = 360.0    # Bir konumda toplam taranacak açı
 STATION_MOVE_DISTANCE_M = 10.0
 STATION_MIN_SEPARATION_M = 8.0
 RELOCATE_TOLERANCE_M = 3.0
+STATION_RELOCATE_TIMEOUT_SEC = 25.0  # YENİ (v5): relocation için üst süre sınırı
 
 SEARCH_AREA_RADIUS_M = 80.0
 SEARCH_AREA_EXPAND_FACTOR = 1.3
 GOLDEN_ANGLE_DEG = 137.5
 
 # HEDEF TESPİT GÜVENİRLİK PARAMETRELERİ
-# DÜZELTME (v4): tick sayısı yerine gerçek zaman penceresi. Vision'ın
-# kontrol döngüsünden (10Hz) daha yavaş gelmesi (ör. 3Hz kamera) gerçek
-# hayatta çok olası; tick-tabanlı pencerede bu durumda MIN_CONSECUTIVE_
+# tick sayısı yerine gerçek zaman penceresi. Vision'ın kontrol
+# döngüsünden (10Hz) daha yavaş gelmesi (ör. 3Hz kamera) gerçek hayatta
+# çok olası; tick-tabanlı pencerede bu durumda MIN_CONSECUTIVE_
 # DETECTIONS'a neredeyse hiç ulaşılamıyordu.
 MIN_CONSECUTIVE_DETECTIONS = 5
 # NOT: bu değeri sahadaki gerçek kamera FPS'ine göre kalibre edin.
@@ -128,6 +139,7 @@ class AramaGorevi:
         self.target_heading_deg = None
 
         self.relocation_target = None
+        self.relocation_start_time = None  # YENİ (v5)
 
         self.target_lost_start_time = None
         self.search_retry_count = 0
@@ -157,6 +169,17 @@ class AramaGorevi:
             )
 
     # ----------------------------------------------------------
+    def update_heading(self, heading_deg):
+        """YENİ (v5): Bridge /cube/gps/heading'i /cube/gps'ten BAĞIMSIZ
+        ayrı bir topic olarak yayınlıyor. GPS fix'i geçici kaybolduğunda
+        bile heading yayını devam edebiliyor; bu yüzden heading'i sadece
+        update_gps() üzerinden almak, GPS callback'i gecikirse/durursa
+        dönüş komutlarının bayat heading ile hesaplanmasına yol açar.
+        Task3KamikazeEngagement.update_heading() bu metodu her heading
+        mesajında çağırmalı."""
+        self.current_heading_deg = heading_deg
+
+    # ----------------------------------------------------------
     def _select_target(self, detections):
         if not detections:
             return None
@@ -178,11 +201,10 @@ class AramaGorevi:
 
     # ----------------------------------------------------------
     def _update_detection_history(self, target):
-        """Pencere-içi (windowed) onay — DÜZELTME (v4): artık gerçek zaman
-        bazlı. Eskiden 'son N tick' kullanılıyordu; vision kontrol
-        döngüsünden yavaşsa (örn. 3Hz kamera / 10Hz kontrol) bu pencere
-        yeterli sayıda gerçek kareyi kapsamıyordu ve onay neredeyse hiç
-        gerçekleşmiyordu."""
+        """Pencere-içi (windowed) onay — gerçek zaman bazlı. Eskiden
+        'son N tick' kullanılıyordu; vision kontrol döngüsünden yavaşsa
+        (örn. 3Hz kamera / 10Hz kontrol) bu pencere yeterli sayıda gerçek
+        kareyi kapsamıyordu ve onay neredeyse hiç gerçekleşmiyordu."""
         now = time.monotonic()
         self.detection_history.append((now, target is not None))
         while self.detection_history and (now - self.detection_history[0][0]) > DETECTION_WINDOW_SEC:
@@ -320,6 +342,7 @@ class AramaGorevi:
         self.rotated_deg_this_station = 0.0
         self.step_start_heading_deg = None
         self.step_start_time = None
+        self.relocation_start_time = time.monotonic()  # YENİ (v5)
 
         target_lat, target_lon = self._next_station_target()
         self.relocation_target = (target_lat, target_lon)
@@ -329,6 +352,24 @@ class AramaGorevi:
         )
 
     def _do_relocation(self):
+        now = time.monotonic()
+
+        # YENİ (v5): relocation'ın süresiz sürmesini önle. GPS drift,
+        # akıntı veya hedefin RELOCATE_TOLERANCE_M içine hiç girememesi
+        # durumunda araç sonsuza kadar aynı hedefe gitmeye çalışmasın —
+        # zaman aşımında bulunduğu yerden taramaya devam etsin.
+        if (self.relocation_start_time is not None
+                and (now - self.relocation_start_time) > STATION_RELOCATE_TIMEOUT_SEC):
+            self.logger.warning(
+                f"[ARAMA] Yeni konuma {STATION_RELOCATE_TIMEOUT_SEC:.0f}sn'de "
+                f"ulaşılamadı, bulunduğu yerden taramaya devam ediliyor."
+            )
+            self.visited_positions.append((self.current_lat, self.current_lon))
+            self.station_start_time = now
+            self.target_heading_deg = self.current_heading_deg
+            self.state = SearchState.SCANNING
+            return
+
         target_lat, target_lon = self.relocation_target
         distance = calculate_gps_distance(self.current_lat, self.current_lon, target_lat, target_lon)
 

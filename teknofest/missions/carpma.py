@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 """
 Task-3 Kamikaze Angajman Görevi — Aşama 3: ÇARPMA
-GERÇEK HAYATTA ÇALIŞACAK ŞEKİLDE İYİLEŞTİRİLMİŞ VERSİYON (TAMAMLANMIŞ)
+GERÇEK HAYATTA ÇALIŞACAK ŞEKİLDE İYİLEŞTİRİLMİŞ VERSİYON (v2 — bridge_node.py
+ve arama.py v5 ile uyumlu hale getirildi)
 
-Bu modül bağımsızdır ve yaklasma.py ile aynı mimariyi kullanır.
-3 çarpma başarısız olursa aramaya dönülmesi için sinyal gönderir.
+Bu sürümde arama.py'nin v5 fikirleriyle hizalanan DÜZELTMELER:
 
-TAMAMLANAN / DÜZELTİLEN KISIMLAR:
-  1. update() fonksiyonu yarım kalmıştı (CREEPING / BACKING_OFF / COOLDOWN
-     durumları hiç işlenmiyordu) -> tamamlandı.
-  2. _register_hit() log mesajı yanlış değeri basıyordu (sayaç sıfırlandıktan
-     sonra loglanıyordu) -> gerçek ivme deltası saklanıp loglanıyor.
-  3. update_imu() içinde, henüz 3 ardışığa ulaşmamış "spike" örnekleri bile
-     baseline'a ekleniyordu -> çarpma anında baseline kirleniyor, hassasiyet
-     düşüyordu. Artık sadece spike OLMAYAN örnekler baseline'a giriyor.
-  4. TARGET_VISIBILITY_TIMEOUT parametresi tanımlı ama hiç kullanılmıyordu
-     -> artık "hiç hedef görülmedi" ve "hedef kısa süre kayboldu" ayrımı
-     için kullanılıyor.
-  5. IMU eşiği bir sebepten (yumuşak/teğet temas) çarpmayı yakalayamazsa diye
-     mesafe tabanlı yedek temas kontrolü eklendi (SOFT_CONTACT_DISTANCE_M).
+  1. update_heading() EKLENDİ. Bridge /cube/gps/heading'i /cube/gps'ten
+     BAĞIMSIZ ayrı bir topic olarak yayınlıyor. Eskiden bu modülün heading'i
+     SADECE update_gps() üzerinden güncelleniyordu; GPS fix'i geçici
+     kaybolduğunda (deniz üstünde sık rastlanır) _creep_towards_target()
+     içindeki dead-reckoning bearing hesabı bayat heading kullanıyordu.
+     task3.py artık heading callback'inde bunu da çağırmalı.
+
+  2. İŞARET (YÖN) HATASI DÜZELTİLDİ. Eski kodda hem görsel takip hem de
+     dead-reckoning kolunda NEGATİF işaret kullanılıyordu:
+         angular_z = -CREEP_ANGULAR_KP * angle                  (görsel)
+         angular_z = -CREEP_ANGULAR_KP * heading_error          (dead-reck.)
+     Bridge sözleşmesine göre (align_heading_to_gps_target yorumu ve
+     task3.py'nin sahada doğrulanmış mantığı) pozitif açı/bearing hatası
+     (hedef sağda) POZİTİF angular_z (sağa dönüş) gerektirir. Eski işaretle
+     tekne, çarpma anında hedefin TERSİNE sürünüyordu. Artık negatif işaret
+     kullanılmıyor; iki kol da aynı (pozitif) kuralı kullanıyor.
+
+  3. stop_vehicle(..., repeat_count=1) standardı tüm çağrılarda uygulandı
+     (arama.py ile tutarlı, gereksiz topic trafiğini önler).
+
+  Not: IMU tabanlı çarpma algılama (update_imu) ve baseline/spike mantığı
+  bridge'in cmd_vel semantiğinden bağımsızdır (sadece ivme okuması), bu
+  yüzden bu kısımda mantıksal bir değişiklik yapılmadı.
 """
 
 import time
@@ -35,7 +45,7 @@ from utils.mavlink_utilities import (
 
 
 # ============================================================
-# GERÇEK HAYAT PARAMETRELERİ (SAHAYA GÖRE KALİBRE EDİN)
+# GERÇEK HAYAT PARAMETRELERİ (SAHADA KALİBRE EDİN!)
 # ============================================================
 
 # --- ÇARPMA HEDEFLERİ ---
@@ -76,7 +86,7 @@ class CarpmaState(Enum):
 
 
 class CarpmaGorevi:
-    """Çarpma görevi - GERÇEK HAYAT İÇİN OPTİMİZE"""
+    """Çarpma görevi - GERÇEK HAYAT İÇİN OPTİMİZE, bridge semantiğine uygun."""
 
     def __init__(self, node, mission_topics, target_class):
         self.node = node
@@ -121,6 +131,15 @@ class CarpmaGorevi:
         self.current_heading = heading
 
     # --------------------------------------------------------
+    def update_heading(self, heading):
+        """YENİ: Bridge /cube/gps/heading'i /cube/gps'ten BAĞIMSIZ ayrı bir
+        topic olarak yayınlıyor. GPS fix'i geçici kaybolduğunda bile heading
+        yayını devam edebiliyor; dead-reckoning bearing hesabı bu yüzden
+        sadece update_gps() üzerinden gelen heading'e güvenemez. task3.py
+        bu metodu her heading mesajında çağırmalı (bkz. arama.py update_heading)."""
+        self.current_heading = heading
+
+    # --------------------------------------------------------
     def update_imu(self, accel_x, accel_y, accel_z):
         """IMU verilerini güncelle ve çarpma algıla."""
         if not self.impact_armed:
@@ -149,8 +168,8 @@ class CarpmaGorevi:
                 self._register_hit()
                 return
 
-        # DÜZELTME: sadece spike OLMAYAN örnekler baseline'a giriyor.
-        # Aksi halde tam çarpma anında baseline kirlenip hassasiyet düşüyordu.
+        # Sadece spike OLMAYAN örnekler baseline'a giriyor; aksi halde tam
+        # çarpma anında baseline kirlenip hassasiyet düşer.
         if not is_spike:
             self.accel_history.append(accel_mag)
 
@@ -191,16 +210,13 @@ class CarpmaGorevi:
         self.accel_history.clear()
         self.impact_armed = False
 
-        # DÜZELTME: eskiden consecutive_spikes burada sıfırlandıktan SONRA
-        # loglanıyordu, yani log her zaman 0.0 basıyordu. Artık gerçek
-        # ivme deltası saklanıp loglanıyor.
         kaynak = "mesafe (yedek)" if soft else "IMU"
         self.logger.info(
             f"[ÇARPMA] 💥 TEMAS! ({self.hit_count}/{REQUIRED_HITS}) "
             f"kaynak: {kaynak}, ivme delta: ~{delta:.2f} m/s²"
         )
 
-        stop_vehicle(self.topics.cmd_vel_pub)
+        stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
 
         if self.hit_count >= REQUIRED_HITS:
             self.state = CarpmaState.COMPLETE
@@ -276,6 +292,11 @@ class CarpmaGorevi:
     # --------------------------------------------------------
     def _creep_towards_target(self, visible_target, now):
         """Hedefe doğru sürün.
+
+        İŞARET KURALI (DÜZELTİLDİ): pozitif açı/bearing hatası (hedef sağda)
+        -> pozitif angular_z (sağa/starboard dönüş). Eski kodda her iki
+        kolda da (görsel + dead-reckoning) hatalı negatif işaret vardı.
+
         Returns:
             bool: True -> normal şekilde ilerlendi (görsel veya dead-reckoning)
                   False -> konum bilgisi çok eski/yok, çağıran taraf MISSED'e
@@ -283,13 +304,13 @@ class CarpmaGorevi:
         """
         if visible_target is not None:
             angle = visible_target["Buoy angle: "]
-            angular_z = -CREEP_ANGULAR_KP * angle
+            angular_z = CREEP_ANGULAR_KP * angle
             angular_z = max(-MAX_CREEP_ANGULAR_Z, min(MAX_CREEP_ANGULAR_Z, angular_z))
             self.current_speed = CREEP_SPEED
 
-            # YENİ: yedek temas kontrolü. IMU eşiği yumuşak/teğet bir
-            # temasta tetiklenmeyebilir; çok yakın mesafede görsel olarak
-            # da "değmiş" sayıyoruz.
+            # Yedek temas kontrolü: IMU eşiği yumuşak/teğet bir temasta
+            # tetiklenmeyebilir; çok yakın mesafede görsel olarak da
+            # "değmiş" sayıyoruz.
             if visible_target["distance"] <= SOFT_CONTACT_DISTANCE_M:
                 publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
                 self._register_hit(soft=True)
@@ -301,8 +322,7 @@ class CarpmaGorevi:
         if self.last_known_target_lat is not None:
             age = now - self.last_target_update_time
             if age > DEAD_RECKONING_TIMEOUT:
-                # Konum bilgisi çok eski; körlemesine ilerlemek yerine
-                # (eski davranış: düz git) çağırana MISSED sinyali ver.
+                # Konum bilgisi çok eski; çağırana MISSED sinyali ver.
                 return False
 
             if age > TARGET_VISIBILITY_TIMEOUT:
@@ -320,7 +340,7 @@ class CarpmaGorevi:
                 self.last_known_target_lat, self.last_known_target_lon
             )
             heading_error = (bearing - self.current_heading + 180) % 360 - 180
-            angular_z = -CREEP_ANGULAR_KP * heading_error
+            angular_z = CREEP_ANGULAR_KP * heading_error
             angular_z = max(-MAX_CREEP_ANGULAR_Z, min(MAX_CREEP_ANGULAR_Z, angular_z))
             self.current_speed = CREEP_SPEED * speed_scale
 
@@ -342,7 +362,7 @@ class CarpmaGorevi:
                 f"[ÇARPMA] Toplam zaman aşımı! "
                 f"{self.hit_count}/{REQUIRED_HITS} çarpma ile kaldı."
             )
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             self.state = CarpmaState.MISSED
             self.finished = True
             self.success = False
@@ -373,23 +393,22 @@ class CarpmaGorevi:
             return True
 
         if self.state in (CarpmaState.COMPLETE, CarpmaState.MISSED):
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return True
 
-        # -------- YENİ: eksik olan durum makinesi tamamlandı --------
         if self.state == CarpmaState.BACKING_OFF:
             if self.backoff_start_time is None:
                 self.backoff_start_time = now
             if now - self.backoff_start_time < BACKOFF_DURATION_SEC:
                 publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=BACKOFF_SPEED, angular_z=0.0)
                 return False
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             self.state = CarpmaState.COOLDOWN
             self.cooldown_start_time = now
             return False
 
         if self.state == CarpmaState.COOLDOWN:
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             if now - self.cooldown_start_time >= COOLDOWN_SEC:
                 self.impact_armed = True
                 self.consecutive_spikes = 0
@@ -407,13 +426,11 @@ class CarpmaGorevi:
                 self._update_target_position(detections)
 
             if target is None and self.last_known_target_lat is None:
-                # Hiç hedef görülmedi. Deneme başından beri kısa bir süre
-                # bekle, sonra vazgeç.
                 if now - self.attempt_start_time < TARGET_VISIBILITY_TIMEOUT:
-                    stop_vehicle(self.topics.cmd_vel_pub)
+                    stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
                     return False
                 self.logger.error("[ÇARPMA] Hedef hiç görülemedi, aramaya dönülüyor.")
-                stop_vehicle(self.topics.cmd_vel_pub)
+                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
                 self.state = CarpmaState.MISSED
                 self.finished = True
                 self.success = False
@@ -426,7 +443,7 @@ class CarpmaGorevi:
                 return self.state in (CarpmaState.COMPLETE, CarpmaState.MISSED)
             if not ok:
                 self.logger.error("[ÇARPMA] Hedef konum bilgisi çok eski, aramaya dönülüyor.")
-                stop_vehicle(self.topics.cmd_vel_pub)
+                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
                 self.state = CarpmaState.MISSED
                 self.finished = True
                 self.success = False

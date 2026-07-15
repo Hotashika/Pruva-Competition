@@ -1,29 +1,53 @@
 #!/usr/bin/env python3
 """
 Task-3 Kamikaze Angajman Görevi — Ana Modül
-GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v3 — bridge_node.py'ye hizalı)
+GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v5 — yaklaşma.py ve carpma.py
+gerçek görev akışına bağlandı)
 
-Bu turda eklenen/düzeltilen kısımlar:
-  1. stop_vehicle(..., repeat_count=1): repeat_count=10 varsayılanıyla her
-     çağrıda arka arkaya 10 mesaj göndermenin fonksiyonel bir kazancı yok
-     (bridge zaten son mesajı işler); SEARCHING/APPROACHING döngüsünde her
-     tick çağrıldığından bu, gereksiz topic trafiğini büyütüyordu.
-  2. handle_vision_detections() içindeki açı kontrolü, bridge'in gerçek
-     angular_z semantiğine göre hizalandı:
-         bridge_node._cmd_vel_callback:
-             target_yaw_rad = self.yaw + angular_z
-     yani angular_z, "mevcut yaw'a bir kerelik eklenecek radyan ofset"tir,
-     klasik ROS Twist (rad/s, sürekli entegre edilir) DEĞİL. Eski kod
-     (kp=0.035, clamp=±0.5) bunu bir hız komutuymuş gibi hesaplıyordu;
-     bu da her tick'te agresif/ani yaw sıçramalarına yol açardı. Yeni kod,
-     ekibin kendi utils/mavlink_utilities.align_heading_to_gps_target()
-     fonksiyonuyla aynı konvansiyonu (kp=0.015, clamp=±0.35 rad) kullanıyor
-     ve ayrıca tick-başı değişimi de sınırlıyor (yumuşatma).
+v4'ten devralınan doğru tasarım kararları (arama.py v5 ile hizalı):
+  - update_heading(): AramaGorevi'nin heading'i artık sadece update_gps()
+    üzerinden değil, ayrıca doğrudan bridge'in /cube/gps/heading topic'inden
+    de güncelleniyor.
 
-  ÖNEMLİ NOT: standalone yaklasma.py / carpma.py dosyaları (henüz task3'e
-  bağlı değil) hâlâ eski/yanlış "sürekli rad/s" varsayımıyla yazılı
-  (PID + integral terimi). Bunları task3'e bağlamadan önce aynı bridge
-  semantiğine göre gözden geçirmek gerekiyor.
+v5'te YAPILAN ASIL DEĞİŞİKLİK:
+  Eskiden bu dosyada handle_vision_detections() adında, YaklasmaGorevi/
+  CarpmaGorevi hiç kullanılmadan yazılmış BASİT bir yaklaşma taklidi vardı;
+  çarpma aşaması (3 vuruş) hiç yoktu — hedefe SAFETY_STOP_DISTANCE kadar
+  yaklaşılınca görev "bitmiş" sayılıyordu. Artık:
+
+  1. YaklasmaGorevi ve CarpmaGorevi GERÇEKTEN kullanılıyor (arama.py'nin
+     import edildiği paketten, aynı düzende):
+         from teknofest.missions.yaklasma import YaklasmaGorevi
+         from teknofest.missions.carpma import CarpmaGorevi
+     (Dosya yolu arama.py ile aynı klasörde olduğu varsayılıyor:
+     teknofest/missions/yaklasma.py ve teknofest/missions/carpma.py.
+     Farklıysa bu iki import satırını kendi paket yapınıza göre düzeltin.)
+
+  2. State machine genişletildi: INIT -> SEARCHING -> APPROACHING -> CARPMA
+     -> DONE (veya herhangi bir aşamada hedef kaybolursa tekrar SEARCHING).
+
+  3. update_gps() / update_heading() artık arama + yaklaşma + çarpma
+     modüllerinin ÜÇÜNE DE aynı anda iletiliyor. Bridge, GPS ve heading'i
+     BAĞIMSIZ topic'ler olarak yayınladığından (bkz. bridge_node.py,
+     arama.py v5 notları) her üç modülün de kendi update_heading()'i
+     olmalı — yaklasma.py ve carpma.py'ye bu v2'lerinde eklendi.
+
+  4. YENİ: IMU verisi artık gerçekten dinleniyor. create_mission_topics()
+     (utils/mavlink_utilities.py) bir /cube/imu aboneliği İÇERMİYOR — bu
+     dosya mavlink_utilities.py'yi DEĞİŞTİRMEDEN, Task3Node içinde DOĞRUDAN
+     '/cube/imu' (sensor_msgs/Imu) aboneliği açıyor ve
+     Task3KamikazeEngagement.update_imu() üzerinden yaklaşma+çarpma
+     modüllerine dağıtıyor. Bu olmadan carpma.py'nin IMU tabanlı çarpma
+     algılaması ve yaklasma.py'nin update_imu() çağrısı hiçbir zaman veri
+     almıyordu.
+
+  5. reset_search() artık üç modülü de (arama, yaklaşma, çarpma) sıfırlıyor;
+     eskiden sadece arama sıfırlanıyordu, yaklaşma/çarpma yoktu.
+
+  ÖNEMLİ NOT: bridge_node.py ve utils/mavlink_utilities.py bu düzeltmede
+  HİÇ değiştirilmedi (kullanıcı talebi üzerine); sadece bu üç görev dosyası
+  (arama.py zaten v5'te düzeltilmişti, burada yaklasma/carpma/task3) revize
+  edildi.
 """
 
 import json
@@ -39,6 +63,7 @@ if str(REPO_ROOT) not in sys.path:
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+from sensor_msgs.msg import Imu
 
 from utils.mavlink_utilities import (
     create_mission_topics,
@@ -48,11 +73,11 @@ from utils.mavlink_utilities import (
     call_trigger_service,
     stop_vehicle,
     calculate_gps_distance,
-    calculate_angle_error_deg,
-    publish_cmd_vel,
 )
 
 from teknofest.missions.arama import AramaGorevi
+from teknofest.missions.yaklasma import YaklasmaGorevi
+from teknofest.missions.carpma import CarpmaGorevi
 
 # ============================================================
 # GÜVENLİK PARAMETRELERİ
@@ -62,34 +87,27 @@ HEADING_TIMEOUT_SEC = 2.0
 VISION_TIMEOUT_SEC = 1.0
 GEOFENCE_RADIUS_M = 150.0
 DRIVE_MODE = "GUIDED"
-TARGET_LOSS_TIMEOUT_FRAMES = 20
 
 TEST_DEFAULT_TARGET_COLOR = "red"
 VALID_TARGET_COLORS = ("red", "green", "black")
 TEST_MODE = True
 SAFETY_STOP_DISTANCE = 1.0
 
-# --- YAKLAŞMA AÇI KONTROLÜ (bridge angular_z konvansiyonu) ---
-# utils.mavlink_utilities.align_heading_to_gps_target() ile AYNI konvansiyon:
-# angular_z = kp * heading_error_deg (radyan), clamp edilmiş. Bridge bunu
-# mevcut yaw'a bir kerelik ekliyor; bu yüzden kp DEĞER/DERECE cinsindendir,
-# klasik bir "rad/s" kazancı değildir.
-APPROACH_YAW_KP_RAD_PER_DEG = 0.015
-APPROACH_MAX_ANGULAR_Z = 0.35
-APPROACH_MAX_ANGULAR_STEP = 0.08   # tick başına ek yumuşatma (ani sıçramayı önler)
-
 
 class MissionState(Enum):
     INIT = auto()
     SEARCHING = auto()
     APPROACHING = auto()
+    CARPMA = auto()
+    DONE = auto()
     FAILSAFE = auto()
 
 
 class Task3KamikazeEngagement:
-    """Görev yöneticisi sınıfı - 3 aşamayı koordine eder."""
+    """Görev yöneticisi sınıfı - 3 aşamayı (arama/yaklaşma/çarpma) koordine eder."""
 
-    def __init__(self, node, mission_topics, mission_clients, target_class, test_mode=False):
+    def __init__(self, node, mission_topics, mission_clients, target_class,
+                 test_mode=False, safety_stop_distance=None):
         self.node = node
         self.is_armed = False
         self.logger = node.get_logger()
@@ -115,15 +133,13 @@ class Task3KamikazeEngagement:
         self.bridge_mode = None
 
         self.arama = AramaGorevi(node, mission_topics, target_class, test_mode=test_mode)
+        self.yaklasma = YaklasmaGorevi(
+            node, mission_topics, target_class,
+            safe_stop_distance=safety_stop_distance,
+        )
+        self.carpma = CarpmaGorevi(node, mission_topics, target_class)
 
-        self.target_loss_counter = 0
-        self.max_target_loss_frames = TARGET_LOSS_TIMEOUT_FRAMES
-        self.approach_active = False
-        self.approach_start_time = None
-
-        # YENİ: yaklaşma açı komutu için tick-başı yumuşatma durumu
-        self.last_angular_z = 0.0
-
+    # --------------------------------------------------------
     def update_gps(self, lat, lon, heading):
         self.current_lat = lat
         self.current_lon = lon
@@ -137,18 +153,37 @@ class Task3KamikazeEngagement:
             if self.state == MissionState.INIT:
                 self.state = MissionState.SEARCHING
 
+        # Üç göreve de GPS bilgisini dağıt.
         self.arama.update_gps(lat, lon, heading)
+        self.yaklasma.update_gps(lat, lon, heading)
+        self.carpma.update_gps(lat, lon, heading)
 
+    # --------------------------------------------------------
     def update_heading(self, heading):
         """heading_callback tarafından çağrılır; bridge bunu DERECE olarak
-        yayınlıyor (/cube/gps/heading, GLOBAL_POSITION_INT.hdg/100 veya
-        VFR_HUD.heading'den türetilmiş)."""
+        yayınlıyor (/cube/gps/heading). Bu topic /cube/gps'ten BAĞIMSIZ
+        yayınlanıyor (bridge_node._publish_telemetry), bu yüzden üç göreve
+        de DOĞRUDAN iletiyoruz — sadece update_gps()'e güvenmek, GPS geçici
+        kaybolduğunda hepsinin heading'inin bayatlamasına yol açardı
+        (bkz. arama.py / yaklasma.py / carpma.py update_heading)."""
         self.current_heading = heading
         self.last_heading_time = time.monotonic()
+        self.arama.update_heading(heading)
+        self.yaklasma.update_heading(heading)
+        self.carpma.update_heading(heading)
 
+    # --------------------------------------------------------
+    def update_imu(self, gyro_z, accel_x, accel_y, accel_z):
+        """YENİ: /cube/imu callback'inden çağrılır. Yaklaşma ve çarpma
+        modüllerine ilgili IMU verilerini dağıtır (bkz. Task3Node.imu_callback)."""
+        self.yaklasma.update_imu(gyro_z, accel_x, accel_y)
+        self.carpma.update_imu(accel_x, accel_y, accel_z)
+
+    # --------------------------------------------------------
     def update_vision_timestamp(self):
         self.last_vision_time = time.monotonic()
 
+    # --------------------------------------------------------
     def _check_watchdog(self):
         """GPS + heading watchdog kontrolü."""
         now = time.monotonic()
@@ -169,11 +204,13 @@ class Task3KamikazeEngagement:
 
         return True
 
+    # --------------------------------------------------------
     def is_vision_stale(self):
         if self.last_vision_time is None:
             return True
         return (time.monotonic() - self.last_vision_time) > VISION_TIMEOUT_SEC
 
+    # --------------------------------------------------------
     def _check_geofence(self):
         if self.home_lat is None or self.current_lat is None:
             return True
@@ -193,6 +230,7 @@ class Task3KamikazeEngagement:
             return False
         return True
 
+    # --------------------------------------------------------
     def update_bridge_state(self, state_text):
         try:
             parts = [p.strip() for p in state_text.split(",")]
@@ -212,117 +250,18 @@ class Task3KamikazeEngagement:
         except Exception as exc:
             self.logger.warn(f"Bridge state parse edilemedi: {exc}", throttle_duration_sec=2.0)
 
+    # --------------------------------------------------------
     def reset_search(self):
-        self.approach_active = False
-        self.target_loss_counter = 0
-        self.last_angular_z = 0.0
+        """Hedef kaybedildiğinde (yaklaşma veya çarpma sırasında) tüm
+        görevi aramaya geri döndürür. Üç modülün de sıfırlanması gerekir;
+        eskiden sadece arama sıfırlanıyordu."""
         self.state = MissionState.SEARCHING
         self.arama.reset_search()
-        self.logger.info("[ARAMA] Yeniden arama başlatıldı.")
+        self.yaklasma.reset_approach()
+        self.carpma.reset_carpma()
+        self.logger.info("[GÖREV] Yeniden arama başlatıldı (arama+yaklaşma+çarpma sıfırlandı).")
 
-    def handle_vision_detections(self, detections):
-        """Hedefe yaklaşma ve çarpma mantığı. Hedef kaybolursa aramayı
-        yeniden başlatır."""
-        if not detections:
-            self.target_loss_counter += 1
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            self.last_angular_z = 0.0
-
-            if self.approach_active and self.target_loss_counter > self.max_target_loss_frames:
-                self.logger.warn(
-                    f"[YAKLAŞMA] Hedef {self.max_target_loss_frames} frame kayboldu, "
-                    f"yeniden aramaya başlanıyor."
-                )
-                self.reset_search()
-            return
-
-        if self.target_loss_counter > 0:
-            self.target_loss_counter = 0
-
-        targets = [
-            d for d in detections
-            if d.get("class") == self.target_class
-            and d.get("distance") is not None
-            and d.get("distance", -1) > 0.5
-            and d.get("Buoy angle: ") is not None
-        ]
-
-        if not targets:
-            self.target_loss_counter += 1
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            self.last_angular_z = 0.0
-
-            if self.approach_active and self.target_loss_counter > self.max_target_loss_frames:
-                self.logger.warn(f"[YAKLAŞMA] Hedef sınıfı {self.target_class} kayboldu.")
-                self.reset_search()
-            return
-
-        if not self.approach_active:
-            self.approach_active = True
-            self.approach_start_time = time.monotonic()
-            self.logger.info("[YAKLAŞMA] Yaklaşma başlıyor!")
-
-        self.state = MissionState.APPROACHING
-
-        target = min(targets, key=lambda d: d["distance"])
-        distance = target["distance"]
-        angle = target["Buoy angle: "]  # kameraya göre bağıl açı (derece)
-
-        if self.test_mode:
-            self.logger.info(f"[TEST] Mesafe: {distance:.2f}m, Açı: {angle:.1f}°")
-
-        if distance <= SAFETY_STOP_DISTANCE:
-            self.logger.info(f"[ÇARPMA] Hedefe ulaşıldı! Mesafe: {distance:.2f}m. Durduruluyor.")
-            publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
-            self.last_angular_z = 0.0
-            if self.test_mode:
-                elapsed = time.monotonic() - self.approach_start_time if self.approach_start_time else 0
-                self.logger.info(f"[TEST] Yaklaşma süresi: {elapsed:.1f} sn")
-            return
-
-        # DÜZELTME: bridge angular_z'yi "mevcut yaw'a eklenecek radyan
-        # ofset" olarak yorumluyor (align_heading_to_gps_target ile aynı
-        # konvansiyon). 'angle' kameraya göre bağıl hata; bunu doğrudan
-        # bir heading hatası gibi kullanabiliriz — target_bearing =
-        # current_heading + angle olduğundan calculate_angle_error_deg
-        # sonucu zaten 'angle'ın kendisiyle (sarmalanmış) aynıdır, ama
-        # tutarlılık için ortak yardımcıyı kullanıyoruz.
-        heading_error_deg = calculate_angle_error_deg(
-            (self.current_heading + angle) % 360.0, self.current_heading
-        )
-        raw_angular_z = max(
-            -APPROACH_MAX_ANGULAR_Z,
-            min(APPROACH_MAX_ANGULAR_Z, APPROACH_YAW_KP_RAD_PER_DEG * heading_error_deg),
-        )
-
-        # Tick başına ani sıçramayı sınırla (yumuşatma)
-        delta = raw_angular_z - self.last_angular_z
-        if delta > APPROACH_MAX_ANGULAR_STEP:
-            angular_z = self.last_angular_z + APPROACH_MAX_ANGULAR_STEP
-        elif delta < -APPROACH_MAX_ANGULAR_STEP:
-            angular_z = self.last_angular_z - APPROACH_MAX_ANGULAR_STEP
-        else:
-            angular_z = raw_angular_z
-        self.last_angular_z = angular_z
-
-        if abs(angle) < 10:
-            linear_x = 0.60
-        elif abs(angle) < 30:
-            linear_x = 0.35
-        else:
-            linear_x = 0.15
-
-        BRAKE_ZONE_M = 3.0
-        if distance < BRAKE_ZONE_M:
-            brake_ratio = max(0.15, (distance - SAFETY_STOP_DISTANCE) / (BRAKE_ZONE_M - SAFETY_STOP_DISTANCE))
-            linear_x = min(linear_x, linear_x * brake_ratio)
-
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
-            linear_x=linear_x,
-            angular_z=angular_z,
-        )
-
+    # --------------------------------------------------------
     def update(self, detections):
         """Ana güncelleme döngüsü. Her 0.1 saniyede çağrılır."""
 
@@ -359,19 +298,49 @@ class Task3KamikazeEngagement:
                               throttle_duration_sec=2.0)
             detections = []
 
+        # ---------------- SEARCHING ----------------
         if self.state == MissionState.SEARCHING:
             if not self.arama.finished:
                 self.arama.update(detections)
                 return
-            else:
-                self.state = MissionState.APPROACHING
-                self.approach_active = True
-                self.approach_start_time = time.monotonic()
-                self.last_angular_z = 0.0
-                self.logger.info("[DURUM] Arama tamamlandı, yaklaşma aşamasına geçiliyor.")
+            self.state = MissionState.APPROACHING
+            self.logger.info("[DURUM] Arama tamamlandı, yaklaşma aşamasına geçiliyor.")
 
+        # ---------------- APPROACHING ----------------
         if self.state == MissionState.APPROACHING:
-            self.handle_vision_detections(detections)
+            approach_done = self.yaklasma.update(detections)
+
+            if self.yaklasma.should_return_to_search():
+                self.logger.warn("[DURUM] Yaklaşma sırasında hedef kayboldu, aramaya dönülüyor.")
+                self.reset_search()
+                return
+
+            if approach_done:
+                self.state = MissionState.CARPMA
+                self.logger.info("[DURUM] Yaklaşma+emin olma tamamlandı, çarpma aşamasına geçiliyor.")
+            return
+
+        # ---------------- CARPMA ----------------
+        if self.state == MissionState.CARPMA:
+            carpma_done = self.carpma.update(detections)
+
+            if self.carpma.should_retry_search():
+                self.logger.warn("[DURUM] Çarpma başarısız/hedef kayboldu, aramaya dönülüyor.")
+                self.reset_search()
+                return
+
+            if carpma_done:
+                self.state = MissionState.DONE
+                if self.carpma.success:
+                    self.logger.info("[DURUM] 🎉 GÖREV BAŞARIYLA TAMAMLANDI (3 çarpma).")
+                else:
+                    self.logger.error("[DURUM] Görev tamamlanamadı (zaman aşımı).")
+            return
+
+        # ---------------- DONE ----------------
+        if self.state == MissionState.DONE:
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            return
 
 
 class Task3Node(Node):
@@ -422,12 +391,34 @@ class Task3Node(Node):
             10
         )
 
+        # YENİ: create_mission_topics() (mavlink_utilities.py) bir IMU
+        # aboneliği içermiyor ve bu dosya mavlink_utilities.py'yi
+        # DEĞİŞTİRMİYOR. Bu yüzden bridge'in '/cube/imu' topic'ine
+        # doğrudan burada abone oluyoruz. Bu abonelik olmadan
+        # carpma.py'nin IMU tabanlı çarpma algılaması ve yaklasma.py'nin
+        # update_imu() çağrısı hiçbir zaman veri almıyordu.
+        self.imu_sub = self.create_subscription(
+            Imu,
+            '/cube/imu',
+            self.imu_callback,
+            10,
+        )
+
+        # vision_node, /mission/active_task topic'i "task3" ALMADAN
+        # detektör YÜKLEMİYOR (bkz. VisionNode.on_task_change /
+        # TASK_DETECTOR_MAP). Periyodik olarak (tek seferlik değil)
+        # gönderiyoruz çünkü vision_node bu node'dan sonra başlarsa
+        # tek seferlik bir yayın kaçırılabilir.
+        self.active_task_pub = self.create_publisher(String, '/mission/active_task', 10)
+        self.active_task_timer = self.create_timer(1.0, self._publish_active_task)
+
         self.task = Task3KamikazeEngagement(
             self,
             self.mission_topics,
             self.mission_clients,
             target_class=self.target_class,
             test_mode=self.test_mode,
+            safety_stop_distance=self.safety_stop_distance,
         )
 
         self.current_heading = 0.0
@@ -442,16 +433,36 @@ class Task3Node(Node):
 
         self.get_logger().info("✅ Task 3 düğümü başlatıldı, görev başlıyor...")
 
+    # --------------------------------------------------------
+    def _publish_active_task(self):
+        msg = String()
+        msg.data = "task3"
+        self.active_task_pub.publish(msg)
+
+    # --------------------------------------------------------
     def gps_callback(self, msg):
         self.task.update_gps(msg.latitude, msg.longitude, self.current_heading)
 
+    # --------------------------------------------------------
     def heading_callback(self, msg):
         self.current_heading = msg.data
         self.task.update_heading(msg.data)
 
+    # --------------------------------------------------------
+    def imu_callback(self, msg):
+        """/cube/imu (sensor_msgs/Imu) -> gyro_z + ivme bileşenlerini
+        çıkarıp Task3KamikazeEngagement.update_imu()'ya iletir."""
+        gyro_z = msg.angular_velocity.z
+        accel_x = msg.linear_acceleration.x
+        accel_y = msg.linear_acceleration.y
+        accel_z = msg.linear_acceleration.z
+        self.task.update_imu(gyro_z, accel_x, accel_y, accel_z)
+
+    # --------------------------------------------------------
     def state_callback(self, msg):
         self.task.update_bridge_state(msg.data)
 
+    # --------------------------------------------------------
     def vision_callback(self, msg):
         try:
             payload = json.loads(msg.data)
@@ -470,6 +481,7 @@ class Task3Node(Node):
         except Exception as exc:
             self.get_logger().error(f"Vision callback hatası: {exc}")
 
+    # --------------------------------------------------------
     def timer_callback(self):
         """Ana kontrol döngüsü."""
         try:
@@ -482,21 +494,24 @@ class Task3Node(Node):
                 self.get_logger().error(f"Araç durdurulamadı: {stop_exc}")
             self.task.state = MissionState.FAILSAFE
 
+    # --------------------------------------------------------
     def status_callback(self):
-        """Test modunda periyodik durum raporu."""
-        status = self.task.arama.get_search_status() if hasattr(self.task, 'arama') else {}
+        """Test modunda periyodik durum raporu (arama + yaklaşma + çarpma)."""
+        arama_status = self.task.arama.get_search_status() if hasattr(self.task, 'arama') else {}
+        yaklasma_status = self.task.yaklasma.get_status() if hasattr(self.task, 'yaklasma') else {}
+        carpma_status = self.task.carpma.get_status() if hasattr(self.task, 'carpma') else {}
 
         self.get_logger().info(
-            f"[TEST STATUS] "
-            f"State: {self.task.state.name}, "
-            f"Arama: {status.get('state', 'N/A')}, "
-            f"Tamamlandı: {status.get('finished', False)}, "
-            f"Onaylandı: {status.get('target_confirmed', False)}, "
-            f"Pencere: {status.get('positive_in_window', 0)} "
-            f"({status.get('window_sec', 0):.1f}sn), "
-            f"İstasyon: {status.get('visited_positions', 0)}, "
-            f"Retry: {status.get('search_retry_count', 0)}, "
-            f"Süre: {status.get('elapsed_time', 0):.1f}s"
+            f"[TEST STATUS] Genel: {self.task.state.name} | "
+            f"Arama: {arama_status.get('state', 'N/A')} "
+            f"bitti={arama_status.get('finished', False)} "
+            f"onaylı={arama_status.get('target_confirmed', False)} | "
+            f"Yaklaşma: {yaklasma_status.get('state', 'N/A')} "
+            f"bitti={yaklasma_status.get('finished', False)} "
+            f"nihai_onay={yaklasma_status.get('final_confirmed', False)} "
+            f"mesafe={yaklasma_status.get('distance')} | "
+            f"Çarpma: {carpma_status.get('state', 'N/A')} "
+            f"vuruş={carpma_status.get('hit_count', 0)}/{carpma_status.get('required_hits', 0)}"
         )
 
 
