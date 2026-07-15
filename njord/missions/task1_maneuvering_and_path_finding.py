@@ -61,10 +61,10 @@ MIN_VALID_ABS_COORD = 1e-6
 
 HOLD_MODE_NAME = "HOLD"
 RELEVANT_OBSTACLE_CLASSES = (
-    "red_buoy",
-    "green_buoy",
-    "east_cardinal",
-    "west_cardinal",
+    "red_buoys",
+    "green_buoys",
+    "east_buoys",
+    "west_buoys",
 )
 DETECTION_ANGLE_KEYS = ("Buoy angle: ", "Buoy angle", "angle_deg", "angle")
 
@@ -369,9 +369,11 @@ class Task1Maneuvering:
             return 1.0
         if obstacle_class == "green_buoy":
             return -1.0
-        if obstacle_class == "east_cardinal":
+        if obstacle_class == "east_cardinal": #DOĞU
+            # Doğuya manevra
             return 1.0
-        if obstacle_class == "west_cardinal":
+        if obstacle_class == "west_cardinal": #BATI
+            # Batıya manevra
             return -1.0
 
         angle_deg = self._detection_angle_deg(obstacle)
