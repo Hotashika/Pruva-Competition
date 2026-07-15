@@ -1,10 +1,4 @@
-# Python 3.12 is required for this project. Please ensure you have Python 3.12 installed before proceeding with the installation of the dependencies listed below.
-
-# ZED ROS Project Dependencies
-# ZED Camera SDK
-# Note: pyzed-5.1-cp312-cp312-linux_x86_64.whl has been provided separately
-# Install with: pip install pyzed-5.1-cp312-cp312-linux_x86_64.whl
-# python /usr/local/zed/get_python_api.py
+# ZED Camera SDK -> python /usr/local/zed/get_python_api.py
 
 # Core dependencies
 numpy>=1.24.0
@@ -23,4 +17,4 @@ Werkzeug>=2.3.0
 psutil
 
 # MAVLink bridge
-pymavlink>=2.4.40
+pymavlink>=2.4.49

@@ -27,17 +27,13 @@ except ImportError:
 
 TASK_DETECTOR_MAP = {
     "task1": {"buoy"},
-    "task2": {"buoy", "vessel"} if VESSEL_MODEL_PATH and VesselDetector else {"buoy"},
-    "task3": {"buoy"},  # DÜZELTME: hedef duba, "vessel" değil "buoy" olmalı
+    "task2": {"buoy"},
+    "task3": {"buoy"}
 }
 
 DETECTOR_REGISTRY = {
     "buoy": (BuoyDetector, BUOY_MODEL_PATH),
 }
-
-if VESSEL_MODEL_PATH and VesselDetector:
-    DETECTOR_REGISTRY["vessel"] = (VesselDetector, VESSEL_MODEL_PATH)
-
 
 class VisionNode(Node):
     def __init__(self, fx=None, cx=None):
@@ -114,13 +110,15 @@ class VisionNode(Node):
                 d["type"] = name
             all_detections += dets
 
-        if all_detections:
-            msg = String()
-            msg.data = json.dumps({
-                "frame_id": frame_id,
-                "detections": all_detections,
-            })
-            self.pub.publish(msg)
+        # Boş tespit listesi de yayınlanır. Böylece görev node'ları vision
+        # process'inin canlı olduğunu, fakat o karede turuncu sınır görülmediğini
+        # topic'in tamamen kesilmesinden ayırt edebilir.
+        msg = String()
+        msg.data = json.dumps({
+            "frame_id": frame_id,
+            "detections": all_detections,
+        })
+        self.pub.publish(msg)
 
     def destroy_node(self):
         self.rgb = None

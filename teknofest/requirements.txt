@@ -23,4 +23,4 @@ Werkzeug>=2.3.0
 psutil
 
 # MAVLink bridge
-pymavlink>=2.4.40
+pymavlink>=2.4.49

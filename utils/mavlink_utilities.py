@@ -4,9 +4,29 @@ from dataclasses import dataclass
 import rclpy
 from geometry_msgs.msg import Twist
 from mavros_msgs.srv import SetMode
+from pymavlink.mavextra import (
+    distance_lat_lon as mavlink_distance_lat_lon,
+    gps_newpos as mavlink_gps_newpos,
+)
 from sensor_msgs.msg import Imu, NavSatFix, BatteryState
 from std_msgs.msg import String, Float32
 from std_srvs.srv import Trigger
+
+
+def parse_bridge_state(text):
+    """Parse the bridge's ``connected/armed/mode`` status string."""
+    state = {}
+    for part in str(text).split(','):
+        if '=' not in part:
+            continue
+        key, value = part.split('=', 1)
+        key = key.strip()
+        value = value.strip()
+        if value.lower() in ('true', 'false'):
+            state[key] = value.lower() == 'true'
+        else:
+            state[key] = value
+    return state
 
 
 # ============================================================
@@ -348,10 +368,14 @@ def call_set_mode(node, set_mode_client, mode_name, timeout_sec=5.0):
     res = future.result()
 
     if res is not None and res.mode_sent:
-        node.get_logger().info(f'Mod degistirildi: {mode_name}')
+        node.get_logger().info(
+            f'Mod bridge tarafindan heartbeat ile dogrulandi: {mode_name}'
+        )
         return True
 
-    node.get_logger().error(f'Mod degistirilemedi: {mode_name}')
+    node.get_logger().error(
+        f'Mod degisikligi Orange Cube durumunda dogrulanamadi: {mode_name}'
+    )
     return False
 
 
@@ -379,9 +403,11 @@ def call_trigger_service(node, client, name, timeout_sec=5.0):
         node.get_logger().error(f'{name} cevabi gelmedi.')
         return False
 
-    node.get_logger().info(
-        f'{name}: success={res.success}, message={res.message}'
-    )
+    log_message = f'{name}: success={res.success}, message={res.message}'
+    if res.success:
+        node.get_logger().info(log_message)
+    else:
+        node.get_logger().error(log_message)
 
     return bool(res.success)
 
@@ -417,7 +443,8 @@ def publish_cmd_vel(cmd_vel_pub, linear_x, angular_z):
 
     angular_z:
         sag/sol donus komutu
-        Açıklama: Pozitif degerler saat yönünün tersine (sola), negatif degerler saat yönünde (sağa) donus anlamina gelir.
+        Açıklama: Bridge sözleşmesinde pozitif değerler sağa/starboard,
+        negatif değerler sola/port dönüş anlamına gelir.
     """
 
     msg = Twist()
@@ -455,14 +482,15 @@ def stop_vehicle(cmd_vel_pub, repeat_count=10):
 
 
 def calculate_gps_distance(lat1, lon1, lat2, lon2):
-    R = 6371000  # Dünya yarıçapı (metre)
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
+    return mavlink_distance_lat_lon(lat1, lon1, lat2, lon2)
 
-    a = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+
+def calculate_gps_newpos(lat, lon, bearing, distance):
+    return mavlink_gps_newpos(lat, lon, bearing, distance)
+
+
+def calculate_angle_error_deg(target_deg, current_deg):
+    return (float(target_deg) - float(current_deg) + 180.0) % 360.0 - 180.0
 
 
 def calculate_bearing(lat1, lon1, lat2, lon2):
@@ -479,3 +507,52 @@ def calculate_bearing(lat1, lon1, lat2, lon2):
     bearing_deg = (math.degrees(bearing_rad) + 360) % 360
 
     return bearing_deg
+
+
+def align_heading_to_gps_target(
+        cmd_vel_pub,
+        current_lat,
+        current_lon,
+        current_heading,
+        target_lat,
+        target_lon,
+        logger=None,
+        target_name="GPS target",
+        tolerance_deg=8.0,
+        kp=0.015,
+        max_angular_z=0.35
+):
+    target_bearing = calculate_bearing(
+        current_lat,
+        current_lon,
+        target_lat,
+        target_lon
+    )
+    heading_error = calculate_angle_error_deg(target_bearing, current_heading)
+
+    if abs(heading_error) <= tolerance_deg:
+        publish_cmd_vel(cmd_vel_pub, linear_x=0.0, angular_z=0.0)
+        if logger is not None:
+            logger.info(
+                f"{target_name} heading aligned: "
+                f"target={target_bearing:.1f}deg, current={float(current_heading):.1f}deg, "
+                f"error={heading_error:.1f}deg",
+                throttle_duration_sec=1.0
+            )
+        return True
+
+    # Bridge, positive angular_z komutunu pozitif yaw (starboard/right) olarak
+    # uygular. Compass bearing hatasi da hedef sagdaysa pozitiftir; bu nedenle
+    # iki isaret dogrudan ayni yönde kullanilmalidir.
+    angular_z = max(-max_angular_z, min(max_angular_z, kp * heading_error))
+    publish_cmd_vel(cmd_vel_pub, linear_x=0.0, angular_z=angular_z)
+
+    if logger is not None:
+        logger.info(
+            f"Aligning heading before {target_name}: "
+            f"target={target_bearing:.1f}deg, current={float(current_heading):.1f}deg, "
+            f"error={heading_error:.1f}deg, angular_z={angular_z:.2f}",
+            throttle_duration_sec=1.0
+        )
+
+    return False

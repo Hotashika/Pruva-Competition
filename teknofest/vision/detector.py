@@ -220,13 +220,13 @@ class BaseYOLODetector:
 
 class BuoyDetector(BaseYOLODetector):
     def __init__(
-        self,
-        model_path=BUOY_MODEL_PATH,
-        device=DEVICE,
-        fx=None,
-        cx=None,
-        use_tracking=False,
-        tracker=None,
+            self,
+            model_path=BUOY_MODEL_PATH,
+            device=DEVICE,
+            fx=None,
+            cx=None,
+            use_tracking=False,
+            tracker=None,
     ):
         super().__init__(
             model_path=model_path,

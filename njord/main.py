@@ -13,6 +13,7 @@ COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
 if COMPETITION_ROOT not in sys.path:
     sys.path.insert(0, COMPETITION_ROOT)
 
+from utils.mavlink_utilities import call_trigger_service
 from njord.core import capture_proc
 from njord.core import data_writer
 from njord.servers import data_server
@@ -73,7 +74,6 @@ def run_startup_cleanup():
     print(f"[SYSTEM] Startup shared memory cleanup running: {cleanup_script}")
     subprocess.run(["/bin/bash", cleanup_script], check=True)
 
-
 def start_capture_process():
     mp_context = get_context("spawn")
     frame_lock = mp_context.Lock()
@@ -128,7 +128,6 @@ if __name__ == "__main__":
 
     try:
         run_startup_cleanup()
-
         (
             capture_process,
             frame_lock,
@@ -170,6 +169,7 @@ if __name__ == "__main__":
         njord_task1_path = os.path.join(PROJECT_ROOT, "missions", "task1_maneuvering_and_path_finding.py")
         njord_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_collision_avoidance.py")
         njord_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_docking.py")
+        njord_task4_path = os.path.join(PROJECT_ROOT, "missions", "task4_surprise.py")
 
         ################################################################################################################
 
@@ -229,13 +229,21 @@ if __name__ == "__main__":
         print("[SYSTEM] Cleaning process was started...")
 
         try:
-            stop_child_process("NJORD Mission 1 Node", p_njord_task1, timeout_sec=7.0)
             stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
             stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
         except Exception as exc:
             print(f"[SYSTEM] Error while sub-process shut down: {exc}")
 
         print("[SYSTEM] Sub-processes closed.")
+
+        print("[SYSTEM] Hold mode & DISARM the AUV...")
+
+        try:
+            call_trigger_service(None, None, "HOLD", timeout_sec=3.0)
+            call_trigger_service(None, None, "DISARM", timeout_sec=3.0)
+        except Exception as exc:
+            print(f"[SYSTEM] Error while sending HOLD/DISARM commands: {exc}")
+
 
         if capture_stop_event is not None:
             capture_stop_event.set()

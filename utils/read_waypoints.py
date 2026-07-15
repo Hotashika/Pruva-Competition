@@ -27,14 +27,16 @@ def parse_qgc_waypoints(file_path):
             continue  # bozuk/eksik satır, atla
 
         seq = int(parts[0])
-        # current_wp = int(parts[1])
-        # frame = int(parts[2])
-        command = int(parts[3])
+        current_wp = int(parts[1])
+        frame = int(parts[2])
         lat = float(parts[8])
         lon = float(parts[9])
         alt = float(parts[10])
 
-        if seq == 0 and command == 0:
+        # QGC WPL dosyalarındaki ilk satır rota noktası değil, HOME kaydıdır.
+        # QGC bunu çoğunlukla NAV_WAYPOINT (command=16) olarak yazar; bu yüzden
+        # HOME ayrımı command alanına göre yapılamaz.
+        if seq == 0 and current_wp == 1 and frame == 0:
             continue
 
         route_index = len(waypoints)
