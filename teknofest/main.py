@@ -181,15 +181,18 @@ if __name__ == "__main__":
         ################################################################################################################
         # SETUP TEKNOFEST MISSION COMMANDS
         ################################################################################################################
-        cmd_teknofest_task1 = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task1_path)}"
-        )
+
+        # cmd_teknofest_task1 = (
+        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task1_path)}"
+        # )
+
         # cmd_teknofest_task2 = (
         #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task2_path)}"
         # )
-        # cmd_teknofest_task3 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task3_path)}"
-        # )
+
+        cmd_teknofest_task3 = (
+            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task3_path)}"
+        )
         ################################################################################################################
 
         p_bridge = launch_child_process(cmd_bridge)
@@ -203,16 +206,14 @@ if __name__ == "__main__":
         ################################################################################################################
         #   TEKNOFEST MISSION START CMD
         ################################################################################################################
-        p_teknofest_task1 = launch_child_process(cmd_teknofest_task1)
-        print(f" -> TEKNOFEST Mission 1 Node launched (PID: {p_teknofest_task1.pid})\n")
+        # p_teknofest_task1 = launch_child_process(cmd_teknofest_task1)
+        # print(f" -> TEKNOFEST Mission 1 Node launched (PID: {p_teknofest_task1.pid})\n")
 
-        # p_teknofest_task2 = subprocess.Popen(cmd_teknofest_task2, shell=True, executable="/bin/bash")
-        # child_processes.append(p_teknofest_task2)
+        # p_teknofest_task2 = launch_child_process(cmd_teknofest_task2)
         # print(f" -> TEKNOFEST Mission 2 Node launched (PID: {p_teknofest_task2.pid})\n")
-        #
-        # p_teknofest_task3 = subprocess.Popen(cmd_teknofest_task3, shell=True, executable="/bin/bash")
-        # child_processes.append(p_teknofest_task3)
-        # print(f" -> TEKNOFEST Mission 3 Node launched (PID: {p_teknofest_task3.pid})\n")
+
+        p_teknofest_task3 = launch_child_process(cmd_teknofest_task3)
+        print(f" -> TEKNOFEST Mission 3 Node launched (PID: {p_teknofest_task3.pid})\n")
         ################################################################################################################
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
