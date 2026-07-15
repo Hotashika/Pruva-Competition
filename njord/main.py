@@ -109,8 +109,13 @@ def start_capture_process():
         raise RuntimeError(f"ZED capture process failed: {ready_msg['error']}")
 
     fx = ready_msg["fx"]
+    fy = ready_msg["fy"]
     cx = ready_msg["cx"]
-    print(f"[SYSTEM] ZED calibration loaded: fx={fx:.2f}, cx={cx:.2f}")
+    cy = ready_msg["cy"]
+    print(
+        "[SYSTEM] ZED calibration loaded: "
+        f"fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}"
+    )
 
     return process, frame_lock, frame_ready_event, stop_event, fx, cx
 
@@ -162,6 +167,8 @@ if __name__ == "__main__":
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
 
         vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        if os.getenv("NJORD_HORIZON_DEBUG", "0").strip().lower() in {"1", "true", "yes"}:
+            vision_args_setup += " --horizon-debug"
 
         ################################################################################################################
         # SETUP NJORD MISSION PATHS

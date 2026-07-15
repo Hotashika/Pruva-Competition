@@ -100,7 +100,7 @@ def disk_writer_worker(q, video_path, frame_size):
         video_writer.write(frame_bgr)
 
         # --- IMU-to-CSV temporarily disabled ---
-        # writer.writerow([timestamp_ms, pitch, yaw, roll, frame_index])
+        # writer.writerow([timestamp_ms, roll, pitch, yaw, frame_index])
 
         # --- depth-to-disk temporarily disabled ---
         # depth_bytes = depth_data.tobytes()
@@ -246,14 +246,14 @@ def run(
             if frame_lock is None:
                 current_frame_id = int(shm_meta[0])
                 timestamp_ms = int(shm_meta[1])
-                pitch, yaw, roll = shm_imu.tolist()
+                roll, pitch, yaw = shm_imu.tolist()
                 np.copyto(bgra_buf, shm_rgb)
                 np.copyto(depth_buf, shm_depth)
             else:
                 with frame_lock:
                     current_frame_id = int(shm_meta[0])
                     timestamp_ms = int(shm_meta[1])
-                    pitch, yaw, roll = shm_imu.tolist()
+                    roll, pitch, yaw = shm_imu.tolist()
                     np.copyto(bgra_buf, shm_rgb)
                     np.copyto(depth_buf, shm_depth)
 
@@ -310,7 +310,7 @@ def run(
             # --- minimize time spent holding locks: just pointer/scalar assignment ---
             with shared_state.data_lock:
                 shared_state.latest_depth_array = downsampled_depth_buf.copy()
-                shared_state.latest_imu = {"pitch": pitch, "yaw": yaw, "roll": roll}
+                shared_state.latest_imu = {"roll": roll, "pitch": pitch, "yaw": yaw}
                 shared_state.latest_timestamp = timestamp_ms
 
             shared_state.data_event.set()

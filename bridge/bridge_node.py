@@ -140,6 +140,9 @@ class OrangeCubeBridgeNode(Node):
         self.roll = None
         self.pitch = None
         self.yaw = None
+        self.imu_linear_acceleration = None
+        self.imu_angular_velocity = None
+        self.last_imu_sample_time = 0.0
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
@@ -603,6 +606,9 @@ class OrangeCubeBridgeNode(Node):
         self.roll = None
         self.pitch = None
         self.yaw = None
+        self.imu_linear_acceleration = None
+        self.imu_angular_velocity = None
+        self.last_imu_sample_time = 0.0
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
@@ -817,6 +823,8 @@ class OrangeCubeBridgeNode(Node):
         requested_messages = (
             (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 5),
             (mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10),
+            (mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU, 20),
+            (mavutil.mavlink.MAVLINK_MSG_ID_SCALED_IMU, 20),
             (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 5),
             (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 1),
         )
@@ -922,6 +930,36 @@ class OrangeCubeBridgeNode(Node):
                     self.pitch = float(msg.pitch)
                     self.yaw = float(msg.yaw)
 
+                elif msg_type == "HIGHRES_IMU":
+                    # HIGHRES_IMU: ivme m/s^2, acisal hiz rad/s.
+                    self.imu_linear_acceleration = (
+                        float(msg.xacc),
+                        float(msg.yacc),
+                        float(msg.zacc),
+                    )
+                    self.imu_angular_velocity = (
+                        float(msg.xgyro),
+                        float(msg.ygyro),
+                        float(msg.zgyro),
+                    )
+                    self.last_imu_sample_time = time.time()
+
+                elif msg_type == "SCALED_IMU":
+                    # SCALED_IMU: ivme mG, acisal hiz millirad/s.
+                    accel_scale = 9.80665 / 1000.0
+                    gyro_scale = 1.0 / 1000.0
+                    self.imu_linear_acceleration = (
+                        float(msg.xacc) * accel_scale,
+                        float(msg.yacc) * accel_scale,
+                        float(msg.zacc) * accel_scale,
+                    )
+                    self.imu_angular_velocity = (
+                        float(msg.xgyro) * gyro_scale,
+                        float(msg.ygyro) * gyro_scale,
+                        float(msg.zgyro) * gyro_scale,
+                    )
+                    self.last_imu_sample_time = time.time()
+
                 elif msg_type == "SYS_STATUS":
                     if msg.voltage_battery != 65535:
                         self.voltage_v = msg.voltage_battery / 1000.0
@@ -1023,6 +1061,27 @@ class OrangeCubeBridgeNode(Node):
             imu_msg.orientation.y = qy
             imu_msg.orientation.z = qz
             imu_msg.orientation.w = qw
+            imu_data_fresh = (
+                self.last_imu_sample_time > 0.0
+                and time.time() - self.last_imu_sample_time <= 0.5
+                and self.imu_linear_acceleration is not None
+                and self.imu_angular_velocity is not None
+            )
+            if imu_data_fresh:
+                (
+                    imu_msg.linear_acceleration.x,
+                    imu_msg.linear_acceleration.y,
+                    imu_msg.linear_acceleration.z,
+                ) = self.imu_linear_acceleration
+                (
+                    imu_msg.angular_velocity.x,
+                    imu_msg.angular_velocity.y,
+                    imu_msg.angular_velocity.z,
+                ) = self.imu_angular_velocity
+            else:
+                # ROS Imu sozlesmesi: ilk covariance -1 ise alan mevcut degildir.
+                imu_msg.linear_acceleration_covariance[0] = -1.0
+                imu_msg.angular_velocity_covariance[0] = -1.0
             self.topics.imu_pub.publish(imu_msg)
 
         if link_ready and self.voltage_v is not None:

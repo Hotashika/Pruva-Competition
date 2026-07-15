@@ -43,6 +43,7 @@ def _install_ros_stubs():
     sys.modules["std_msgs.msg"] = std_msgs_msg
 
     utilities = types.ModuleType("utils.mavlink_utilities")
+    utilities.align_heading_to_gps_target = lambda *args, **kwargs: True
     utilities.calculate_gps_distance = lambda lat1, lon1, lat2, lon2: 100.0
     utilities.call_set_mode = lambda *args, **kwargs: True
     utilities.call_trigger_service = lambda *args, **kwargs: True
@@ -231,6 +232,60 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.mission.update([], now=12.6)
         self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
         self.assertEqual(0, self.mission.current_target_index)
+
+    def test_next_waypoint_waits_then_aligns_before_position_command(self):
+        self.mission.waypoints = [
+            {"lat": 10.0, "lon": 20.0, "alt": 0.0, "seq": 1},
+            {"lat": 11.0, "lon": 21.0, "alt": 0.0, "seq": 2},
+        ]
+        original_distance = task2.calculate_gps_distance
+        original_align = task2.align_heading_to_gps_target
+        alignment_ready = {"value": False}
+        alignment_targets = []
+
+        def fake_distance(lat1, lon1, lat2, lon2):
+            return 0.5 if float(lat2) == 10.0 else 10.0
+
+        def fake_align(*args, **kwargs):
+            alignment_targets.append(kwargs.get("target_name"))
+            return alignment_ready["value"]
+
+        task2.calculate_gps_distance = fake_distance
+        task2.align_heading_to_gps_target = fake_align
+        self.addCleanup(setattr, task2, "calculate_gps_distance", original_distance)
+        self.addCleanup(setattr, task2, "align_heading_to_gps_target", original_align)
+
+        self.mission.update([], now=10.0)
+        self.assertEqual(1, self.mission.current_target_index)
+        self.assertEqual(("cmd_vel", 0.0, 0.0), self.topics.cmd_vel_pub.messages[-1])
+
+        self._refresh_sensors(10.5)
+        self.mission.update([], now=10.5)
+        self.assertEqual([], alignment_targets)
+        self.assertEqual([], self.topics.position_target_pub.messages)
+
+        self._refresh_sensors(10.8)
+        self.mission.update([], now=10.8)
+        self.assertEqual(["WP1"], alignment_targets)
+        self.assertEqual([], self.topics.position_target_pub.messages)
+
+        alignment_ready["value"] = True
+        self._refresh_sensors(10.9)
+        self.mission.update([], now=10.9)
+        self.assertEqual(
+            ("set_position", 11.0, 21.0, 0.0),
+            self.topics.position_target_pub.messages[-1],
+        )
+
+    def test_avoidance_forces_realignment_with_current_waypoint(self):
+        self.mission.aligned_target_key = ("WP0", 10.0, 20.0)
+
+        self._update(6.0, 0.0, 10.0)
+        self._update(5.0, 0.0, 10.3)
+        self._update(4.0, 0.0, 10.6)
+
+        self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+        self.assertIsNone(self.mission.aligned_target_key)
 
 
 if __name__ == "__main__":

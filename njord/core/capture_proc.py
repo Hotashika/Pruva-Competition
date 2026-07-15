@@ -67,7 +67,9 @@ def run_capture(
         cam_info = zed.get_camera_information()
         calib = cam_info.camera_configuration.calibration_parameters.left_cam
         fx = float(calib.fx)
+        fy = float(calib.fy)
         cx = float(calib.cx)
+        cy = float(calib.cy)
 
         runtime = sl.RuntimeParameters()
 
@@ -135,11 +137,11 @@ def run_capture(
 
         meta_buf[:] = 0
         imu_buf[:] = 0.0
-        calib_buf[:] = (fx, cx)
+        calib_buf[:] = (fx, fy, cx, cy)
         frame_index = 0
 
         if ready_queue is not None:
-            ready_queue.put({"fx": fx, "cx": cx})
+            ready_queue.put({"fx": fx, "fy": fy, "cx": cx, "cy": cy})
             ready_sent = True
 
         # ------------------------------------------------------------------
@@ -155,19 +157,24 @@ def run_capture(
             timestamp_ms = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_milliseconds()
 
             imu_pose = sensors_data.get_imu_data().get_pose()
-            pitch, yaw, roll = imu_pose.get_euler_angles()
+            try:
+                roll, pitch, yaw = imu_pose.get_euler_angles(radian=True)
+            except TypeError:
+                # Compatibility with ZED Python API releases whose method does
+                # not expose the radian keyword. Radians are the SDK default.
+                roll, pitch, yaw = imu_pose.get_euler_angles()
 
             frame_index += 1
             if lock is None:
                 rgb_buf[:] = rgb_mat.get_data()
                 depth_buf[:] = depth_mat.get_data()
-                imu_buf[:] = (pitch, yaw, roll)
+                imu_buf[:] = (roll, pitch, yaw)
                 meta_buf[:] = (frame_index, timestamp_ms)
             else:
                 with lock:
                     rgb_buf[:] = rgb_mat.get_data()
                     depth_buf[:] = depth_mat.get_data()
-                    imu_buf[:] = (pitch, yaw, roll)
+                    imu_buf[:] = (roll, pitch, yaw)
                     meta_buf[:] = (frame_index, timestamp_ms)
 
             if frame_ready_event is not None:
