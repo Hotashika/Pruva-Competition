@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
 """
 Task-3 Kamikaze Angajman Görevi — Ana Modül
-GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON
+GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v3 — bridge_node.py'ye hizalı)
 
-Bu dosyada eklenen/düzeltilen kısımlar (bkz. sohbet açıklaması):
-  1. VISION_TIMEOUT_SEC: vision node donarsa/çökerse eski tespitler
-     sonsuza dek "geçerliymiş" gibi kullanılmasın diye tazelik kontrolü.
-  2. HEADING_TIMEOUT_SEC: pusula verisi donarsa arama/yaklaşma
-     durdurulup FAILSAFE'e geçilir (önceden last_heading_time
-     tutuluyordu ama hiç kontrol edilmiyordu).
-  3. Bu iki watchdog da _check_watchdog() içine eklendi.
+Bu turda eklenen/düzeltilen kısımlar:
+  1. stop_vehicle(..., repeat_count=1): repeat_count=10 varsayılanıyla her
+     çağrıda arka arkaya 10 mesaj göndermenin fonksiyonel bir kazancı yok
+     (bridge zaten son mesajı işler); SEARCHING/APPROACHING döngüsünde her
+     tick çağrıldığından bu, gereksiz topic trafiğini büyütüyordu.
+  2. handle_vision_detections() içindeki açı kontrolü, bridge'in gerçek
+     angular_z semantiğine göre hizalandı:
+         bridge_node._cmd_vel_callback:
+             target_yaw_rad = self.yaw + angular_z
+     yani angular_z, "mevcut yaw'a bir kerelik eklenecek radyan ofset"tir,
+     klasik ROS Twist (rad/s, sürekli entegre edilir) DEĞİL. Eski kod
+     (kp=0.035, clamp=±0.5) bunu bir hız komutuymuş gibi hesaplıyordu;
+     bu da her tick'te agresif/ani yaw sıçramalarına yol açardı. Yeni kod,
+     ekibin kendi utils/mavlink_utilities.align_heading_to_gps_target()
+     fonksiyonuyla aynı konvansiyonu (kp=0.015, clamp=±0.35 rad) kullanıyor
+     ve ayrıca tick-başı değişimi de sınırlıyor (yumuşatma).
+
+  ÖNEMLİ NOT: standalone yaklasma.py / carpma.py dosyaları (henüz task3'e
+  bağlı değil) hâlâ eski/yanlış "sürekli rad/s" varsayımıyla yazılı
+  (PID + integral terimi). Bunları task3'e bağlamadan önce aynı bridge
+  semantiğine göre gözden geçirmek gerekiyor.
 """
 
 import json
@@ -34,6 +48,7 @@ from utils.mavlink_utilities import (
     call_trigger_service,
     stop_vehicle,
     calculate_gps_distance,
+    calculate_angle_error_deg,
     publish_cmd_vel,
 )
 
@@ -43,10 +58,8 @@ from teknofest.missions.arama import AramaGorevi
 # GÜVENLİK PARAMETRELERİ
 # ============================================================
 GPS_TIMEOUT_SEC = 3.0
-HEADING_TIMEOUT_SEC = 2.0          # YENİ: pusula verisi bu süreden fazla
-                                    # gecikirse FAILSAFE'e geç
-VISION_TIMEOUT_SEC = 1.0           # YENİ: vision verisi bu süreden fazla
-                                    # bayatlarsa "tespit yok" say
+HEADING_TIMEOUT_SEC = 2.0
+VISION_TIMEOUT_SEC = 1.0
 GEOFENCE_RADIUS_M = 150.0
 DRIVE_MODE = "GUIDED"
 TARGET_LOSS_TIMEOUT_FRAMES = 20
@@ -55,6 +68,15 @@ TEST_DEFAULT_TARGET_COLOR = "red"
 VALID_TARGET_COLORS = ("red", "green", "black")
 TEST_MODE = True
 SAFETY_STOP_DISTANCE = 1.0
+
+# --- YAKLAŞMA AÇI KONTROLÜ (bridge angular_z konvansiyonu) ---
+# utils.mavlink_utilities.align_heading_to_gps_target() ile AYNI konvansiyon:
+# angular_z = kp * heading_error_deg (radyan), clamp edilmiş. Bridge bunu
+# mevcut yaw'a bir kerelik ekliyor; bu yüzden kp DEĞER/DERECE cinsindendir,
+# klasik bir "rad/s" kazancı değildir.
+APPROACH_YAW_KP_RAD_PER_DEG = 0.015
+APPROACH_MAX_ANGULAR_Z = 0.35
+APPROACH_MAX_ANGULAR_STEP = 0.08   # tick başına ek yumuşatma (ani sıçramayı önler)
 
 
 class MissionState(Enum):
@@ -84,7 +106,7 @@ class Task3KamikazeEngagement:
         self.state = MissionState.INIT
         self.last_gps_time = None
         self.last_heading_time = None
-        self.last_vision_time = None   # YENİ
+        self.last_vision_time = None
         self.home_lat = None
         self.home_lon = None
 
@@ -98,6 +120,9 @@ class Task3KamikazeEngagement:
         self.max_target_loss_frames = TARGET_LOSS_TIMEOUT_FRAMES
         self.approach_active = False
         self.approach_start_time = None
+
+        # YENİ: yaklaşma açı komutu için tick-başı yumuşatma durumu
+        self.last_angular_z = 0.0
 
     def update_gps(self, lat, lon, heading):
         self.current_lat = lat
@@ -115,17 +140,17 @@ class Task3KamikazeEngagement:
         self.arama.update_gps(lat, lon, heading)
 
     def update_heading(self, heading):
-        """YENİ: heading_callback artık bunu çağırıyor, böylece
-        last_heading_time gerçekten watchdog tarafından kullanılabiliyor."""
+        """heading_callback tarafından çağrılır; bridge bunu DERECE olarak
+        yayınlıyor (/cube/gps/heading, GLOBAL_POSITION_INT.hdg/100 veya
+        VFR_HUD.heading'den türetilmiş)."""
         self.current_heading = heading
         self.last_heading_time = time.monotonic()
 
     def update_vision_timestamp(self):
-        """YENİ: her yeni vision mesajı geldiğinde çağrılır."""
         self.last_vision_time = time.monotonic()
 
     def _check_watchdog(self):
-        """GPS + heading + vision watchdog kontrolü."""
+        """GPS + heading watchdog kontrolü."""
         now = time.monotonic()
 
         if self.last_gps_time is None:
@@ -136,9 +161,6 @@ class Task3KamikazeEngagement:
             self.state = MissionState.FAILSAFE
             return False
 
-        # YENİ: heading watchdog. Heading hiç gelmediyse (None) henüz
-        # başlangıçtayız, hataya düşürmeyelim; ama bir kere geldikten
-        # sonra donarsa FAILSAFE'e geç.
         if self.last_heading_time is not None and (now - self.last_heading_time) > HEADING_TIMEOUT_SEC:
             if self.state != MissionState.FAILSAFE:
                 self.logger.error(f"HEADING VERİSİ {HEADING_TIMEOUT_SEC} SANİYEDİR GELMİYOR! FAILSAFE.")
@@ -148,8 +170,6 @@ class Task3KamikazeEngagement:
         return True
 
     def is_vision_stale(self):
-        """YENİ: vision verisi bayatladı mı? Bayatladıysa çağıran taraf
-        tespitleri 'yok' sayıp güvenli tarafta kalmalı."""
         if self.last_vision_time is None:
             return True
         return (time.monotonic() - self.last_vision_time) > VISION_TIMEOUT_SEC
@@ -195,6 +215,7 @@ class Task3KamikazeEngagement:
     def reset_search(self):
         self.approach_active = False
         self.target_loss_counter = 0
+        self.last_angular_z = 0.0
         self.state = MissionState.SEARCHING
         self.arama.reset_search()
         self.logger.info("[ARAMA] Yeniden arama başlatıldı.")
@@ -204,7 +225,8 @@ class Task3KamikazeEngagement:
         yeniden başlatır."""
         if not detections:
             self.target_loss_counter += 1
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            self.last_angular_z = 0.0
 
             if self.approach_active and self.target_loss_counter > self.max_target_loss_frames:
                 self.logger.warn(
@@ -227,7 +249,8 @@ class Task3KamikazeEngagement:
 
         if not targets:
             self.target_loss_counter += 1
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            self.last_angular_z = 0.0
 
             if self.approach_active and self.target_loss_counter > self.max_target_loss_frames:
                 self.logger.warn(f"[YAKLAŞMA] Hedef sınıfı {self.target_class} kayboldu.")
@@ -243,7 +266,7 @@ class Task3KamikazeEngagement:
 
         target = min(targets, key=lambda d: d["distance"])
         distance = target["distance"]
-        angle = target["Buoy angle: "]
+        angle = target["Buoy angle: "]  # kameraya göre bağıl açı (derece)
 
         if self.test_mode:
             self.logger.info(f"[TEST] Mesafe: {distance:.2f}m, Açı: {angle:.1f}°")
@@ -251,14 +274,36 @@ class Task3KamikazeEngagement:
         if distance <= SAFETY_STOP_DISTANCE:
             self.logger.info(f"[ÇARPMA] Hedefe ulaşıldı! Mesafe: {distance:.2f}m. Durduruluyor.")
             publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
+            self.last_angular_z = 0.0
             if self.test_mode:
                 elapsed = time.monotonic() - self.approach_start_time if self.approach_start_time else 0
                 self.logger.info(f"[TEST] Yaklaşma süresi: {elapsed:.1f} sn")
             return
 
-        kp = 0.035
-        angular_z = -kp * angle
-        angular_z = max(-0.5, min(0.5, angular_z))
+        # DÜZELTME: bridge angular_z'yi "mevcut yaw'a eklenecek radyan
+        # ofset" olarak yorumluyor (align_heading_to_gps_target ile aynı
+        # konvansiyon). 'angle' kameraya göre bağıl hata; bunu doğrudan
+        # bir heading hatası gibi kullanabiliriz — target_bearing =
+        # current_heading + angle olduğundan calculate_angle_error_deg
+        # sonucu zaten 'angle'ın kendisiyle (sarmalanmış) aynıdır, ama
+        # tutarlılık için ortak yardımcıyı kullanıyoruz.
+        heading_error_deg = calculate_angle_error_deg(
+            (self.current_heading + angle) % 360.0, self.current_heading
+        )
+        raw_angular_z = max(
+            -APPROACH_MAX_ANGULAR_Z,
+            min(APPROACH_MAX_ANGULAR_Z, APPROACH_YAW_KP_RAD_PER_DEG * heading_error_deg),
+        )
+
+        # Tick başına ani sıçramayı sınırla (yumuşatma)
+        delta = raw_angular_z - self.last_angular_z
+        if delta > APPROACH_MAX_ANGULAR_STEP:
+            angular_z = self.last_angular_z + APPROACH_MAX_ANGULAR_STEP
+        elif delta < -APPROACH_MAX_ANGULAR_STEP:
+            angular_z = self.last_angular_z - APPROACH_MAX_ANGULAR_STEP
+        else:
+            angular_z = raw_angular_z
+        self.last_angular_z = angular_z
 
         if abs(angle) < 10:
             linear_x = 0.60
@@ -267,9 +312,6 @@ class Task3KamikazeEngagement:
         else:
             linear_x = 0.15
 
-        # Hedefe yakınken hız kademeli düşsün diye ek fren mesafesi.
-        # (SAFETY_STOP_DISTANCE'a çok yaklaşınca sabit hızla gitmek yerine
-        # mesafe ile orantılı yavaşlama, sert/beklenmedik durmayı azaltır.)
         BRAKE_ZONE_M = 3.0
         if distance < BRAKE_ZONE_M:
             brake_ratio = max(0.15, (distance - SAFETY_STOP_DISTANCE) / (BRAKE_ZONE_M - SAFETY_STOP_DISTANCE))
@@ -296,25 +338,22 @@ class Task3KamikazeEngagement:
             self.logger.warn("Araç arm değil; cmd_vel etkisiz olabilir.", throttle_duration_sec=2.0)
 
         if self.state == MissionState.FAILSAFE:
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             self.logger.warn("FAILSAFE aktif, araç durduruldu.", throttle_duration_sec=2.0)
             return
 
         if not gps_ok:
             self.logger.info("GPS/heading verisi bekleniyor veya kayıp...", throttle_duration_sec=2.0)
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return
 
         if not self._check_geofence():
-            stop_vehicle(self.topics.cmd_vel_pub)
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return
 
         if self.state == MissionState.INIT:
             return
 
-        # YENİ: vision verisi bayatladıysa tespitleri "yok" say.
-        # Böylece eski/donmuş bir kare üzerinden yanlışlıkla hedef
-        # onaylanması veya yaklaşmaya devam edilmesi engellenir.
         if self.is_vision_stale():
             self.logger.warn("Vision verisi bayat, tespit yokmuş gibi davranılıyor.",
                               throttle_duration_sec=2.0)
@@ -328,6 +367,7 @@ class Task3KamikazeEngagement:
                 self.state = MissionState.APPROACHING
                 self.approach_active = True
                 self.approach_start_time = time.monotonic()
+                self.last_angular_z = 0.0
                 self.logger.info("[DURUM] Arama tamamlandı, yaklaşma aşamasına geçiliyor.")
 
         if self.state == MissionState.APPROACHING:
@@ -407,8 +447,6 @@ class Task3Node(Node):
 
     def heading_callback(self, msg):
         self.current_heading = msg.data
-        # DÜZELTME: artık gerçekten watchdog tarafından kullanılan
-        # last_heading_time bu metod üzerinden set ediliyor.
         self.task.update_heading(msg.data)
 
     def state_callback(self, msg):
@@ -426,7 +464,6 @@ class Task3Node(Node):
             self.current_vision_frame_id = frame_id
             self.current_detections = detections
             self.last_detection_time = time.monotonic()
-            # DÜZELTME: task tarafındaki vision-watchdog için de zaman damgası.
             self.task.update_vision_timestamp()
         except json.JSONDecodeError as exc:
             self.get_logger().warn(f"Vision JSON parse edilemedi: {exc}", throttle_duration_sec=2.0)
@@ -440,7 +477,7 @@ class Task3Node(Node):
         except Exception as exc:
             self.get_logger().error(f"Zamanlayıcı döngüsünde beklenmeyen hata: {exc}")
             try:
-                stop_vehicle(self.mission_topics.cmd_vel_pub)
+                stop_vehicle(self.mission_topics.cmd_vel_pub, repeat_count=1)
             except Exception as stop_exc:
                 self.get_logger().error(f"Araç durdurulamadı: {stop_exc}")
             self.task.state = MissionState.FAILSAFE
@@ -455,7 +492,8 @@ class Task3Node(Node):
             f"Arama: {status.get('state', 'N/A')}, "
             f"Tamamlandı: {status.get('finished', False)}, "
             f"Onaylandı: {status.get('target_confirmed', False)}, "
-            f"Pencere: {status.get('positive_in_window', 0)}/{status.get('window_size', 0)}, "
+            f"Pencere: {status.get('positive_in_window', 0)} "
+            f"({status.get('window_sec', 0):.1f}sn), "
             f"İstasyon: {status.get('visited_positions', 0)}, "
             f"Retry: {status.get('search_retry_count', 0)}, "
             f"Süre: {status.get('elapsed_time', 0):.1f}s"
@@ -503,7 +541,7 @@ def main(args=None):
     finally:
         node.get_logger().info("Araç durduruluyor...")
         try:
-            stop_vehicle(node.mission_topics.cmd_vel_pub)
+            stop_vehicle(node.mission_topics.cmd_vel_pub, repeat_count=1)
         except Exception:
             pass
         node.destroy_node()
