@@ -67,7 +67,7 @@ WAYPOINT_PATH = BASE_DIR / "waypoints" / "teknofest_task2.waypoints"
 # ROS / VISION PARAMETRELERİ
 # ============================================================
 DETECTION_TOPIC = "/vision/detections"
-DETECTION_STALE_SEC = 0.75
+cDETECTION_STALE_SEC = 3.00
 
 # Görev 2 parkurundaki bütün engeller sarı dubadır. Mevcut buoy.pt modelinin
 # class adı dışında hiçbir tespit engel kaçınmasını tetiklemez.
