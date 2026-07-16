@@ -1,3 +1,4 @@
+import argparse
 import os
 import queue
 import shlex
@@ -18,6 +19,28 @@ from njord.core import capture_proc
 from njord.core import data_writer
 from njord.servers import data_server
 from njord.servers import video_server
+
+
+MISSION_SPECS = {
+    "task1": ("Mission 1", "task1_maneuvering_and_path_finding.py"),
+    "task2": ("Mission 2", "task2_collision_avoidance.py"),
+    "task3": ("Mission 3", "task3_docking.py"),
+    "task4": ("Mission 4", "task4_surprise.py"),
+}
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Start the selected NJORD mission.")
+    task_group = parser.add_mutually_exclusive_group(required=True)
+    for task_number in range(1, 5):
+        task_group.add_argument(
+            f"--task-{task_number}",
+            dest="task",
+            action="store_const",
+            const=f"task{task_number}",
+            help=f"Start NJORD Mission {task_number}.",
+        )
+    return parser.parse_args(argv)
 
 
 def launch_child_process(command):
@@ -121,6 +144,9 @@ def start_capture_process():
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    mission_name, mission_filename = MISSION_SPECS[args.task]
+
     fx = None
     cx = None
     capture_process = None
@@ -129,7 +155,7 @@ if __name__ == "__main__":
     frame_ready_event = None
     p_bridge = None
     p_vision = None
-    p_njord_task1 = None
+    p_njord_mission = None
 
     try:
         run_startup_cleanup()
@@ -170,15 +196,7 @@ if __name__ == "__main__":
         if os.getenv("NJORD_HORIZON_DEBUG", "0").strip().lower() in {"1", "true", "yes"}:
             vision_args_setup += " --horizon-debug"
 
-        ################################################################################################################
-        # SETUP NJORD MISSION PATHS
-        ################################################################################################################
-        njord_task1_path = os.path.join(PROJECT_ROOT, "missions", "task1_maneuvering_and_path_finding.py")
-        njord_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_collision_avoidance.py")
-        njord_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_docking.py")
-        njord_task4_path = os.path.join(PROJECT_ROOT, "missions", "task4_surprise.py")
-
-        ################################################################################################################
+        mission_path = os.path.join(PROJECT_ROOT, "missions", mission_filename)
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
@@ -186,19 +204,10 @@ if __name__ == "__main__":
         cmd_bridge = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
-        ################################################################################################################
-        # SETUP NJORD MISSION COMMANDS
-        ################################################################################################################
-        cmd_njord_task1 = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task1_path)}"
+        cmd_njord_mission = (
+            f"{ros2_setup} && {python_path_setup} && "
+            f"{shlex.quote(sys.executable)} {shlex.quote(mission_path)}"
         )
-        # cmd_njord_task2 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task2_path)}"
-        # )
-        # cmd_njord_task3 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task3_path)}"
-        # )
-        ################################################################################################################
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
@@ -208,24 +217,17 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        ################################################################################################################
-        #   NJORD MISSION START CMD
-        ################################################################################################################
-        p_njord_task1 = launch_child_process(cmd_njord_task1)
-        print(f" -> NJORD Mission 1 Node launched (PID: {p_njord_task1.pid})\n")
-
-        # p_njord_task2 = subprocess.Popen(cmd_njord_task2, shell=True, executable="/bin/bash")
-        # child_processes.append(p_njord_task2)
-        # print(f" -> NJORD Mission 2 Node launched (PID: {p_njord_task2.pid})\n")
-        #
-        # p_njord_task3 = subprocess.Popen(cmd_njord_task3, shell=True, executable="/bin/bash")
-        # child_processes.append(p_njord_task3)
-        # print(f" -> NJORD Mission 3 Node launched (PID: {p_njord_task3.pid})\n")
-        ################################################################################################################
+        p_njord_mission = launch_child_process(cmd_njord_mission)
+        print(f" -> NJORD {mission_name} Node launched (PID: {p_njord_mission.pid})\n")
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
-        data_writer.run(frame_lock, frame_ready_event, capture_stop_event)
+        data_writer.run(
+            frame_lock,
+            frame_ready_event,
+            capture_stop_event,
+            active_task=args.task,
+        )
 
     except KeyboardInterrupt:
         print("\n[SYSTEM] Stopped by the user (Ctrl+C)...")
@@ -235,11 +237,16 @@ if __name__ == "__main__":
     finally:
         print("[SYSTEM] Cleaning process was started...")
 
-        try:
-            stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
-            stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
-        except Exception as exc:
-            print(f"[SYSTEM] Error while sub-process shut down: {exc}")
+        subprocesses = (
+            (f"NJORD {mission_name} Node", p_njord_mission, 7.0),
+            ("Vision Node", p_vision, 3.0),
+            ("Bridge Node", p_bridge, 5.0),
+        )
+        for process_name, process, timeout_sec in subprocesses:
+            try:
+                stop_child_process(process_name, process, timeout_sec=timeout_sec)
+            except Exception as exc:
+                print(f"[SYSTEM] Error while stopping {process_name}: {exc}")
 
         print("[SYSTEM] Sub-processes closed.")
 

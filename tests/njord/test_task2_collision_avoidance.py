@@ -149,7 +149,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
     def _buoy(color, distance, angle):
         return {
             "type": "buoy",
-            "class": f"{color}_buoy",
+            "class": f"{color}_buoys",
             "distance": distance,
             "Buoy angle: ": angle,
         }
@@ -182,7 +182,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertEqual(("cmd_vel", 0.5, -0.6), self.topics.cmd_vel_pub.messages[-1])
 
-    def test_closing_red_buoy_is_used_as_collision_target(self):
+    def test_closing_buoy_is_used_as_collision_target(self):
         for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
             self._refresh_sensors(now)
             self.mission.update(
@@ -194,17 +194,31 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertEqual(("cmd_vel", 0.5, -0.6), self.topics.cmd_vel_pub.messages[-1])
 
-    def test_non_red_buoy_is_not_used_as_collision_target(self):
-        for distance, now in ((6.0, 10.0), (5.0, 10.3), (2.0, 10.6)):
-            self._refresh_sensors(now)
-            self.mission.update(
-                [self._buoy("green", distance, 0.0)],
-                now=now,
-                record_observation=True,
-            )
+    def test_current_buoy_model_classes_are_collision_targets(self):
+        expected_classes = {
+            "green_buoys",
+            "red_buoys",
+            "north_buoys",
+            "east_buoys",
+            "south_buoys",
+            "west_buoys",
+        }
 
-        self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
-        self.assertNotIn(("cmd_vel", 0.5, -0.6), self.topics.cmd_vel_pub.messages)
+        self.assertEqual(expected_classes, task2.BUOY_MODEL_TYPES)
+        for model_class in expected_classes:
+            with self.subTest(model_class=model_class):
+                self.assertTrue(
+                    self.mission._is_vessel(
+                        {"type": "buoy", "class": model_class}
+                    )
+                )
+
+    def test_unknown_buoy_class_is_not_used_as_collision_target(self):
+        self.assertFalse(
+            self.mission._is_vessel(
+                {"type": "buoy", "class": "unknown_buoy"}
+            )
+        )
 
     def test_port_side_risk_stands_on_then_uses_starboard_fallback(self):
         self._update(5.0, -25.0, 10.0)

@@ -11,7 +11,7 @@ import numpy as np
 from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
 from njord.core import shared_state
 from njord.core.shared_memory_utils import attach_existing_shared_memory
-from njord.vision.detector import BuoyDetector, VesselDetector
+from njord.vision.detector import ArTagDetector, BuoyDetector
 
 OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")
@@ -22,16 +22,16 @@ VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
 VIDEO_FPS = 5
 
 TASK_DETECTOR_MAP = {
-    "task1": ("buoy",),
-    "task2": ("vessel",),
-    "task3": ("vessel",),
-    "task4": ("buoy",),
-    "none": ("buoy", "vessel"),
+    "task1": ("buoy", "ar_tag"),
+    "task2": ("buoy", "ar_tag"),
+    "task3": ("buoy", "ar_tag"),
+    "task4": ("buoy", "ar_tag"),
+    "none": ("buoy", "ar_tag"),
 }
 
 DETECTOR_FACTORIES = {
     "buoy": BuoyDetector,
-    "vessel": VesselDetector,
+    "ar_tag": ArTagDetector,
 }
 
 logger = logging.getLogger("zed_capture")

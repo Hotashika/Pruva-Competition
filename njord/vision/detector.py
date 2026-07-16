@@ -6,7 +6,13 @@ import numpy as np
 from ultralytics import YOLO
 
 from njord.config.camera_config import CAMERA_WIDTH
-from njord.config.vision_config import DEVICE, BUOY_MODEL_PATH, VESSEL_MODEL_PATH, TOLERANCE_RATIO, TOLARANCE_DEG
+from njord.config.vision_config import (
+    AR_TAG_MODEL_PATH,
+    BUOY_MODEL_PATH,
+    DEVICE,
+    TOLERANCE_RATIO,
+    TOLERANCE_DEG,
+)
 from njord.vision.depth_utils import get_distance_from_bbox
 
 
@@ -171,7 +177,7 @@ def _compute_angle_from_bbox(detection, fx, cx):
 
 def _compute_side_from_bbox(detection, angle_deg):
     if angle_deg is not None:
-        if abs(angle_deg) <= TOLARANCE_DEG:
+        if abs(angle_deg) <= TOLERANCE_DEG:
             return "across"
         if angle_deg > 0:
             return "right"
@@ -212,14 +218,11 @@ class BuoyDetector(BaseYOLODetector):
         return _add_angle_fields(detections, "Buoy", self.fx, self.cx)
 
 
-class VesselDetector(BaseYOLODetector):
-    def __init__(self, model_path=VESSEL_MODEL_PATH, device=DEVICE, fx=None, cx=None):
+class ArTagDetector(BaseYOLODetector):
+    def __init__(self, model_path=AR_TAG_MODEL_PATH, device=DEVICE, fx=None, cx=None):
         super().__init__(model_path, device)
-        # ZED kalibrasyonundan gelen intrinsics. Kamera açıldıktan sonra
-        # zed.get_camera_information() ile okunup buraya geçirilmeli.
-        # fx=None kalırsa side hesabı görüntü merkezi fallback'ini kullanır.
         self.fx, self.cx = _normalize_intrinsics(fx, cx)
 
     def detect(self, bgr_image, depth_array):
         detections = super().detect(bgr_image, depth_array)
-        return _add_angle_fields(detections, "Vessel", self.fx, self.cx)
+        return _add_angle_fields(detections, "AR tag", self.fx, self.cx)

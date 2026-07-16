@@ -17,22 +17,22 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
-from njord.config.vision_config import BUOY_MODEL_PATH, VESSEL_MODEL_PATH
+from njord.config.vision_config import AR_TAG_MODEL_PATH, BUOY_MODEL_PATH
 from njord.core import shared_state
 from njord.core.shared_memory_utils import attach_existing_shared_memory, close_shared_memory_handles
-from njord.vision.detector import BuoyDetector, VesselDetector
+from njord.vision.detector import ArTagDetector, BuoyDetector
 from njord.vision.horizon_mask import create_horizon_mask, render_horizon_overlay
 
 TASK_DETECTOR_MAP = {
-    "task1": {"buoy"},
-    "task2": {"buoy", "vessel"},
-    "task3": {"vessel"},
-    "task4": {...},
+    "task1": {"buoy", "ar_tag"},
+    "task2": {"buoy", "ar_tag"},
+    "task3": {"buoy", "ar_tag"},
+    "task4": {"buoy", "ar_tag"},
 }
 
 DETECTOR_REGISTRY = {
     "buoy": (BuoyDetector, BUOY_MODEL_PATH),
-    "vessel": (VesselDetector, VESSEL_MODEL_PATH),
+    "ar_tag": (ArTagDetector, AR_TAG_MODEL_PATH),
 }
 
 

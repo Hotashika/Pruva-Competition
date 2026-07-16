@@ -76,7 +76,14 @@ AVOID_MAX_DURATION_SEC = 10.0
 VISION_DETECTION_TIMEOUT_SEC = 1.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
-RED_BUOY_TYPES = {"red_buoy", "red buoy", "red-buoy"}
+BUOY_MODEL_TYPES = {
+    "green_buoys",
+    "red_buoys",
+    "north_buoys",
+    "east_buoys",
+    "south_buoys",
+    "west_buoys",
+}
 COLLISION_TARGET_ANGLE_KEYS = (
     "Vessel angle: ",
     "Vessel angle",
@@ -184,11 +191,10 @@ class Task2CollisionAvoidance:
         model_class = str(detection.get("class", "")).strip().lower()
         is_vessel = detector_type == "vessel" or model_class in VESSEL_TYPES
 
-        # Task 2 water tests use a red buoy as the collision target. Keep
-        # vessel support for the real mission while accepting only the red
-        # buoy class from the buoy detector.
-        is_red_buoy = model_class in RED_BUOY_TYPES
-        return is_vessel or is_red_buoy
+        # Task 2 water tests use the buoy detector as the collision target.
+        # These names mirror the classes embedded in the current buoy model.
+        is_buoy = detector_type == "buoy" and model_class in BUOY_MODEL_TYPES
+        return is_vessel or is_buoy
 
     @classmethod
     def _detection_angle_deg(cls, detection):
