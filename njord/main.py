@@ -14,6 +14,7 @@ if COMPETITION_ROOT not in sys.path:
     sys.path.insert(0, COMPETITION_ROOT)
 
 from utils.mavlink_utilities import call_trigger_service
+from utils.task_selection_state import default_task_selection_file
 from njord.core import capture_proc
 from njord.core import data_writer
 from njord.servers import data_server
@@ -81,27 +82,8 @@ def configure_mavlink_bridge_environment():
         "MAVLINK_BAUD": "921600",
         "MAVLINK_SOURCE_SYSTEM": "1",
         "MAVLINK_SOURCE_COMPONENT": "191",
-        "MAVLINK_MISSION_LAUNCH_ENABLED": "1",
-        "MAVLINK_MISSION_1_PATH": os.path.join(
-            PROJECT_ROOT,
-            "missions",
-            "task1_maneuvering_and_path_finding.py",
-        ),
-        "MAVLINK_MISSION_2_PATH": os.path.join(
-            PROJECT_ROOT,
-            "missions",
-            "task2_collision_avoidance.py",
-        ),
-        "MAVLINK_MISSION_3_PATH": os.path.join(
-            PROJECT_ROOT,
-            "missions",
-            "task3_docking.py",
-        ),
-        "MAVLINK_MISSION_4_PATH": os.path.join(
-            PROJECT_ROOT,
-            "missions",
-            "task4_surprise.py",
-        ),
+        "MAVLINK_MISSION_START_TOPIC": "/mission_start",
+        "MISSION_SELECTION_FILE": default_task_selection_file(),
     }
     for key, value in defaults.items():
         os.environ.setdefault(key, value)
@@ -112,7 +94,8 @@ def configure_mavlink_bridge_environment():
         f"baud={os.environ.get('MAVLINK_BAUD')}, "
         f"source={os.environ.get('MAVLINK_SOURCE_SYSTEM')}:"
         f"{os.environ.get('MAVLINK_SOURCE_COMPONENT')}, "
-        f"mission_launch={os.environ.get('MAVLINK_MISSION_LAUNCH_ENABLED')}"
+        f"mission_start_topic={os.environ.get('MAVLINK_MISSION_START_TOPIC')}, "
+        f"mission_selection_file={os.environ.get('MISSION_SELECTION_FILE')}"
     )
 
 
@@ -167,6 +150,7 @@ if __name__ == "__main__":
     frame_ready_event = None
     p_bridge = None
     p_vision = None
+    p_mission_manager = None
 
     try:
         run_startup_cleanup()
@@ -209,6 +193,7 @@ if __name__ == "__main__":
 
         vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
+        mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
 
         vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
 
@@ -218,9 +203,15 @@ if __name__ == "__main__":
         cmd_bridge = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
+        cmd_mission_manager = (
+            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(mission_manager_path)}"
+        )
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
+
+        p_mission_manager = launch_child_process(cmd_mission_manager)
+        print(f" -> Mission Manager launched (PID: {p_mission_manager.pid})")
 
         if not bridge_only:
             p_vision = launch_child_process(cmd_vision)
@@ -228,7 +219,9 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        print(" -> Mission nodes will be launched by SCR_USER1 bridge commands.\n")
+        print(" -> Bridge publishes SCR_USER1 commands to /mission_start.")
+        print(" -> Mission Manager writes /mission_start commands to JSON.")
+        print(" -> Task algorithms will later poll the JSON file.\n")
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
@@ -248,6 +241,7 @@ if __name__ == "__main__":
 
         try:
             stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
+            stop_child_process("Mission Manager", p_mission_manager, timeout_sec=5.0)
             stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
         except Exception as exc:
             print(f"[SYSTEM] Error while sub-process shut down: {exc}")
