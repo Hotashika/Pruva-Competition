@@ -2,8 +2,6 @@
 
 import math
 import os
-import signal
-import subprocess
 import sys
 import time
 
@@ -17,17 +15,35 @@ from rclpy.executors import ExternalShutdownException
 from pymavlink import mavutil
 
 from sensor_msgs.msg import Imu, NavSatFix, BatteryState
-from std_msgs.msg import String, Float32
+from std_msgs.msg import Float32, Int32, String
 
 from bridge.mavlink_connection import (
     DEFAULT_BAUD,
     DEFAULT_CONNECTION_STRING,
     DEFAULT_HEARTBEAT_TIMEOUT,
+    DEFAULT_SOURCE_COMPONENT,
+    DEFAULT_SOURCE_SYSTEM,
     connect_mavlink,
 )
 from utils.mavlink_utilities import create_bridge_topics, create_bridge_services
 
-MAV_CMD_MISSION_START = mavutil.mavlink.MAV_CMD_USER_1
+MISSION_PARAM_NAME = "SCR_USER1"
+MISSION_IDLE = 0
+MISSION_1 = 1
+MISSION_2 = 2
+MISSION_3 = 3
+MISSION_4 = 4
+MISSION_STOP = 90
+MISSION_EMERGENCY = 99
+VALID_MISSION_COMMANDS = {
+    MISSION_IDLE,
+    MISSION_1,
+    MISSION_2,
+    MISSION_3,
+    MISSION_4,
+    MISSION_STOP,
+    MISSION_EMERGENCY,
+}
 
 
 def euler_to_quaternion(roll, pitch, yaw):
@@ -81,6 +97,14 @@ class OrangeCubeBridgeNode(Node):
             int(os.getenv("MAVLINK_HEARTBEAT_TIMEOUT", str(DEFAULT_HEARTBEAT_TIMEOUT))),
         )
         self.declare_parameter(
+            "source_system",
+            int(os.getenv("MAVLINK_SOURCE_SYSTEM", str(DEFAULT_SOURCE_SYSTEM))),
+        )
+        self.declare_parameter(
+            "source_component",
+            int(os.getenv("MAVLINK_SOURCE_COMPONENT", str(DEFAULT_SOURCE_COMPONENT))),
+        )
+        self.declare_parameter(
             "connection_timeout_sec",
             float(os.getenv("MAVLINK_CONNECTION_TIMEOUT", "5.0")),
         )
@@ -102,14 +126,23 @@ class OrangeCubeBridgeNode(Node):
             not in ("0", "false", "no", "off"),
         )
         self.declare_parameter(
-            "mission_launch_enabled",
-            os.getenv("MAVLINK_MISSION_LAUNCH_ENABLED", "0").lower()
-            in ("1", "true", "yes", "on"),
+            "mission_start_topic",
+            os.getenv("MAVLINK_MISSION_START_TOPIC", "/mission_start"),
+        )
+        self.declare_parameter(
+            "mission_start_ack_topic",
+            os.getenv("MAVLINK_MISSION_START_ACK_TOPIC", "/mission_start_ack"),
+        )
+        self.declare_parameter(
+            "mission_start_retry_sec",
+            float(os.getenv("MAVLINK_MISSION_START_RETRY_SEC", "1.0")),
         )
 
         self.connection_string = self.get_parameter("connection_string").value
         self.baud = int(self.get_parameter("baud").value)
         self.heartbeat_timeout = int(self.get_parameter("heartbeat_timeout").value)
+        self.source_system = int(self.get_parameter("source_system").value)
+        self.source_component = int(self.get_parameter("source_component").value)
         self.connection_timeout_sec = float(self.get_parameter("connection_timeout_sec").value)
         self.reconnect_interval_sec = float(self.get_parameter("reconnect_interval_sec").value)
         self.reconnect_heartbeat_timeout = float(
@@ -119,8 +152,10 @@ class OrangeCubeBridgeNode(Node):
             self.get_parameter("command_confirmation_timeout_sec").value
         )
         self.disarm_on_shutdown = bool(self.get_parameter("disarm_on_shutdown").value)
-        self.mission_launch_enabled = bool(
-            self.get_parameter("mission_launch_enabled").value
+        self.mission_start_topic = str(self.get_parameter("mission_start_topic").value)
+        self.mission_start_ack_topic = str(self.get_parameter("mission_start_ack_topic").value)
+        self.mission_start_retry_sec = float(
+            self.get_parameter("mission_start_retry_sec").value
         )
 
         self.master = None
@@ -131,6 +166,14 @@ class OrangeCubeBridgeNode(Node):
         self.last_connection_attempt = 0.0
         self.connection_lost_reported = False
         self.cmd_vel_ignored_reported = False
+        self.last_mavlink_rx_time = 0.0
+        self.last_mission_command_time = 0.0
+        self.last_mission_command_wait_log_time = 0.0
+        self.mission_parameter_initialized = False
+        self.last_mission_parameter_value = MISSION_IDLE
+        self.pending_mission_command = None
+        self.pending_mission_command_first_publish_time = 0.0
+        self.pending_mission_command_last_publish_time = 0.0
 
         self.gps_lat = None
         self.gps_lon = None
@@ -140,6 +183,9 @@ class OrangeCubeBridgeNode(Node):
         self.roll = None
         self.pitch = None
         self.yaw = None
+        self.imu_linear_acceleration = None
+        self.imu_angular_velocity = None
+        self.last_imu_sample_time = 0.0
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
@@ -152,14 +198,6 @@ class OrangeCubeBridgeNode(Node):
         self.last_attitude_tx_active = False
         self.last_position_target_time = 0.0
         self.position_target_timeout_sec = 0.5
-        self.active_mission_name = None
-        self.active_mission_process = None
-        self.mission_paths = self._load_mission_paths_from_env()
-        self.mission_waypoint_paths = self._load_mission_waypoint_paths_from_env()
-        self.mission_sequence = self._load_mission_sequence_from_env()
-        self.active_sequence = []
-        self.active_sequence_index = 0
-
         self.topics = create_bridge_topics(
             self,
             self._cmd_vel_callback,
@@ -173,9 +211,15 @@ class OrangeCubeBridgeNode(Node):
             self._disarm_callback,
         )
 
-        self.mission_command_pub = self.create_publisher(
-            String,
-            "/mission_command",
+        self.mission_start_pub = self.create_publisher(
+            Int32,
+            self.mission_start_topic,
+            10,
+        )
+        self.create_subscription(
+            Int32,
+            self.mission_start_ack_topic,
+            self._mission_start_ack_callback,
             10,
         )
 
@@ -187,72 +231,17 @@ class OrangeCubeBridgeNode(Node):
         self.create_timer(0.1, self._send_attitude_target_loop)
         self.create_timer(1.0, self._connection_watchdog)
         self.create_timer(1.0, self._send_companion_heartbeat)
-        self.create_timer(1.0, self._mission_process_watchdog)
+        self.create_timer(0.5, self._request_mission_command_parameter)
+        self.create_timer(5.0, self._mission_command_rx_watchdog)
+        self.create_timer(0.2, self._mission_start_ack_watchdog)
 
-        if self.mission_launch_enabled:
-            configured = ", ".join(
-                f"M{number}={path}"
-                for number, path in sorted(self.mission_paths.items())
-            )
-            waypoint_configured = ", ".join(
-                f"M{number}={path}"
-                for number, path in sorted(self.mission_waypoint_paths.items())
-            )
-            sequence_text = (
-                " sequence=" + ",".join(f"M{number}" for number in self.mission_sequence)
-                if self.mission_sequence
-                else ""
-            )
-            self.get_logger().info(
-                f"MAVLink mission launch aktif. Komut: MAV_CMD_USER_1 param1=1..4.{sequence_text} {configured}"
-            )
-            if waypoint_configured:
-                self.get_logger().info(
-                    f"Pixhawk waypoint sync aktif: {waypoint_configured}"
-                )
-        else:
-            self.get_logger().info(
-                "MAVLink mission launch pasif. Sadece /mission_command yayinlanacak."
-            )
+        self.get_logger().info(
+            f"MAVLink Bridge aktif. {MISSION_PARAM_NAME}=1..4/90/99 okunup "
+            f"{self.mission_start_topic} topic'ine Int32 olarak yayinlanacak; "
+            f"{self.mission_start_ack_topic} ack geldikten sonra {MISSION_PARAM_NAME}=0 yapilacak."
+        )
 
         self.get_logger().info("/cube topic ve servisleri aktif.")
-
-    @staticmethod
-    def _load_mission_paths_from_env():
-        paths = {}
-        for number in range(1, 5):
-            path = os.getenv(f"MAVLINK_MISSION_{number}_PATH", "").strip()
-            if path:
-                paths[number] = path
-        return paths
-
-    @staticmethod
-    def _load_mission_waypoint_paths_from_env():
-        paths = {}
-        for number in range(1, 5):
-            path = os.getenv(f"MAVLINK_MISSION_{number}_WAYPOINT_PATH", "").strip()
-            if path:
-                paths[number] = path
-        return paths
-
-    @staticmethod
-    def _load_mission_sequence_from_env():
-        raw = os.getenv("MAVLINK_MISSION_SEQUENCE", "").strip()
-        if not raw:
-            return []
-
-        sequence = []
-        for part in raw.split(","):
-            text = part.strip().upper()
-            if text.startswith("M"):
-                text = text[1:]
-            try:
-                number = int(text)
-            except ValueError:
-                continue
-            if 1 <= number <= 4 and number not in sequence:
-                sequence.append(number)
-        return sequence
 
     def _send_command_ack(self, command, result):
         if self.master is None:
@@ -263,288 +252,79 @@ class OrangeCubeBridgeNode(Node):
         except Exception as exc:
             self.get_logger().warn(f"COMMAND_ACK gonderilemedi: {exc}")
 
-    def _stop_active_mission(self, timeout_sec=7.0):
-        process = self.active_mission_process
-        mission_name = self.active_mission_name
-        if process is None:
+    def _send_status_text(self, text, severity=None):
+        if self.master is None:
             return
 
-        if process.poll() is not None:
-            self.active_mission_process = None
-            self.active_mission_name = None
-            return
+        if severity is None:
+            severity = mavutil.mavlink.MAV_SEVERITY_INFO
 
-        self.get_logger().info(f"{mission_name} gorevi durduruluyor...")
+        message = f"JETSON: {text}"[:50]
         try:
-            os.killpg(process.pid, signal.SIGINT)
-        except ProcessLookupError:
-            pass
-        except AttributeError:
-            process.send_signal(signal.SIGINT)
-
-        try:
-            process.wait(timeout=timeout_sec)
-        except subprocess.TimeoutExpired:
-            self.get_logger().warn(f"{mission_name} SIGINT ile kapanmadi, SIGTERM gonderiliyor.")
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except AttributeError:
-                process.terminate()
-            process.wait(timeout=2)
-
-        self.active_mission_process = None
-        self.active_mission_name = None
-        self.active_sequence = []
-        self.active_sequence_index = 0
-
-    def _start_mission_process(self, mission_number):
-        mission_name = f"M{mission_number}"
-
-        mission_path = self.mission_paths.get(mission_number)
-        if not mission_path:
-            self.get_logger().warn(f"{mission_name} icin mission path tanimli degil.")
-            return False
-
-        if not os.path.isfile(mission_path):
-            self.get_logger().error(f"{mission_name} script bulunamadi: {mission_path}")
-            return False
-
-        if (
-            self.active_mission_process is not None
-            and self.active_mission_process.poll() is None
-        ):
-            if self.active_mission_name == mission_name:
-                self.get_logger().warn(f"{mission_name} zaten calisiyor; ikinci kez baslatilmadi.")
-                return True
-            self._stop_active_mission()
-
-        try:
-            self.active_mission_process = subprocess.Popen(
-                [sys.executable, mission_path],
-                start_new_session=True,
-            )
-            self.active_mission_name = mission_name
-            self.get_logger().info(
-                f"{mission_name} Jetson uzerinde baslatildi: PID={self.active_mission_process.pid}"
-            )
-            return True
-        except Exception as exc:
-            self.active_mission_process = None
-            self.active_mission_name = None
-            self._publish_error(f"{mission_name} baslatilamadi: {exc}")
-            return False
-
-    def _request_mission_item(self, target_system, target_component, seq):
-        try:
-            self.master.mav.mission_request_int_send(
-                target_system,
-                target_component,
-                seq,
-                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
-            )
-        except AttributeError:
-            self.master.mav.mission_request_send(target_system, target_component, seq)
+            self.master.mav.statustext_send(severity, message.encode("utf-8"))
         except TypeError:
-            self.master.mav.mission_request_int_send(target_system, target_component, seq)
-
-    def _read_pixhawk_mission_waypoints(self):
-        if not self._has_valid_link():
-            raise RuntimeError("MAVLink baglantisi hazir degil.")
-
-        target_system = self.master.target_system
-        target_component = self.master.target_component
-
-        try:
-            self.master.mav.mission_request_list_send(
-                target_system,
-                target_component,
-                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
-            )
-        except TypeError:
-            self.master.mav.mission_request_list_send(target_system, target_component)
-
-        count_msg = self.master.recv_match(
-            type="MISSION_COUNT",
-            blocking=True,
-            timeout=5.0,
-        )
-        if count_msg is None:
-            raise RuntimeError("Pixhawk MISSION_COUNT gondermedi.")
-
-        count = int(getattr(count_msg, "count", 0) or 0)
-        if count <= 0:
-            raise RuntimeError("Pixhawk mission listesi bos.")
-
-        waypoints = []
-        for seq in range(count):
-            self._request_mission_item(target_system, target_component, seq)
-            item_msg = None
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                candidate = self.master.recv_match(
-                    type=("MISSION_ITEM_INT", "MISSION_ITEM"),
-                    blocking=True,
-                    timeout=1.0,
-                )
-                if candidate is None:
-                    continue
-                if int(getattr(candidate, "seq", -1)) == seq:
-                    item_msg = candidate
-                    break
-
-            if item_msg is None:
-                raise RuntimeError(f"Pixhawk mission item {seq} gondermedi.")
-
-            command = int(
-                getattr(
-                    item_msg,
-                    "command",
-                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                )
-            )
-            if command != mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
-                continue
-
-            if item_msg.get_type() == "MISSION_ITEM_INT":
-                lat = float(getattr(item_msg, "x", 0)) / 1e7
-                lon = float(getattr(item_msg, "y", 0)) / 1e7
-            else:
-                lat = float(getattr(item_msg, "x", getattr(item_msg, "lat", 0.0)))
-                lon = float(getattr(item_msg, "y", getattr(item_msg, "lon", 0.0)))
-
-            alt = float(getattr(item_msg, "z", 0.0) or 0.0)
-            if abs(lat) < 1e-6 and abs(lon) < 1e-6:
-                continue
-
-            # GUI upload path adds a HOME item at seq=0. Mission algorithms should
-            # consume only the route coordinates selected in the GUI.
-            if seq == 0 and count > 1:
-                continue
-
-            waypoints.append({"lat": lat, "lon": lon, "alt": alt})
-
-        if not waypoints:
-            raise RuntimeError("Pixhawk mission icinde gecerli waypoint yok.")
-
-        return waypoints
-
-    @staticmethod
-    def _write_qgc_waypoint_file(path, waypoints):
-        lines = ["QGC WPL 110\n"]
-        lines.append("0\t1\t0\t0\t0\t0\t0\t0\t0\t0\t0\t1\n")
-        for index, waypoint in enumerate(waypoints, start=1):
-            lines.append(
-                "{seq}\t0\t3\t16\t0.00000000\t0.00000000\t0.00000000\t0.00000000\t"
-                "{lat:.8f}\t{lon:.8f}\t{alt:.6f}\t1\n".format(
-                    seq=index,
-                    lat=float(waypoint["lat"]),
-                    lon=float(waypoint["lon"]),
-                    alt=float(waypoint.get("alt", 0.0) or 0.0),
-                )
-            )
-
-        with open(path, "w", encoding="utf-8", newline="") as waypoint_file:
-            waypoint_file.writelines(lines)
-
-    def _sync_pixhawk_waypoints_for_missions(self, mission_numbers):
-        waypoint_paths = [
-            self.mission_waypoint_paths[number]
-            for number in mission_numbers
-            if number in self.mission_waypoint_paths
-        ]
-        if not waypoint_paths:
-            return True
-
-        try:
-            waypoints = self._read_pixhawk_mission_waypoints()
-            for waypoint_path in waypoint_paths:
-                self._write_qgc_waypoint_file(waypoint_path, waypoints)
-                self.get_logger().info(
-                    f"Pixhawk mission waypointleri yazildi: {waypoint_path} ({len(waypoints)} WP)"
-                )
-            return True
+            self.master.mav.statustext_send(severity, message)
         except Exception as exc:
-            self._publish_error(f"Pixhawk waypoint sync basarisiz: {exc}")
-            return False
+            self.get_logger().warn(f"STATUSTEXT gonderilemedi: {exc}")
 
-    def _launch_mission(self, mission_number):
-        mission_name = f"M{mission_number}"
-
-        if not self.mission_launch_enabled:
-            self.get_logger().info(
-                f"{mission_name} MAVLink komutu alindi; mission launch pasif oldugu icin sadece yayinlandi."
-            )
-            return True
-
-        if self.mission_sequence:
-            self._stop_active_mission()
-            self.active_sequence = list(self.mission_sequence)
-            self.active_sequence_index = 0
-            first_mission_number = self.active_sequence[self.active_sequence_index]
-            if not self._sync_pixhawk_waypoints_for_missions(self.active_sequence):
-                self.active_sequence = []
-                self.active_sequence_index = 0
-                return False
-            self.get_logger().info(
-                f"{mission_name} komutu alindi; sirali gorev M{first_mission_number}'den baslatiliyor."
-            )
-            return self._start_mission_process(first_mission_number)
-
-        if not self._sync_pixhawk_waypoints_for_missions([mission_number]):
-            return False
-
-        return self._start_mission_process(mission_number)
-
-    def _mission_process_watchdog(self):
-        process = self.active_mission_process
-        if process is None:
+    def _mission_command_rx_watchdog(self):
+        if self.master is None or not self.connected:
             return
 
-        return_code = process.poll()
-        if return_code is None:
+        now = time.time()
+        if now - self.last_mission_command_wait_log_time < 15.0:
             return
 
-        finished_mission = self.active_mission_name
-        self.get_logger().info(
-            f"{finished_mission} process bitti. return_code={return_code}"
+        if self.last_mission_command_time > 0.0:
+            return
+
+        mavlink_rx_age = (
+            now - self.last_mavlink_rx_time
+            if self.last_mavlink_rx_time > 0.0
+            else None
         )
-        self.active_mission_process = None
-        self.active_mission_name = None
-
-        if not self.active_sequence:
+        if mavlink_rx_age is None or mavlink_rx_age > 10.0:
             return
 
-        if return_code != 0:
-            self.get_logger().error(
-                f"{finished_mission} hata kodu ile bitti; sirali gorev durduruldu."
-            )
-            self.active_sequence = []
-            self.active_sequence_index = 0
-            return
-
-        self.active_sequence_index += 1
-        if self.active_sequence_index >= len(self.active_sequence):
-            self.get_logger().info("Sirali gorevlerin tamami bitti.")
-            self.active_sequence = []
-            self.active_sequence_index = 0
-            return
-
-        next_mission_number = self.active_sequence[self.active_sequence_index]
-        self.get_logger().info(f"Siradaki gorev baslatiliyor: M{next_mission_number}")
-        if not self._start_mission_process(next_mission_number):
-            self.get_logger().error(
-                f"M{next_mission_number} baslatilamadi; sirali gorev durduruldu."
-            )
-            self.active_sequence = []
-            self.active_sequence_index = 0
+        self.last_mission_command_wait_log_time = now
+        self.get_logger().warn(
+            f"{MISSION_PARAM_NAME} mission command not seen yet: telemetry is arriving, "
+            "but no non-zero parameter command has been read."
+        )
+        self._send_status_text(
+            f"telemetry OK, waiting {MISSION_PARAM_NAME}",
+            mavutil.mavlink.MAV_SEVERITY_WARNING,
+        )
 
     def _publish_error(self, text):
         msg = String()
         msg.data = str(text)
         self.topics.error_pub.publish(msg)
         self.get_logger().error(str(text))
+
+    def _publish_diagnostic(self, text):
+        msg = String()
+        msg.data = str(text)
+        self.topics.diagnostics_pub.publish(msg)
+
+    def _link_diagnostic_text(self):
+        target_system = getattr(self.master, "target_system", None)
+        target_component = getattr(self.master, "target_component", None)
+        heartbeat_age = (
+            time.time() - self.last_heartbeat_time
+            if self.last_heartbeat_time > 0.0
+            else None
+        )
+        heartbeat_age_text = (
+            f"{heartbeat_age:.3f}s"
+            if heartbeat_age is not None
+            else "never"
+        )
+        return (
+            f"master_present={self.master is not None}, connected={self.connected}, "
+            f"target_system={target_system}, target_component={target_component}, "
+            f"last_heartbeat_age={heartbeat_age_text}, armed={self.armed}, mode={self.mode}"
+        )
 
     def _connect(self):
         self.last_connection_attempt = time.time()
@@ -554,10 +334,13 @@ class OrangeCubeBridgeNode(Node):
                 connection_string=self.connection_string,
                 baud=self.baud,
                 heartbeat_timeout=self.heartbeat_timeout,
+                source_system=self.source_system,
+                source_component=self.source_component,
                 logger=self.get_logger(),
             )
             self.connected = True
             self.last_heartbeat_time = time.time()
+            self.last_mavlink_rx_time = time.time()
             self.connection_lost_reported = False
             self.cmd_vel_ignored_reported = False
             self._request_data_streams()
@@ -603,6 +386,9 @@ class OrangeCubeBridgeNode(Node):
         self.roll = None
         self.pitch = None
         self.yaw = None
+        self.imu_linear_acceleration = None
+        self.imu_angular_velocity = None
+        self.last_imu_sample_time = 0.0
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
@@ -675,7 +461,17 @@ class OrangeCubeBridgeNode(Node):
         command = int(getattr(msg, "command", -1))
         result = int(getattr(msg, "result", -1))
         result_name = self._mav_result_name(result)
-        log_text = f"MAVLink RX COMMAND_ACK: command={command}, result={result_name}({result})"
+        log_text = (
+            "MAVLink RX COMMAND_ACK raw: "
+            f"src_system={getattr(msg, 'get_srcSystem', lambda: None)()}, "
+            f"src_component={getattr(msg, 'get_srcComponent', lambda: None)()}, "
+            f"command={command}, result={result_name}({result}), "
+            f"progress={getattr(msg, 'progress', None)}, "
+            f"result_param2={getattr(msg, 'result_param2', None)}, "
+            f"target_system={getattr(msg, 'target_system', None)}, "
+            f"target_component={getattr(msg, 'target_component', None)}"
+        )
+        self._publish_diagnostic(log_text)
         accepted_results = {
             mavutil.mavlink.MAV_RESULT_ACCEPTED,
             mavutil.mavlink.MAV_RESULT_IN_PROGRESS,
@@ -699,9 +495,11 @@ class OrangeCubeBridgeNode(Node):
             else float(timeout_sec)
         )
         deadline = time.time() + timeout_sec
-        self.get_logger().info(
+        wait_text = (
             f"Orange Cube confirmation waiting: {description}, timeout={timeout_sec:.1f}s"
         )
+        self.get_logger().info(wait_text)
+        self._publish_diagnostic(wait_text)
 
         while time.time() < deadline:
             if predicate():
@@ -720,6 +518,20 @@ class OrangeCubeBridgeNode(Node):
 
             msg_type = msg.get_type()
             if msg_type == "HEARTBEAT":
+                heartbeat_text = (
+                    "MAVLink RX HEARTBEAT raw (command confirmation): "
+                    f"src_system={getattr(msg, 'get_srcSystem', lambda: None)()}, "
+                    f"src_component={getattr(msg, 'get_srcComponent', lambda: None)()}, "
+                    f"type={getattr(msg, 'type', None)}, "
+                    f"autopilot={getattr(msg, 'autopilot', None)}, "
+                    f"base_mode={getattr(msg, 'base_mode', None)}, "
+                    f"custom_mode={getattr(msg, 'custom_mode', None)}, "
+                    f"system_status={getattr(msg, 'system_status', None)}, "
+                    f"mavlink_version={getattr(msg, 'mavlink_version', None)}, "
+                    f"decoded_mode={mavutil.mode_string_v10(msg)}"
+                )
+                self.get_logger().info(heartbeat_text)
+                self._publish_diagnostic(heartbeat_text)
                 self._update_vehicle_state_from_heartbeat(msg, source="command confirmation")
                 continue
 
@@ -736,15 +548,18 @@ class OrangeCubeBridgeNode(Node):
                 mavutil.mavlink.MAV_RESULT_IN_PROGRESS,
             }
             if result not in accepted_results:
-                self.get_logger().error(
-                    f"Orange Cube command rejected before state confirmation: {description}"
+                self._publish_error(
+                    "Orange Cube command rejected before state confirmation: "
+                    f"expected={description}, command={command}, "
+                    f"result={self._mav_result_name(result)}({result}), "
+                    f"{self._link_diagnostic_text()}"
                 )
                 return False
 
-        self.get_logger().error(
+        self._publish_error(
             "Orange Cube confirmation timeout: "
-            f"expected={description}, connected={self.connected}, "
-            f"armed={self.armed}, mode={self.mode}"
+            f"expected={description}, timeout={timeout_sec:.1f}s, "
+            f"{self._link_diagnostic_text()}"
         )
         return False
 
@@ -773,10 +588,13 @@ class OrangeCubeBridgeNode(Node):
                 connection_string=self.connection_string,
                 baud=self.baud,
                 heartbeat_timeout=self.reconnect_heartbeat_timeout,
+                source_system=self.source_system,
+                source_component=self.source_component,
                 logger=self.get_logger(),
             )
             self.connected = True
             self.last_heartbeat_time = time.time()
+            self.last_mavlink_rx_time = time.time()
             self.connection_lost_reported = False
             self.cmd_vel_ignored_reported = False
             self._request_data_streams()
@@ -817,6 +635,8 @@ class OrangeCubeBridgeNode(Node):
         requested_messages = (
             (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 5),
             (mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10),
+            (mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU, 20),
+            (mavutil.mavlink.MAVLINK_MSG_ID_SCALED_IMU, 20),
             (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 5),
             (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 1),
         )
@@ -858,9 +678,12 @@ class OrangeCubeBridgeNode(Node):
         if self._has_valid_link():
             return False
 
-        self.get_logger().warn(
-            f"{action_name} reddedildi: MAVLink baglantisi hazir degil."
+        reason = (
+            f"{action_name} reddedildi: MAVLink baglantisi hazir degil; "
+            f"{self._link_diagnostic_text()}"
         )
+        self._publish_error(reason)
+        self._publish_diagnostic(reason)
         return True
 
     def _send_companion_heartbeat(self):
@@ -878,6 +701,20 @@ class OrangeCubeBridgeNode(Node):
         except Exception as exc:
             self.get_logger().warn(f"Companion heartbeat gonderilemedi: {exc}")
 
+    def _request_mission_command_parameter(self):
+        if self.master is None or not self.connected:
+            return
+
+        try:
+            self.master.mav.param_request_read_send(
+                self.master.target_system,
+                self.master.target_component,
+                MISSION_PARAM_NAME.encode("ascii"),
+                -1,
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"{MISSION_PARAM_NAME} okunamadi: {exc}")
+
     # noinspection D
     def _read_mavlink_messages(self):
         if self.master is None:
@@ -893,15 +730,16 @@ class OrangeCubeBridgeNode(Node):
                 if msg_type == "BAD_DATA":
                     continue
 
-                if msg_type == "COMMAND_LONG":
-                    self._handle_command_long(msg)
-                    continue
+                self.last_mavlink_rx_time = time.time()
 
                 if not self._message_from_target(msg):
                     continue
 
                 if msg_type == "HEARTBEAT":
                     self._update_vehicle_state_from_heartbeat(msg)
+
+                elif msg_type == "PARAM_VALUE":
+                    self._handle_mission_parameter_value(msg)
 
                 elif msg_type == "COMMAND_ACK":
                     self._log_command_ack(msg)
@@ -921,6 +759,36 @@ class OrangeCubeBridgeNode(Node):
                     self.roll = float(msg.roll)
                     self.pitch = float(msg.pitch)
                     self.yaw = float(msg.yaw)
+
+                elif msg_type == "HIGHRES_IMU":
+                    # HIGHRES_IMU: ivme m/s^2, acisal hiz rad/s.
+                    self.imu_linear_acceleration = (
+                        float(msg.xacc),
+                        float(msg.yacc),
+                        float(msg.zacc),
+                    )
+                    self.imu_angular_velocity = (
+                        float(msg.xgyro),
+                        float(msg.ygyro),
+                        float(msg.zgyro),
+                    )
+                    self.last_imu_sample_time = time.time()
+
+                elif msg_type == "SCALED_IMU":
+                    # SCALED_IMU: ivme mG, acisal hiz millirad/s.
+                    accel_scale = 9.80665 / 1000.0
+                    gyro_scale = 1.0 / 1000.0
+                    self.imu_linear_acceleration = (
+                        float(msg.xacc) * accel_scale,
+                        float(msg.yacc) * accel_scale,
+                        float(msg.zacc) * accel_scale,
+                    )
+                    self.imu_angular_velocity = (
+                        float(msg.xgyro) * gyro_scale,
+                        float(msg.ygyro) * gyro_scale,
+                        float(msg.zgyro) * gyro_scale,
+                    )
+                    self.last_imu_sample_time = time.time()
 
                 elif msg_type == "SYS_STATUS":
                     if msg.voltage_battery != 65535:
@@ -942,39 +810,168 @@ class OrangeCubeBridgeNode(Node):
                 self._close_master()
                 return
 
-    def _handle_command_long(self, msg):
-        command = int(getattr(msg, "command", -1))
-
-        if command != MAV_CMD_MISSION_START:
+    def _handle_mission_parameter_value(self, msg):
+        param_name = getattr(msg, "param_id", "")
+        if isinstance(param_name, bytes):
+            param_name = param_name.decode("utf-8", errors="ignore")
+        param_name = str(param_name).rstrip("\x00")
+        if param_name != MISSION_PARAM_NAME:
             return
 
-        mission_number = int(getattr(msg, "param1", 0))
+        try:
+            command = int(round(float(getattr(msg, "param_value", MISSION_IDLE))))
+        except (TypeError, ValueError):
+            return
 
-        if mission_number < 1 or mission_number > 4:
+        if not self.mission_parameter_initialized:
+            self.mission_parameter_initialized = True
+            self.last_mission_parameter_value = command
+            if command != MISSION_IDLE:
+                self.get_logger().warn(
+                    f"Baslangicta {MISSION_PARAM_NAME}={command} bulundu; "
+                    "kaybolmamasi icin /mission_start olarak yayinlanacak."
+                )
+                self._process_mission_parameter_command(command)
+            return
+
+        if command == self.last_mission_parameter_value:
+            return
+
+        self.get_logger().info(
+            f"{MISSION_PARAM_NAME} degisti: {self.last_mission_parameter_value} -> {command}"
+        )
+        self.last_mission_parameter_value = command
+
+        if command == MISSION_IDLE:
+            return
+
+        self._process_mission_parameter_command(command)
+
+    def _process_mission_parameter_command(self, command):
+        self.last_mission_command_time = time.time()
+
+        if command == MISSION_STOP:
+            self.get_logger().info(
+                "Normal gorev durdurma komutu alindi; /mission_start=90 yayinlaniyor, ack bekleniyor."
+            )
+            self._publish_mission_start(command, track_ack=True)
+            self._send_status_text("mission stop published, waiting ack")
+            return
+
+        if command == MISSION_EMERGENCY:
             self.get_logger().warn(
-                f"Gecersiz gorev komutu alindi: M{mission_number}"
+                "Jetson acil gorev iptal komutu alindi; /mission_start=99 yayinlaniyor, ack bekleniyor."
             )
-            self._send_command_ack(
-                command,
-                mavutil.mavlink.MAV_RESULT_DENIED,
+            self._publish_mission_start(command, track_ack=True)
+            self._send_status_text(
+                "emergency cancel published, waiting ack",
+                mavutil.mavlink.MAV_SEVERITY_WARNING,
             )
             return
 
+        if command not in (MISSION_1, MISSION_2, MISSION_3, MISSION_4):
+            self.get_logger().warn(
+                f"Gecersiz {MISSION_PARAM_NAME} gorev komutu alindi: {command}"
+            )
+            self._send_status_text(
+                f"invalid {MISSION_PARAM_NAME} command {command}",
+                mavutil.mavlink.MAV_SEVERITY_WARNING,
+            )
+            self._acknowledge_mission_parameter()
+            return
+
+        mission_number = command
         mission_name = f"M{mission_number}"
 
-        mission_msg = String()
-        mission_msg.data = mission_name
-        self.mission_command_pub.publish(mission_msg)
-
-        launch_ok = self._launch_mission(mission_number)
-        ack_result = (
-            mavutil.mavlink.MAV_RESULT_ACCEPTED
-            if launch_ok
-            else mavutil.mavlink.MAV_RESULT_FAILED
+        self._publish_mission_start(mission_number, track_ack=True)
+        self._send_status_text(
+            f"{MISSION_PARAM_NAME} received: {mission_name}, waiting ack",
+            mavutil.mavlink.MAV_SEVERITY_INFO,
         )
-        self._send_command_ack(command, ack_result)
 
-        self.get_logger().info(f"MAVLink mission command received: {mission_name}")
+        self.get_logger().info(
+            f"{MISSION_PARAM_NAME} mission command received: {mission_name}; "
+            f"{self.mission_start_topic}={mission_number} yayinlandi, "
+            f"{self.mission_start_ack_topic} ack bekleniyor."
+        )
+
+    def _publish_mission_start(self, command, track_ack=False):
+        mission_msg = Int32()
+        mission_msg.data = int(command)
+        self.mission_start_pub.publish(mission_msg)
+        now = time.time()
+        if track_ack:
+            previous_pending_command = self.pending_mission_command
+            self.pending_mission_command = int(command)
+            if (
+                self.pending_mission_command_first_publish_time <= 0.0
+                or previous_pending_command != self.pending_mission_command
+            ):
+                self.pending_mission_command_first_publish_time = now
+            self.pending_mission_command_last_publish_time = now
+
+    def _mission_start_ack_callback(self, msg):
+        try:
+            ack_command = int(msg.data)
+        except (TypeError, ValueError):
+            self.get_logger().warn(f"Gecersiz mission_start_ack verisi: {msg.data}")
+            return
+
+        if self.pending_mission_command is None:
+            self.get_logger().info(
+                f"{self.mission_start_ack_topic}={ack_command} alindi ama bekleyen komut yok."
+            )
+            return
+
+        if ack_command != self.pending_mission_command:
+            self.get_logger().warn(
+                f"{self.mission_start_ack_topic} uyusmadi: beklenen={self.pending_mission_command}, "
+                f"gelen={ack_command}"
+            )
+            return
+
+        self.get_logger().info(
+            f"{self.mission_start_ack_topic}={ack_command} alindi; {MISSION_PARAM_NAME}=0 yapiliyor."
+        )
+        self._acknowledge_mission_parameter()
+
+    def _mission_start_ack_watchdog(self):
+        if self.pending_mission_command is None:
+            return
+
+        now = time.time()
+        if now - self.pending_mission_command_last_publish_time < self.mission_start_retry_sec:
+            return
+
+        pending_command = self.pending_mission_command
+        self.get_logger().warn(
+            f"{self.mission_start_ack_topic} bekleniyor; "
+            f"{self.mission_start_topic}={pending_command} tekrar yayinlaniyor."
+        )
+        self._publish_mission_start(pending_command, track_ack=True)
+
+    def _acknowledge_mission_parameter(self):
+        self._set_mission_parameter(MISSION_IDLE)
+        self.last_mission_parameter_value = MISSION_IDLE
+        self.pending_mission_command = None
+        self.pending_mission_command_first_publish_time = 0.0
+        self.pending_mission_command_last_publish_time = 0.0
+
+    def _set_mission_parameter(self, value):
+        if self.master is None:
+            return
+
+        try:
+            self.master.mav.param_set_send(
+                self.master.target_system,
+                self.master.target_component,
+                MISSION_PARAM_NAME.encode("ascii"),
+                float(value),
+                mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+            )
+            self.get_logger().info(f"{MISSION_PARAM_NAME} = {value} gonderildi.")
+        except Exception as exc:
+            self.get_logger().warn(f"{MISSION_PARAM_NAME} sifirlanamadi: {exc}")
 
     def _log_statustext(self, msg):
         text = getattr(msg, "text", "")
@@ -985,10 +982,18 @@ class OrangeCubeBridgeNode(Node):
             return
 
         severity = int(getattr(msg, "severity", 6))
+        raw_text = (
+            "MAVLink RX STATUSTEXT raw: "
+            f"src_system={getattr(msg, 'get_srcSystem', lambda: None)()}, "
+            f"src_component={getattr(msg, 'get_srcComponent', lambda: None)()}, "
+            f"severity={severity}, id={getattr(msg, 'id', None)}, "
+            f"chunk_seq={getattr(msg, 'chunk_seq', None)}, text={text!r}"
+        )
+        self._publish_diagnostic(raw_text)
         if severity <= mavutil.mavlink.MAV_SEVERITY_WARNING:
-            self.get_logger().warn(f"MAVLink STATUSTEXT[{severity}]: {text}")
+            self.get_logger().warn(raw_text)
         else:
-            self.get_logger().info(f"MAVLink STATUSTEXT[{severity}]: {text}")
+            self.get_logger().info(raw_text)
 
     # noinspection D
     def _publish_telemetry(self):
@@ -1023,6 +1028,27 @@ class OrangeCubeBridgeNode(Node):
             imu_msg.orientation.y = qy
             imu_msg.orientation.z = qz
             imu_msg.orientation.w = qw
+            imu_data_fresh = (
+                self.last_imu_sample_time > 0.0
+                and time.time() - self.last_imu_sample_time <= 0.5
+                and self.imu_linear_acceleration is not None
+                and self.imu_angular_velocity is not None
+            )
+            if imu_data_fresh:
+                (
+                    imu_msg.linear_acceleration.x,
+                    imu_msg.linear_acceleration.y,
+                    imu_msg.linear_acceleration.z,
+                ) = self.imu_linear_acceleration
+                (
+                    imu_msg.angular_velocity.x,
+                    imu_msg.angular_velocity.y,
+                    imu_msg.angular_velocity.z,
+                ) = self.imu_angular_velocity
+            else:
+                # ROS Imu sozlesmesi: ilk covariance -1 ise alan mevcut degildir.
+                imu_msg.linear_acceleration_covariance[0] = -1.0
+                imu_msg.angular_velocity_covariance[0] = -1.0
             self.topics.imu_pub.publish(imu_msg)
 
         if link_ready and self.voltage_v is not None:
@@ -1042,14 +1068,33 @@ class OrangeCubeBridgeNode(Node):
         self.topics.state_pub.publish(state_msg)
 
     def _set_mode_callback(self, request, response):
+        request_text = (
+            "ROS RX SET_MODE request: "
+            f"base_mode={request.base_mode}, custom_mode={request.custom_mode!r}, "
+            f"{self._link_diagnostic_text()}"
+        )
+        self.get_logger().info(request_text)
+        self._publish_diagnostic(request_text)
+
         if self._reject_without_link("Mod komutu"):
             response.mode_sent = False
             return response
 
         mode_name = self._normalize_mode_name(request.custom_mode)
-        mapping = self.master.mode_mapping()
+        try:
+            mapping = self.master.mode_mapping() or {}
+        except Exception as exc:
+            self._publish_error(
+                f"Mode mapping okunamadi: requested={mode_name}, exception={exc!r}"
+            )
+            response.mode_sent = False
+            return response
+
         if mode_name not in mapping:
-            self.get_logger().error(f"Bilinmeyen mod: {mode_name}")
+            available_modes = ",".join(sorted(mapping)) if mapping else "<empty>"
+            self._publish_error(
+                f"Bilinmeyen mod: requested={mode_name}, available_modes={available_modes}"
+            )
             response.mode_sent = False
             return response
 
@@ -1061,13 +1106,29 @@ class OrangeCubeBridgeNode(Node):
             return response
 
         try:
-            self.get_logger().info(
-                f"MAVLink TX SET_MODE: requested={mode_name}, current={self.mode}"
+            tx_text = (
+                "MAVLink TX MAV_CMD_DO_SET_MODE raw: "
+                f"target_system={self.master.target_system}, "
+                f"target_component={self.master.target_component}, "
+                f"command={mavutil.mavlink.MAV_CMD_DO_SET_MODE}, confirmation=0, "
+                f"param1={mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED}, "
+                f"param2={mapping[mode_name]}, requested={mode_name}, "
+                f"current={self.mode}"
             )
-            self.master.mav.set_mode_send(
+            self.get_logger().info(tx_text)
+            self._publish_diagnostic(tx_text)
+            self.master.mav.command_long_send(
                 self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
                 mapping[mode_name],
+                0,
+                0,
+                0,
+                0,
+                0,
             )
             response.mode_sent = self._wait_for_vehicle_state(
                 lambda: self._normalize_mode_name(self.mode) == mode_name,
@@ -1120,9 +1181,16 @@ class OrangeCubeBridgeNode(Node):
         force_code = 21196 if arm and force else 0
         try:
             action_name = "FORCE ARM" if arm and force else ("ARM" if arm else "DISARM")
-            self.get_logger().info(
-                f"MAVLink TX {action_name}: current_armed={self.armed}, mode={self.mode}"
+            tx_text = (
+                f"MAVLink TX {action_name} raw: "
+                f"target_system={self.master.target_system}, "
+                f"target_component={self.master.target_component}, "
+                f"command={mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM}, "
+                f"confirmation=0, param1={1 if arm else 0}, param2={force_code}, "
+                f"current_armed={self.armed}, mode={self.mode}"
             )
+            self.get_logger().info(tx_text)
+            self._publish_diagnostic(tx_text)
             self.master.mav.command_long_send(
                 self.master.target_system,
                 self.master.target_component,
@@ -1180,6 +1248,15 @@ class OrangeCubeBridgeNode(Node):
         self._neutralize_outputs()
 
         try:
+            tx_text = (
+                "MAVLink TX SHUTDOWN DISARM raw: "
+                f"target_system={self.master.target_system}, "
+                f"target_component={self.master.target_component}, "
+                f"command={mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM}, "
+                "confirmation=0, param1=0, param2=0"
+            )
+            self.get_logger().info(tx_text)
+            self._publish_diagnostic(tx_text)
             for _ in range(3):
                 self._send_zero_attitude_target_once()
                 self.master.mav.command_long_send(
@@ -1197,26 +1274,19 @@ class OrangeCubeBridgeNode(Node):
                 )
                 time.sleep(0.15)
 
-            deadline = time.time() + 3.0
-            while time.time() < deadline:
-                msg = self.master.recv_match(
-                    type="HEARTBEAT",
-                    blocking=True,
-                    timeout=0.25,
+            success = self._wait_for_vehicle_state(
+                lambda: not self.armed,
+                "armed=False (shutdown)",
+                expected_command=mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                timeout_sec=3.0,
+            )
+            if success:
+                self.get_logger().info("Shutdown DISARM dogrulandi.")
+            else:
+                self.get_logger().warn(
+                    "Shutdown DISARM dogrulanamadi; ayrinti icin COMMAND_ACK ve "
+                    "STATUSTEXT loglarina bakin."
                 )
-                if msg is None or not self._message_from_target(msg):
-                    continue
-
-                armed = bool(
-                    msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                )
-                self.armed = armed
-                self.mode = mavutil.mode_string_v10(msg)
-                if not armed:
-                    self.get_logger().info("Shutdown DISARM dogrulandi.")
-                    return
-
-            self.get_logger().warn("Shutdown DISARM dogrulanamadi; komut gonderildi ama armed heartbeat devam ediyor.")
         except Exception as exc:
             self._publish_error(f"Shutdown DISARM hatasi: {exc}")
 
@@ -1357,7 +1427,6 @@ def main(args=None):
     except ExternalShutdownException:
         pass
     finally:
-        node._stop_active_mission()
         node.shutdown_vehicle()
         node.destroy_node()
         rclpy.shutdown()

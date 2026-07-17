@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from missions.utils.orange_boundary_guard import (
+from teknofest.missions.utils.orange_boundary_guard import (
     OrangeBoundaryGuard,
     is_orange_boundary_detection,
 )

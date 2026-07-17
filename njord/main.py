@@ -14,6 +14,7 @@ if COMPETITION_ROOT not in sys.path:
     sys.path.insert(0, COMPETITION_ROOT)
 
 from utils.mavlink_utilities import call_trigger_service
+from utils.task_selection_state import default_task_selection_file
 from njord.core import capture_proc
 from njord.core import data_writer
 from njord.servers import data_server
@@ -74,6 +75,30 @@ def run_startup_cleanup():
     print(f"[SYSTEM] Startup shared memory cleanup running: {cleanup_script}")
     subprocess.run(["/bin/bash", cleanup_script], check=True)
 
+
+def configure_mavlink_bridge_environment():
+    defaults = {
+        "MAVLINK_CONNECTION_STRING": "/dev/ttyACM0",
+        "MAVLINK_BAUD": "921600",
+        "MAVLINK_SOURCE_SYSTEM": "1",
+        "MAVLINK_SOURCE_COMPONENT": "191",
+        "MAVLINK_MISSION_START_TOPIC": "/mission_start",
+        "MISSION_SELECTION_FILE": default_task_selection_file(),
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+    print(
+        "[SYSTEM] MAVLink bridge env: "
+        f"connection={os.environ.get('MAVLINK_CONNECTION_STRING')}, "
+        f"baud={os.environ.get('MAVLINK_BAUD')}, "
+        f"source={os.environ.get('MAVLINK_SOURCE_SYSTEM')}:"
+        f"{os.environ.get('MAVLINK_SOURCE_COMPONENT')}, "
+        f"mission_start_topic={os.environ.get('MAVLINK_MISSION_START_TOPIC')}, "
+        f"mission_selection_file={os.environ.get('MISSION_SELECTION_FILE')}"
+    )
+
+
 def start_capture_process():
     mp_context = get_context("spawn")
     frame_lock = mp_context.Lock()
@@ -118,35 +143,43 @@ def start_capture_process():
 if __name__ == "__main__":
     fx = None
     cx = None
+    bridge_only = False
     capture_process = None
     capture_stop_event = None
     frame_lock = None
     frame_ready_event = None
     p_bridge = None
     p_vision = None
-    p_njord_task1 = None
+    p_mission_manager = None
 
     try:
         run_startup_cleanup()
-        (
-            capture_process,
-            frame_lock,
-            frame_ready_event,
-            capture_stop_event,
-            fx,
-            cx,
-        ) = start_capture_process()
+        try:
+            (
+                capture_process,
+                frame_lock,
+                frame_ready_event,
+                capture_stop_event,
+                fx,
+                cx,
+            ) = start_capture_process()
+        except RuntimeError as exc:
+            bridge_only = True
+            print(f"[SYSTEM] ZED capture unavailable: {exc}")
+            print("[SYSTEM] Continuing in bridge-only mode. Vision/video/data writer are disabled.")
 
-        # Flask
-        threading.Thread(target=video_server.start, args=(5000,), daemon=True).start()
-        threading.Thread(target=data_server.start, args=(5001,), daemon=True).start()
+        if not bridge_only:
+            # Flask
+            threading.Thread(target=video_server.start, args=(5000,), daemon=True).start()
+            threading.Thread(target=data_server.start, args=(5001,), daemon=True).start()
 
-        print("[SYSTEM] ZED capture was launched with success.")
-        print("[SYSTEM] Video stream   -> http://0.0.0.0:5000/data/stream")
-        print("[SYSTEM] Data stream   -> http://0.0.0.0:5001/data/stream")
+            print("[SYSTEM] ZED capture was launched with success.")
+            print("[SYSTEM] Video stream   -> http://0.0.0.0:5000/data/stream")
+            print("[SYSTEM] Data stream   -> http://0.0.0.0:5001/data/stream")
 
         print("\n[SYSTEM] Vision and bridge node launch in ROS2...")
         time.sleep(1)
+        configure_mavlink_bridge_environment()
 
         if os.path.isfile("/opt/ros/kilted/setup.bash"):
             ros2_setup = "source /opt/ros/kilted/setup.bash"
@@ -160,18 +193,9 @@ if __name__ == "__main__":
 
         vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
+        mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
 
         vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
-
-        ################################################################################################################
-        # SETUP NJORD MISSION PATHS
-        ################################################################################################################
-        njord_task1_path = os.path.join(PROJECT_ROOT, "missions", "task1_maneuvering_and_path_finding.py")
-        njord_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_collision_avoidance.py")
-        njord_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_docking.py")
-        njord_task4_path = os.path.join(PROJECT_ROOT, "missions", "task4_surprise.py")
-
-        ################################################################################################################
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
@@ -179,46 +203,33 @@ if __name__ == "__main__":
         cmd_bridge = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
-        ################################################################################################################
-        # SETUP NJORD MISSION COMMANDS
-        ################################################################################################################
-        cmd_njord_task1 = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task1_path)}"
+        cmd_mission_manager = (
+            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(mission_manager_path)}"
         )
-        # cmd_njord_task2 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task2_path)}"
-        # )
-        # cmd_njord_task3 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(njord_task3_path)}"
-        # )
-        ################################################################################################################
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
 
-        p_vision = launch_child_process(cmd_vision)
-        print(f" -> Vision Node launched (PID: {p_vision.pid})")
+        p_mission_manager = launch_child_process(cmd_mission_manager)
+        print(f" -> Mission Manager launched (PID: {p_mission_manager.pid})")
+
+        if not bridge_only:
+            p_vision = launch_child_process(cmd_vision)
+            print(f" -> Vision Node launched (PID: {p_vision.pid})")
 
         time.sleep(2)
 
-        ################################################################################################################
-        #   NJORD MISSION START CMD
-        ################################################################################################################
-        p_njord_task1 = launch_child_process(cmd_njord_task1)
-        print(f" -> NJORD Mission 1 Node launched (PID: {p_njord_task1.pid})\n")
-
-        # p_njord_task2 = subprocess.Popen(cmd_njord_task2, shell=True, executable="/bin/bash")
-        # child_processes.append(p_njord_task2)
-        # print(f" -> NJORD Mission 2 Node launched (PID: {p_njord_task2.pid})\n")
-        #
-        # p_njord_task3 = subprocess.Popen(cmd_njord_task3, shell=True, executable="/bin/bash")
-        # child_processes.append(p_njord_task3)
-        # print(f" -> NJORD Mission 3 Node launched (PID: {p_njord_task3.pid})\n")
-        ################################################################################################################
+        print(" -> Bridge publishes SCR_USER1 commands to /mission_start.")
+        print(" -> Mission Manager writes /mission_start commands to JSON.")
+        print(" -> Task algorithms will later poll the JSON file.\n")
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
-        data_writer.run(frame_lock, frame_ready_event, capture_stop_event)
+        if bridge_only:
+            while True:
+                time.sleep(1)
+        else:
+            data_writer.run(frame_lock, frame_ready_event, capture_stop_event)
 
     except KeyboardInterrupt:
         print("\n[SYSTEM] Stopped by the user (Ctrl+C)...")
@@ -230,19 +241,21 @@ if __name__ == "__main__":
 
         try:
             stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
+            stop_child_process("Mission Manager", p_mission_manager, timeout_sec=5.0)
             stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
         except Exception as exc:
             print(f"[SYSTEM] Error while sub-process shut down: {exc}")
 
         print("[SYSTEM] Sub-processes closed.")
 
-        print("[SYSTEM] Hold mode & DISARM the AUV...")
+        if p_bridge is not None:
+            print("[SYSTEM] Hold mode & DISARM the AUV...")
 
-        try:
-            call_trigger_service(None, None, "HOLD", timeout_sec=3.0)
-            call_trigger_service(None, None, "DISARM", timeout_sec=3.0)
-        except Exception as exc:
-            print(f"[SYSTEM] Error while sending HOLD/DISARM commands: {exc}")
+            try:
+                call_trigger_service(None, None, "HOLD", timeout_sec=3.0)
+                call_trigger_service(None, None, "DISARM", timeout_sec=3.0)
+            except Exception as exc:
+                print(f"[SYSTEM] Error while sending HOLD/DISARM commands: {exc}")
 
 
         if capture_stop_event is not None:

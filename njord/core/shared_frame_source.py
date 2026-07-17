@@ -69,8 +69,12 @@ class SharedFrameSource:
             raise
 
     def get_calibration(self):
-        fx, cx = self.calib.tolist()
+        fx, _, cx, _ = self.calib.tolist()
         return fx, cx
+
+    def get_camera_intrinsics(self):
+        """Return rectified left-camera intrinsics as fx, fy, cx, cy."""
+        return tuple(self.calib.tolist())
 
     def read(self, timeout=1.0):
         deadline = time.monotonic() + timeout
@@ -99,11 +103,11 @@ class SharedFrameSource:
                 return None
 
             timestamp_ms = int(self.meta[1])
-            pitch, yaw, roll = self.imu.tolist()
+            roll, pitch, yaw = self.imu.tolist()
             np.copyto(self.bgra_buf, self.rgb)
             np.copyto(self.depth_buf, self.depth)
 
-        return self._build_frame(frame_id, timestamp_ms, pitch, yaw, roll)
+        return self._build_frame(frame_id, timestamp_ms, roll, pitch, yaw)
 
     def _copy_without_lock(self):
         frame_id = int(self.meta[0])
@@ -111,16 +115,16 @@ class SharedFrameSource:
             return None
 
         timestamp_ms = int(self.meta[1])
-        pitch, yaw, roll = self.imu.tolist()
+        roll, pitch, yaw = self.imu.tolist()
         np.copyto(self.bgra_buf, self.rgb)
         np.copyto(self.depth_buf, self.depth)
 
         if int(self.meta[0]) != frame_id:
             return None
 
-        return self._build_frame(frame_id, timestamp_ms, pitch, yaw, roll)
+        return self._build_frame(frame_id, timestamp_ms, roll, pitch, yaw)
 
-    def _build_frame(self, frame_id, timestamp_ms, pitch, yaw, roll):
+    def _build_frame(self, frame_id, timestamp_ms, roll, pitch, yaw):
         self.last_frame_id = frame_id
         cv2.cvtColor(self.bgra_buf, cv2.COLOR_BGRA2BGR, dst=self.frame_bgr_buf)
         return {
@@ -128,7 +132,7 @@ class SharedFrameSource:
             "timestamp_ms": timestamp_ms,
             "frame_bgr": self.frame_bgr_buf.copy(),
             "depth": self.depth_buf.copy(),
-            "imu": {"pitch": pitch, "yaw": yaw, "roll": roll},
+            "imu": {"roll": roll, "pitch": pitch, "yaw": yaw},
         }
 
     def close(self):

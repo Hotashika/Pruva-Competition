@@ -21,6 +21,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 from utils.mavlink_utilities import (
+    align_heading_to_gps_target,
     calculate_gps_distance,
     call_set_mode,
     call_trigger_service,
@@ -46,6 +47,8 @@ AVOID_LINEAR_X = 0.5
 AVOID_TURN_Z = -0.6
 
 WAYPOINT_TOLERANCE_M = 1.0
+WAYPOINT_SETTLE_SEC = 0.75
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 GPS_TIMEOUT_SEC = 2.0
 HEADING_TIMEOUT_SEC = 2.0
 BRIDGE_STATE_TIMEOUT_SEC = 10.0
@@ -73,7 +76,14 @@ AVOID_MAX_DURATION_SEC = 10.0
 VISION_DETECTION_TIMEOUT_SEC = 1.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
-RED_BUOY_TYPES = {"red_buoy", "red buoy", "red-buoy"}
+BUOY_MODEL_TYPES = {
+    "green_buoys",
+    "red_buoys",
+    "north_buoys",
+    "east_buoys",
+    "south_buoys",
+    "west_buoys",
+}
 COLLISION_TARGET_ANGLE_KEYS = (
     "Vessel angle: ",
     "Vessel angle",
@@ -146,6 +156,9 @@ class Task2CollisionAvoidance:
         self.stand_on_risk_since = None
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
+        self.aligned_target_key = None
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
         self.hold_mode_requested = False
         self.hold_mode_future = None
 
@@ -178,11 +191,10 @@ class Task2CollisionAvoidance:
         model_class = str(detection.get("class", "")).strip().lower()
         is_vessel = detector_type == "vessel" or model_class in VESSEL_TYPES
 
-        # Task 2 water tests use a red buoy as the collision target. Keep
-        # vessel support for the real mission while accepting only the red
-        # buoy class from the buoy detector.
-        is_red_buoy = model_class in RED_BUOY_TYPES
-        return is_vessel or is_red_buoy
+        # Task 2 water tests use the buoy detector as the collision target.
+        # These names mirror the classes embedded in the current buoy model.
+        is_buoy = detector_type == "buoy" and model_class in BUOY_MODEL_TYPES
+        return is_vessel or is_buoy
 
     @classmethod
     def _detection_angle_deg(cls, detection):
@@ -370,6 +382,43 @@ class Task2CollisionAvoidance:
             return False
         return True
 
+    def _begin_waypoint_hold(self, waypoint_name, now):
+        """Stop briefly at a waypoint before aligning with the next leg."""
+        stop_vehicle(self.topics.cmd_vel_pub)
+        self.waypoint_hold_until = float(now) + WAYPOINT_SETTLE_SEC
+        self.waypoint_hold_name = waypoint_name
+        self.aligned_target_key = None
+        self.logger.info(
+            f"{waypoint_name} reached; vehicle stopped for "
+            f"{WAYPOINT_SETTLE_SEC:.2f}s before next heading alignment."
+        )
+
+    def _waypoint_hold_active(self, now):
+        """Keep the vehicle stopped until the waypoint settle time expires."""
+        if self.waypoint_hold_until is None:
+            return False
+
+        remaining = self.waypoint_hold_until - float(now)
+        if remaining > 0.0:
+            publish_cmd_vel(
+                self.topics.cmd_vel_pub,
+                linear_x=0.0,
+                angular_z=0.0,
+            )
+            self.logger.info(
+                f"Holding at {self.waypoint_hold_name}: {remaining:.2f}s remaining.",
+                throttle_duration_sec=0.5,
+            )
+            return True
+
+        completed_name = self.waypoint_hold_name
+        self.waypoint_hold_until = None
+        self.waypoint_hold_name = None
+        self.logger.info(
+            f"{completed_name} stop stabilized; aligning with the next waypoint."
+        )
+        return False
+
     def _publish_waypoint_target(self, target):
         if self.current_lat is None or self.current_lon is None:
             return False
@@ -384,6 +433,28 @@ class Task2CollisionAvoidance:
                 f"WP{self.current_target_index} reached. Remaining={distance:.2f}m"
             )
             return True
+
+        target_name = f"WP{self.current_target_index}"
+        target_key = (
+            target_name,
+            round(float(target["lat"]), 7),
+            round(float(target["lon"]), 7),
+        )
+        if self.aligned_target_key != target_key:
+            if not align_heading_to_gps_target(
+                self.topics.cmd_vel_pub,
+                self.current_lat,
+                self.current_lon,
+                self.current_heading,
+                target["lat"],
+                target["lon"],
+                logger=self.logger,
+                target_name=target_name,
+                tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
+            ):
+                return False
+            self.aligned_target_key = target_key
+
         publish_set_position(
             self.topics.position_target_pub,
             target["lat"],
@@ -401,6 +472,8 @@ class Task2CollisionAvoidance:
         self.avoid_started_time = now
         self.avoid_clear_started_time = None
         self.stand_on_risk_since = None
+        # Avoidance changes the heading, so re-align before resuming this leg.
+        self.aligned_target_key = None
         tcpa_text = "unknown" if assessment.tcpa_sec is None else f"{assessment.tcpa_sec:.1f}s"
         dcpa_text = "unknown" if assessment.dcpa_m is None else f"{assessment.dcpa_m:.1f}m"
         self.logger.warn(
@@ -456,6 +529,9 @@ class Task2CollisionAvoidance:
             self._enter_failsafe("Task 2 waypoint list is empty")
             return
 
+        if self._waypoint_hold_active(now):
+            return
+
         if self.current_target_index >= len(self.waypoints):
             stop_vehicle(self.topics.cmd_vel_pub)
             self.finished = True
@@ -505,6 +581,10 @@ class Task2CollisionAvoidance:
 
         target = self.waypoints[self.current_target_index]
         if self._publish_waypoint_target(target):
+            self._begin_waypoint_hold(
+                f"WP{self.current_target_index}",
+                now,
+            )
             self.current_target_index += 1
 
 

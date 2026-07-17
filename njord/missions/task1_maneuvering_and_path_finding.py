@@ -55,16 +55,28 @@ AVOID_MANEUVER_MAX_SEC = 1.5  # Tek kacinma manevrasinin maksimum suresi
 AVOID_CLEAR_DURATION_SEC = 0.3  # Obje temiz gorundukten sonra ana rotaya donus bekleme suresi
 AVOID_CLEAR_ANGLE_DEG = 25.0  # Obje bu acinin disina cikinca merkezden temiz kabul edilir
 
+CARDINAL_PASS_CLEARANCE_M = 4.0  # Cardinal marker'in dogu/bati tarafindaki gecis mesafesi
+CARDINAL_TARGET_TOLERANCE_M = 1.0  # Gecis GPS hedefinin tamamlanma toleransi
+CARDINAL_PASS_TIMEOUT_SEC = 20.0  # Gecis hedefi bu surede alinmazsa FAILSAFE + HOLD
+
 VISION_DETECTION_TIMEOUT_SEC = 1.0  # Son vision mesajı bu süreden eskiyse yok say
 EARTH_RADIUS_M = 6378137.0
 MIN_VALID_ABS_COORD = 1e-6
 
 HOLD_MODE_NAME = "HOLD"
+RED_BUOY_CLASS = "red_buoys"
+GREEN_BUOY_CLASS = "green_buoys"
+EAST_CARDINAL_CLASS = "east_buoys"
+WEST_CARDINAL_CLASS = "west_buoys"
+CARDINAL_PASS_SIDES = {
+    EAST_CARDINAL_CLASS: "east",
+    WEST_CARDINAL_CLASS: "west",
+}
 RELEVANT_OBSTACLE_CLASSES = (
-    "red_buoy",
-    "green_buoy",
-    "east_cardinal",
-    "west_cardinal",
+    RED_BUOY_CLASS,
+    GREEN_BUOY_CLASS,
+    EAST_CARDINAL_CLASS,
+    WEST_CARDINAL_CLASS,
 )
 DETECTION_ANGLE_KEYS = ("Buoy angle: ", "Buoy angle", "angle_deg", "angle")
 
@@ -118,6 +130,7 @@ class Task1Maneuvering:
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = 0.0  # +1.0 right/starboard, -1.0 left/port
+        self.cardinal_pass_target = None  # Marker'in coğrafi dogu/batisindaki GPS hedefi
         self.aligned_target_key = None
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
@@ -341,6 +354,38 @@ class Task1Maneuvering:
         obstacle_east = distance_m * math.sin(obstacle_bearing_rad)
         return obstacle_north, obstacle_east
 
+    def _create_cardinal_pass_target(self, obstacle):
+        """Cardinal marker'in istenen coğrafi tarafinda geçici bir GPS hedefi üretir."""
+        pass_side = CARDINAL_PASS_SIDES.get(obstacle.get("class"))
+        obstacle_offset = self._obstacle_offset_from_detection(obstacle)
+        if pass_side is None or obstacle_offset is None:
+            return None
+
+        obstacle_north, obstacle_east = obstacle_offset
+        marker_gps = self._offset_gps(
+            self.current_lat,
+            self.current_lon,
+            north_m=obstacle_north,
+            east_m=obstacle_east,
+        )
+        pass_east_offset = (
+            CARDINAL_PASS_CLEARANCE_M
+            if pass_side == "east"
+            else -CARDINAL_PASS_CLEARANCE_M
+        )
+        target_gps = self._offset_gps(
+            marker_gps["lat"],
+            marker_gps["lon"],
+            north_m=0.0,
+            east_m=pass_east_offset,
+        )
+        target_gps.update({
+            "side": pass_side,
+            "marker_lat": marker_gps["lat"],
+            "marker_lon": marker_gps["lon"],
+        })
+        return target_gps
+
     def _matching_avoidance_obstacle(self, detections):
         """Aktif kaçınma sınıfından hâlâ yakın görünen objeyi döndürür."""
         if self.avoiding_class is None:
@@ -362,17 +407,23 @@ class Task1Maneuvering:
         return min(candidates, key=lambda item: item[0])[1]
 
     def _avoid_turn_direction_for_obstacle(self, obstacle):
-        """Kaçınma yönü: kırmızı/east sağ, yeşil/west sol."""
+        """Normal şamandıra veya cardinal GPS fallback manevrasının yönünü seçer."""
         obstacle_class = obstacle.get("class")
 
-        if obstacle_class == "red_buoy":
+        if obstacle_class == RED_BUOY_CLASS:
             return 1.0
-        if obstacle_class == "green_buoy":
+        if obstacle_class == GREEN_BUOY_CLASS:
             return -1.0
-        if obstacle_class == "east_cardinal":
-            return 1.0
-        if obstacle_class == "west_cardinal":
-            return -1.0
+
+        pass_side = CARDINAL_PASS_SIDES.get(obstacle_class)
+        if pass_side is not None and self.current_heading is not None:
+            target_bearing = 90.0 if pass_side == "east" else 270.0
+            heading_error = (
+                target_bearing - float(self.current_heading) + 180.0
+            ) % 360.0 - 180.0
+            if abs(heading_error) < 1e-6:
+                return 0.0
+            return 1.0 if heading_error > 0.0 else -1.0
 
         angle_deg = self._detection_angle_deg(obstacle)
         if angle_deg is not None:
@@ -390,9 +441,9 @@ class Task1Maneuvering:
         else:
             turn_text = "straight"
 
-        if obstacle_class == "east_cardinal":
+        if obstacle_class == EAST_CARDINAL_CLASS:
             return f"east side via {turn_text}"
-        if obstacle_class == "west_cardinal":
+        if obstacle_class == WEST_CARDINAL_CLASS:
             return f"west side via {turn_text}"
         return turn_text
 
@@ -416,8 +467,38 @@ class Task1Maneuvering:
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = 0.0
+        self.cardinal_pass_target = None
         self.aligned_target_key = None
         self.state = MissionState.NAVIGATING
+
+    def _update_cardinal_pass(self, now):
+        """Aktif cardinal hedefini mevcut GNSS position akışıyla takip eder."""
+        target = self.cardinal_pass_target
+        if target is None:
+            return False
+
+        elapsed = 0.0 if self.avoid_started_time is None else now - self.avoid_started_time
+        if elapsed >= CARDINAL_PASS_TIMEOUT_SEC:
+            self._enter_failsafe(
+                f"{target['side'].upper()} CARDINAL PASS TARGET TIMEOUT "
+                f"({elapsed:.1f}s)! FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            stop_vehicle(self.topics.cmd_vel_pub)
+            return True
+
+        target_name = f"{target['side'].upper()} cardinal pass"
+        if self._set_position_to_gps_target(
+                target["lat"],
+                target["lon"],
+                target_name,
+                CARDINAL_TARGET_TOLERANCE_M,
+        ):
+            self.logger.info(
+                f"{target_name} completed; resuming main GNSS route."
+            )
+            self._reset_avoidance_state()
+        return True
 
     def _publish_avoidance_maneuver(self):
         angular_z = self.avoid_turn_direction * AVOID_TURN_Z
@@ -506,14 +587,8 @@ class Task1Maneuvering:
         )
         return False
 
-    # noinspection D
-    # Guvenlik, kacinma ve waypoint akislarini tek kontrol dongusunde yurutur.
-    def update(self, detections):
-        """Sürekli çalışan ana kontrol döngüsü."""
-
-        # ---------------------------------------------------------
-        # 0. GÜVENLİK KONTROLLERİ (her şeyden önce)
-        # ---------------------------------------------------------
+    def _prepare_update(self):
+        """Görev adımından önce güvenlik, rota ve bekleme koşullarını doğrular."""
         safety_ok = self._check_watchdog()
 
         if self.state == MissionState.FAILSAFE:
@@ -545,6 +620,83 @@ class Task1Maneuvering:
                 stop_vehicle(self.topics.cmd_vel_pub)
                 self.finished = True
                 self.state = MissionState.FINISHED
+            return False
+
+        return True
+
+    def _update_active_avoidance(self, detections, now):
+        """Aktif kaçınmayı günceller; bu tick tüketildiyse True döndürür."""
+        if self._update_cardinal_pass(now):
+            return True
+
+        elapsed = 0.0
+        if self.avoid_started_time is not None:
+            elapsed = now - self.avoid_started_time
+
+        active_obstacle = self._matching_avoidance_obstacle(detections)
+        avoidance_done = False
+
+        if elapsed >= AVOID_MANEUVER_MAX_SEC:
+            self.logger.info(
+                "Avoidance maneuver max duration reached, returning to main route."
+            )
+            avoidance_done = True
+        else:
+            clear_enough = (
+                elapsed >= AVOID_MANEUVER_MIN_SEC
+                and self._is_avoidance_clear(active_obstacle)
+            )
+            if clear_enough:
+                if self.avoid_clear_started_time is None:
+                    self.avoid_clear_started_time = now
+                elif (now - self.avoid_clear_started_time) >= AVOID_CLEAR_DURATION_SEC:
+                    self.logger.info("Obstacle cleared, returning to main route.")
+                    avoidance_done = True
+            else:
+                self.avoid_clear_started_time = None
+
+        if avoidance_done:
+            self._reset_avoidance_state()
+            return False
+
+        self._publish_avoidance_maneuver()
+        return True
+
+    def _start_avoidance(self, obstacle, now):
+        """Yeni bir engel için mevcut kaçınma davranışını başlatır."""
+        self.state = MissionState.AVOIDING
+        self.avoiding_class = obstacle["class"]
+        self.avoid_started_time = now
+        self.avoid_clear_started_time = None
+        self.avoid_turn_direction = self._avoid_turn_direction_for_obstacle(obstacle)
+        self.cardinal_pass_target = self._create_cardinal_pass_target(obstacle)
+
+        if self.cardinal_pass_target is not None:
+            target = self.cardinal_pass_target
+            angle_deg = self._detection_angle_deg(obstacle)
+            self.logger.info(
+                f"{obstacle['class']} ({obstacle['distance']:.1f}m, "
+                f"angle={angle_deg:.1f} deg)! Geographic {target['side']} pass "
+                f"target created at ({target['lat']:.7f}, {target['lon']:.7f}), "
+                f"clearance={CARDINAL_PASS_CLEARANCE_M:.1f}m."
+            )
+            return
+
+        direction_text = self._avoid_direction_text(
+            self.avoid_turn_direction,
+            obstacle["class"],
+        )
+        angle_deg = self._detection_angle_deg(obstacle)
+        angle_text = "unknown" if angle_deg is None else f"{angle_deg:.1f} deg"
+        self.logger.info(
+            f"{obstacle['class']} ({obstacle['distance']:.1f}m, angle={angle_text})! "
+            f"Hybrid avoidance maneuver started toward {direction_text}."
+        )
+        self._publish_avoidance_maneuver()
+
+    def update(self, detections):
+        """Güvenlik, kaçınma ve waypoint akışlarının ana kontrol döngüsü."""
+        if not self._prepare_update():
             return
 
         target_gps = self.waypoints[self.current_target_index]
@@ -563,57 +715,11 @@ class Task1Maneuvering:
         now = time.monotonic()
 
         if self.state == MissionState.AVOIDING:
-            elapsed = 0.0
-            if self.avoid_started_time is not None:
-                elapsed = now - self.avoid_started_time
-
-            active_obstacle = self._matching_avoidance_obstacle(detections)
-            avoidance_done = False
-
-            if elapsed >= AVOID_MANEUVER_MAX_SEC:
-                self.logger.info(
-                    "Avoidance maneuver max duration reached, returning to main route."
-                )
-                avoidance_done = True
-            else:
-                clear_enough = (
-                        elapsed >= AVOID_MANEUVER_MIN_SEC
-                        and self._is_avoidance_clear(active_obstacle)
-                )
-                if clear_enough:
-                    if self.avoid_clear_started_time is None:
-                        self.avoid_clear_started_time = now
-                    elif (now - self.avoid_clear_started_time) >= AVOID_CLEAR_DURATION_SEC:
-                        self.logger.info("Obstacle cleared, returning to main route.")
-                        avoidance_done = True
-                else:
-                    self.avoid_clear_started_time = None
-
-            if avoidance_done:
-                self._reset_avoidance_state()
-            else:
-                self._publish_avoidance_maneuver()
+            if self._update_active_avoidance(detections, now):
                 return
 
         elif nearest is not None and nearest["distance"] <= AVOID_ENTER_DIST_M:
-            self.state = MissionState.AVOIDING
-            self.avoiding_class = nearest["class"]
-            self.avoid_started_time = now
-            self.avoid_clear_started_time = None
-            self.avoid_turn_direction = self._avoid_turn_direction_for_obstacle(nearest)
-
-            direction_text = self._avoid_direction_text(
-                self.avoid_turn_direction,
-                nearest["class"]
-            )
-            angle_deg = self._detection_angle_deg(nearest)
-            angle_text = "unknown" if angle_deg is None else f"{angle_deg:.1f} deg"
-
-            self.logger.info(
-                f"{nearest['class']} ({nearest['distance']:.1f}m, angle={angle_text})! "
-                f"Hybrid avoidance maneuver started toward {direction_text}."
-            )
-            self._publish_avoidance_maneuver()
+            self._start_avoidance(nearest, now)
             return
         # ---------------------------------------------------------
         # 2. WP0 / MISSION BAŞLANGIÇ KONTROLÜ

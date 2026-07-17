@@ -35,7 +35,18 @@ DEPTH_MODE = sl.DEPTH_MODE.NEURAL
 COORDINATE_UNITS = sl.UNIT.METER
 
 # Coordinate System
-COORDINATE_SYSTEM = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP
+# Prefer the ROS REP-103 convention so ZED Euler angles have the familiar
+# roll(X-forward), pitch(Y-left), yaw(Z-up) meaning. SDK releases expose the
+# enum under one of the two names below; retain the old Z-up mode as fallback.
+COORDINATE_SYSTEM = getattr(
+    sl.COORDINATE_SYSTEM,
+    "RIGHT_HANDED_Z_UP_X_FWD",
+    getattr(
+        sl.COORDINATE_SYSTEM,
+        "RIGHT_HANDED_Z_UP_X_FORWARD",
+        sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP,
+    ),
+)
 
 # -----------------------------------------------------------------------------
 # Runtime Settings
