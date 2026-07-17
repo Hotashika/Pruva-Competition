@@ -63,7 +63,7 @@ from teknofest.missions.utils.orange_boundary_guard import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR / "waypoints" / "teknofest_task2.waypoints"
+WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "teknofest_task2.waypoints"
 
 # ============================================================
 # ROS / VISION PARAMETRELERİ

@@ -6,7 +6,7 @@ from utils.read_waypoints import parse_qgc_waypoints
 
 
 GN_WAYPOINT_PATH = (
-    Path(__file__).resolve().parents[2]
+    Path(__file__).resolve().parents[3]
     / "waypoints"
     / "teknofest.waypoints"
 )

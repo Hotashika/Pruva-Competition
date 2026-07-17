@@ -37,7 +37,7 @@ from utils.read_waypoints import parse_qgc_waypoints
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR / "waypoints" / "njord_task2.waypoints"
+WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "njord_task2.waypoints"
 ACTIVE_TASK_NAME = "task2"
 HOLD_MODE_NAME = "HOLD"
 
