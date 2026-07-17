@@ -15,6 +15,7 @@ if COMPETITION_ROOT not in sys.path:
 
 from utils.mavlink_utilities import call_trigger_service
 from utils.task_selection_state import default_task_selection_file
+from utils import waypoint_server
 from njord.core import capture_proc
 from njord.core import data_writer
 from njord.servers import data_server
@@ -154,6 +155,8 @@ if __name__ == "__main__":
 
     try:
         run_startup_cleanup()
+        threading.Thread(target=waypoint_server.start, args=(8000,), daemon=True).start()
+        print("[SYSTEM] Waypoint upload -> http://0.0.0.0:8000/api/mission/upload_txt")
         try:
             (
                 capture_process,

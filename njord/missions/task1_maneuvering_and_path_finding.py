@@ -30,7 +30,7 @@ from utils.mavlink_utilities import (
 from utils.read_waypoints import parse_qgc_waypoints
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR / "waypoints" / "njord_task1.waypoints"
+WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "njord_task1.waypoints"
 ACTIVE_TASK_NAME = "task1"
 
 # ============================================================

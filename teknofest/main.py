@@ -18,6 +18,7 @@ if COMPETITION_ROOT not in sys.path:
 from teknofest.core import capture_proc
 from teknofest.core import data_writer
 from teknofest.servers import data_server
+from utils import waypoint_server
 
 
 MISSION_SPECS = {
@@ -165,6 +166,8 @@ if __name__ == "__main__":
 
     try:
         run_startup_cleanup()
+        threading.Thread(target=waypoint_server.start, args=(8000,), daemon=True).start()
+        print("[SYSTEM] Waypoint upload -> http://0.0.0.0:8000/api/mission/upload_txt")
 
         (
             capture_process,
