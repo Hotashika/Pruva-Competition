@@ -28,6 +28,7 @@ from bridge.mavlink_connection import (
 from utils.mavlink_utilities import create_bridge_topics, create_bridge_services
 from utils.pixhawk_waypoints import mission_items_to_qgc
 from utils.waypoint_server import DEFAULT_WAYPOINT_DIRECTORY, overwrite_waypoint_file
+from utils.battery import battery_percentage_from_voltage
 
 MISSION_PARAM_NAME = "SCR_USER1"
 MISSION_IDLE = 0
@@ -1024,10 +1025,12 @@ class OrangeCubeBridgeNode(Node):
             destination = overwrite_waypoint_file(
                 DEFAULT_WAYPOINT_DIRECTORY, filename, content
             )
-            self.get_logger().info(
+            save_text = (
                 f"Pixhawk mission dosyaya yazildi: path={destination.resolve()}, "
                 f"items={self.mission_download_count}, bytes={len(content.encode('utf-8'))}"
             )
+            self.get_logger().info(save_text)
+            self._publish_diagnostic(save_text)
             try:
                 self.master.mav.mission_ack_send(
                     self.master.target_system,
@@ -1247,8 +1250,7 @@ class OrangeCubeBridgeNode(Node):
             battery_msg.voltage = float(self.voltage_v)
             if self.current_a is not None:
                 battery_msg.current = float(self.current_a)
-            if self.battery_remaining is not None:
-                battery_msg.percentage = float(self.battery_remaining) / 100.0
+            battery_msg.percentage = battery_percentage_from_voltage(self.voltage_v)
             self.topics.battery_pub.publish(battery_msg)
 
         state_msg = String()
