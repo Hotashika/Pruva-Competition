@@ -606,8 +606,9 @@ class Task2Node(Node):
         self.last_detection_time = None
         self.last_consumed_detection_time = None
         self.bridge_connected = False
-        self.vehicle_armed = False
-        self.vehicle_mode = "UNKNOWN"
+        self.bridge_armed = False
+        self.bridge_mode = "UNKNOWN"
+        self._last_logged_bridge_state = None
         self.valid_gps_received = False
         self.valid_heading_received = False
         self.mission_active = False

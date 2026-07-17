@@ -14,6 +14,7 @@ from std_msgs.msg import String
 
 from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
 from njord.core import shared_state
+from njord.core.capture_dataset import ActiveTaskRecordingGate
 from njord.core.shared_memory_utils import attach_existing_shared_memory
 from njord.vision.detector import BaseYOLODetector
 
@@ -41,12 +42,32 @@ def attach_shared_memory(name, retries=50, delay=0.1):
 class VisionDetectionCache(Node):
     """Cache vision output so recording never reruns the detector models."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        dataset_record_event=None,
+        dataset_task="task2",
+        dataset_task_timeout_sec=2.5,
+    ):
         super().__init__("njord_video_detection_cache")
         self._lock = threading.Lock()
         self._frame_id = None
         self._detections = []
+        self._dataset_gate = None
         self.create_subscription(String, "/vision/detections", self._callback, 10)
+        if dataset_record_event is not None:
+            self._dataset_gate = ActiveTaskRecordingGate(
+                dataset_record_event,
+                task_name=dataset_task,
+                timeout_sec=dataset_task_timeout_sec,
+            )
+            self.create_subscription(
+                String,
+                "/mission/active_task",
+                self._active_task_callback,
+                10,
+            )
+            self.create_timer(0.5, self._expire_active_task)
 
     def _callback(self, message):
         try:
@@ -67,6 +88,18 @@ class VisionDetectionCache(Node):
             if self._frame_id is None or abs(int(frame_id) - self._frame_id) > max_frame_lag:
                 return []
             return [dict(item) for item in self._detections if isinstance(item, dict)]
+
+    def _active_task_callback(self, message):
+        if self._dataset_gate is not None:
+            self._dataset_gate.observe(message.data)
+
+    def _expire_active_task(self):
+        if self._dataset_gate is not None:
+            self._dataset_gate.expire()
+
+    def close(self):
+        if self._dataset_gate is not None:
+            self._dataset_gate.close()
 
 
 def disk_writer_worker(q, video_path, frame_size):
@@ -163,6 +196,8 @@ def run(
     active_task="task1",
     fx=None,
     cx=None,
+    dataset_record_event=None,
+    dataset_task="task2",
 ):
     setup_output_dirs()
     frame_index = 0
@@ -206,7 +241,10 @@ def run(
         if not rclpy.ok():
             rclpy.init()
             owns_rclpy_context = True
-        detection_node = VisionDetectionCache()
+        detection_node = VisionDetectionCache(
+            dataset_record_event=dataset_record_event,
+            dataset_task=dataset_task,
+        )
         detection_spin_thread = threading.Thread(
             target=rclpy.spin, args=(detection_node,), daemon=True
         )
@@ -368,7 +406,10 @@ def run(
                 shm.close()
 
         if detection_node is not None:
+            detection_node.close()
             detection_node.destroy_node()
+        elif dataset_record_event is not None:
+            dataset_record_event.clear()
         if owns_rclpy_context and rclpy.ok():
             rclpy.shutdown()
         if detection_spin_thread is not None:
