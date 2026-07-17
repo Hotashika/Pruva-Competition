@@ -258,8 +258,3 @@ cython_debug/
 .codex
 teknofest/logs
 njord/logs
-
-njord/models/buoy
-njord/models/ar_tag
-
-teknofest/models/buoy
