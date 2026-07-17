@@ -347,8 +347,12 @@ class OrangeCubeBridgeNode(Node):
                 source_component=self.source_component,
                 logger=self.get_logger(),
             )
-            self.connected = True
-            self.last_heartbeat_time = time.time()
+            initial_heartbeat = getattr(self.master, "initial_vehicle_heartbeat", None)
+            if initial_heartbeat is None:
+                raise ConnectionError("Baglanti heartbeat'i bridge durumuna aktarilamadi.")
+            self._update_vehicle_state_from_heartbeat(
+                initial_heartbeat, source="initial connection"
+            )
             self.last_mavlink_rx_time = time.time()
             self.connection_lost_reported = False
             self.cmd_vel_ignored_reported = False
@@ -601,8 +605,12 @@ class OrangeCubeBridgeNode(Node):
                 source_component=self.source_component,
                 logger=self.get_logger(),
             )
-            self.connected = True
-            self.last_heartbeat_time = time.time()
+            initial_heartbeat = getattr(self.master, "initial_vehicle_heartbeat", None)
+            if initial_heartbeat is None:
+                raise ConnectionError("Reconnect heartbeat'i bridge durumuna aktarilamadi.")
+            self._update_vehicle_state_from_heartbeat(
+                initial_heartbeat, source="reconnect"
+            )
             self.last_mavlink_rx_time = time.time()
             self.connection_lost_reported = False
             self.cmd_vel_ignored_reported = False
@@ -1171,6 +1179,16 @@ class OrangeCubeBridgeNode(Node):
     def _publish_telemetry(self):
         now = self.get_clock().now().to_msg()
         link_ready = self._has_valid_link()
+
+        # Gecerli heartbeat mode'u olmadan bagli durum yayinlama. Boylece
+        # arayuzde gecici UNKNOWN/GUIDED salinimi gorunmez.
+        if self.connected and self._normalize_mode_name(self.mode) == "UNKNOWN":
+            self.get_logger().warn(
+                "connected=True fakat heartbeat mode henuz dogrulanmadi; "
+                "/cube/state yayini bu tur icin atlandi.",
+                throttle_duration_sec=2.0,
+            )
+            return
 
         if link_ready and self._has_valid_gps():
             gps_msg = NavSatFix()
