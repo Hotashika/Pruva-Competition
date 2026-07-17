@@ -84,7 +84,15 @@ def create_app(waypoint_directory=DEFAULT_WAYPOINT_DIRECTORY):
                 payload.get("content"),
             )
         except (OSError, ValueError) as exc:
+            app.logger.warning("Waypoint upload rejected: %s", exc)
             return jsonify(ok=False, success=False, error=str(exc)), 400
+
+        app.logger.info(
+            "Waypoint upload saved: path=%s bytes=%d overwritten=%s",
+            destination,
+            len(payload["content"].encode("utf-8")),
+            existed_before_write,
+        )
 
         return jsonify(
             ok=True,
@@ -108,4 +116,10 @@ app = create_app()
 
 
 def start(port=8000):
+    print(
+        "[WAYPOINT] Receiver ready: "
+        f"http://0.0.0.0:{port}/api/mission/upload_txt -> "
+        f"{DEFAULT_WAYPOINT_DIRECTORY.resolve()}",
+        flush=True,
+    )
     app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)

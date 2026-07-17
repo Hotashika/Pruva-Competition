@@ -26,6 +26,8 @@ from bridge.mavlink_connection import (
     connect_mavlink,
 )
 from utils.mavlink_utilities import create_bridge_topics, create_bridge_services
+from utils.pixhawk_waypoints import mission_items_to_qgc
+from utils.waypoint_server import DEFAULT_WAYPOINT_DIRECTORY, overwrite_waypoint_file
 
 MISSION_PARAM_NAME = "SCR_USER1"
 MISSION_IDLE = 0
@@ -170,10 +172,16 @@ class OrangeCubeBridgeNode(Node):
         self.last_mission_command_time = 0.0
         self.last_mission_command_wait_log_time = 0.0
         self.mission_parameter_initialized = False
+        self.mission_parameter_startup_reset_pending = False
         self.last_mission_parameter_value = MISSION_IDLE
         self.pending_mission_command = None
         self.pending_mission_command_first_publish_time = 0.0
         self.pending_mission_command_last_publish_time = 0.0
+        self.mission_download_task = None
+        self.mission_download_count = None
+        self.mission_download_items = {}
+        self.mission_download_last_request_time = 0.0
+        self.mission_download_retry_count = 0
 
         self.gps_lat = None
         self.gps_lon = None
@@ -234,6 +242,7 @@ class OrangeCubeBridgeNode(Node):
         self.create_timer(0.5, self._request_mission_command_parameter)
         self.create_timer(5.0, self._mission_command_rx_watchdog)
         self.create_timer(0.2, self._mission_start_ack_watchdog)
+        self.create_timer(0.5, self._mission_download_watchdog)
 
         self.get_logger().info(
             f"MAVLink Bridge aktif. {MISSION_PARAM_NAME}=1..4/90/99 okunup "
@@ -744,6 +753,12 @@ class OrangeCubeBridgeNode(Node):
                 elif msg_type == "COMMAND_ACK":
                     self._log_command_ack(msg)
 
+                elif msg_type == "MISSION_COUNT":
+                    self._handle_mission_count(msg)
+
+                elif msg_type in ("MISSION_ITEM_INT", "MISSION_ITEM"):
+                    self._handle_mission_item(msg)
+
                 elif msg_type == "GLOBAL_POSITION_INT":
                     self.gps_lat = msg.lat / 1e7
                     self.gps_lon = msg.lon / 1e7
@@ -823,15 +838,27 @@ class OrangeCubeBridgeNode(Node):
         except (TypeError, ValueError):
             return
 
+        if self.mission_parameter_startup_reset_pending:
+            if command == MISSION_IDLE:
+                self.mission_parameter_startup_reset_pending = False
+                self.last_mission_parameter_value = MISSION_IDLE
+                self.get_logger().info(
+                    f"Baslangic {MISSION_PARAM_NAME} sifirlamasi dogrulandi; "
+                    "yeni gorev komutu bekleniyor."
+                )
+            return
+
         if not self.mission_parameter_initialized:
             self.mission_parameter_initialized = True
             self.last_mission_parameter_value = command
             if command != MISSION_IDLE:
                 self.get_logger().warn(
                     f"Baslangicta {MISSION_PARAM_NAME}={command} bulundu; "
-                    "kaybolmamasi icin /mission_start olarak yayinlanacak."
+                    "kalici/eski komut olarak kabul edilip 0'a sifirlaniyor; "
+                    "gorev baslatilmayacak."
                 )
-                self._process_mission_parameter_command(command)
+                self.mission_parameter_startup_reset_pending = True
+                self._set_mission_parameter(MISSION_IDLE)
             return
 
         if command == self.last_mission_parameter_value:
@@ -883,17 +910,162 @@ class OrangeCubeBridgeNode(Node):
         mission_number = command
         mission_name = f"M{mission_number}"
 
+        if mission_number in (MISSION_1, MISSION_2, MISSION_4):
+            self._start_mission_download(mission_number)
+            self._send_status_text(
+                f"{MISSION_PARAM_NAME} received: {mission_name}, downloading mission",
+                mavutil.mavlink.MAV_SEVERITY_INFO,
+            )
+            self.get_logger().info(
+                f"{MISSION_PARAM_NAME} mission command received: {mission_name}; "
+                "waypoint dosyasi yazildiktan sonra mission_start yayinlanacak."
+            )
+            return
+
+        self._publish_downloaded_mission_start(mission_number)
+
+    def _publish_downloaded_mission_start(self, mission_number):
         self._publish_mission_start(mission_number, track_ack=True)
         self._send_status_text(
-            f"{MISSION_PARAM_NAME} received: {mission_name}, waiting ack",
+            f"mission M{mission_number} ready, waiting ack",
             mavutil.mavlink.MAV_SEVERITY_INFO,
         )
-
         self.get_logger().info(
-            f"{MISSION_PARAM_NAME} mission command received: {mission_name}; "
+            f"Mission M{mission_number} hazir; "
             f"{self.mission_start_topic}={mission_number} yayinlandi, "
             f"{self.mission_start_ack_topic} ack bekleniyor."
         )
+
+    def _start_mission_download(self, mission_number):
+        if self.master is None:
+            self.get_logger().warn("Waypoint senkronizasyonu baslatilamadi: MAVLink yok.")
+            return
+
+        self.mission_download_task = int(mission_number)
+        self.mission_download_count = None
+        self.mission_download_items = {}
+        self.mission_download_retry_count = 0
+        self._request_mission_list()
+        self.get_logger().info(
+            f"Pixhawk mission listesi njord_task{mission_number}.waypoints icin isteniyor."
+        )
+
+    def _request_mission_list(self):
+        try:
+            self.master.mav.mission_request_list_send(
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+            )
+        except TypeError:
+            self.master.mav.mission_request_list_send(
+                self.master.target_system,
+                self.master.target_component,
+            )
+        self.mission_download_last_request_time = time.time()
+
+    def _request_mission_item(self, sequence):
+        try:
+            self.master.mav.mission_request_int_send(
+                self.master.target_system,
+                self.master.target_component,
+                int(sequence),
+                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+            )
+        except TypeError:
+            self.master.mav.mission_request_int_send(
+                self.master.target_system,
+                self.master.target_component,
+                int(sequence),
+            )
+        self.mission_download_last_request_time = time.time()
+
+    def _handle_mission_count(self, msg):
+        if self.mission_download_task is None:
+            return
+        self.mission_download_count = int(msg.count)
+        self.mission_download_retry_count = 0
+        if self.mission_download_count <= 0:
+            self.get_logger().warn("Pixhawk mission listesi bos; waypoint dosyasi degistirilmedi.")
+            self._reset_mission_download()
+            return
+        self._request_mission_item(0)
+
+    def _handle_mission_item(self, msg):
+        if self.mission_download_task is None or self.mission_download_count is None:
+            return
+        sequence = int(msg.seq)
+        if not 0 <= sequence < self.mission_download_count:
+            return
+        self.mission_download_items[sequence] = msg
+        self.mission_download_retry_count = 0
+
+        missing = next(
+            (seq for seq in range(self.mission_download_count)
+             if seq not in self.mission_download_items),
+            None,
+        )
+        if missing is not None:
+            self._request_mission_item(missing)
+            return
+
+        task_number = self.mission_download_task
+        filename = f"njord_task{task_number}.waypoints"
+        try:
+            content = mission_items_to_qgc(self.mission_download_items.values())
+            destination = overwrite_waypoint_file(
+                DEFAULT_WAYPOINT_DIRECTORY, filename, content
+            )
+            self.get_logger().info(
+                f"Pixhawk mission dosyaya yazildi: path={destination.resolve()}, "
+                f"items={self.mission_download_count}, bytes={len(content.encode('utf-8'))}"
+            )
+            try:
+                self.master.mav.mission_ack_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    mavutil.mavlink.MAV_MISSION_ACCEPTED,
+                    mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+                )
+            except TypeError:
+                self.master.mav.mission_ack_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    mavutil.mavlink.MAV_MISSION_ACCEPTED,
+                )
+            self._publish_downloaded_mission_start(task_number)
+        except Exception as exc:
+            self.get_logger().error(f"Pixhawk waypoint dosyasi yazilamadi: {exc}")
+        finally:
+            self._reset_mission_download()
+
+    def _mission_download_watchdog(self):
+        if self.mission_download_task is None:
+            return
+        if time.time() - self.mission_download_last_request_time < 2.0:
+            return
+        self.mission_download_retry_count += 1
+        if self.mission_download_retry_count > 4:
+            self.get_logger().error("Pixhawk mission indirme zaman asimina ugradi.")
+            self._reset_mission_download()
+            return
+        if self.mission_download_count is None:
+            self._request_mission_list()
+            return
+        missing = next(
+            (seq for seq in range(self.mission_download_count)
+             if seq not in self.mission_download_items),
+            None,
+        )
+        if missing is not None:
+            self._request_mission_item(missing)
+
+    def _reset_mission_download(self):
+        self.mission_download_task = None
+        self.mission_download_count = None
+        self.mission_download_items = {}
+        self.mission_download_last_request_time = 0.0
+        self.mission_download_retry_count = 0
 
     def _publish_mission_start(self, command, track_ack=False):
         mission_msg = Int32()
