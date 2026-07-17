@@ -21,6 +21,7 @@ from teknofest.servers import data_server
 
 
 MISSION_SPECS = {
+    "competition": ("Full Competition", "competition_mission.py"),
     "task1": ("Mission 1", "task1_point_tracking.py"),
     "task2": ("Mission 2", "task2_point_tracking_task_in_an_environment_with_obstacle.py"),
     "task3": ("Mission 3", "task3_kamikaze_engagement.py"),
@@ -30,13 +31,24 @@ MISSION_SPECS = {
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Start the selected TEKNOFEST mission.")
     task_group = parser.add_mutually_exclusive_group(required=True)
+    task_group.add_argument(
+        "--competition",
+        dest="task",
+        action="store_const",
+        const="competition",
+        help="Run Missions 1, 2 and 3 continuously using GN transitions.",
+    )
     for task_number in range(1, 4):
         task_group.add_argument(
             f"--task-{task_number}",
+            f"--task{task_number}",
             dest="task",
             action="store_const",
             const=f"task{task_number}",
-            help=f"Start TEKNOFEST Mission {task_number}.",
+            help=(
+                f"Start TEKNOFEST Mission {task_number} with its dedicated "
+                f"teknofest_task{task_number}.waypoints route where applicable."
+            ),
         )
     return parser.parse_args(argv)
 
