@@ -587,6 +587,106 @@ class Task3DockingMission:
         self.logger.info(f"Task3 next mode: {self.current_mode_name}")
         self.set_state(DockingState.GO_TO_APPROACH_POINT, "next_mode")
 
+    def _update_wait_start(self) -> None:
+        if self.config.auto_start:
+            self.set_state(DockingState.GO_TO_APPROACH_POINT, "auto_start")
+        else:
+            self.stop("wait_start")
+
+    def _update_go_to_approach_point(self) -> None:
+        target = self.current_mode.approach_point
+        if target.is_valid:
+            if self._navigate_to_point(target, f"{self.current_mode_name}_approach"):
+                self.set_state(DockingState.SEARCH_DOCK, "approach_reached")
+            return
+
+        key = f"{self.current_mode_name}_approach_missing"
+        if key not in self._missing_config_logged:
+            self.logger.warn(
+                f"{self.current_mode_name}: approach_point config missing. "
+                "Skipping GPS approach and using QR visual docking."
+            )
+            self._missing_config_logged.add(key)
+        self.set_state(DockingState.SEARCH_DOCK, "no_approach_point")
+
+    def _update_search_dock(self) -> None:
+        if self._qr_is_usable_for_current_mode():
+            self.set_state(DockingState.ALIGN_TO_TAG, "target_qr_detected")
+            return
+        if self._qr_is_fresh() and not self._payload_matches_current_mode(self.last_qr_detection):
+            detection = self.last_qr_detection
+            self.logger.warn(
+                f"QR detected but not valid for mode={self.current_mode_name}: "
+                f"payload={detection.canonical_payload if detection else None}",
+                throttle_duration_sec=2.0,
+            )
+        if self._state_age() > self.current_mode.search_timeout_seconds:
+            self._enter_failsafe(
+                f"Target QR not detected within {self.current_mode.search_timeout_seconds}s"
+            )
+            return
+        self._send_cmd(0.0, self._search_yaw_command(), reason="search_target_qr")
+
+    def _update_align_to_tag(self) -> None:
+        if not self._qr_is_usable_for_current_mode():
+            self.set_state(DockingState.SEARCH_DOCK, "target_qr_lost_or_wrong")
+            return
+        if self._align_to_global_dock_heading_if_needed():
+            return
+
+        detection = self.last_qr_detection
+        linear_x, angular_z, aligned = self._align_command(
+            detection,
+            kp=self.config.align_kp_yaw,
+            forward_speed=0.0,
+        )
+        self._send_cmd(linear_x, angular_z, reason="align_to_tag")
+        if aligned:
+            self.set_state(DockingState.FINAL_APPROACH, "tag_centered")
+
+    def _update_final_approach(self) -> None:
+        if not self._qr_is_usable_for_current_mode():
+            self.set_state(DockingState.SEARCH_DOCK, "target_qr_lost_or_wrong_in_final")
+            return
+        if self._state_age() > self.current_mode.final_approach_timeout_seconds:
+            self._enter_failsafe(
+                f"Final approach timeout > {self.current_mode.final_approach_timeout_seconds}s"
+            )
+            return
+
+        detection = self.last_qr_detection
+        if detection.area_ratio >= self.current_mode.stop_area_ratio:
+            self.stop("dock_reached_by_bbox_area")
+            self.set_state(DockingState.HOLD_POSITION, f"area_ratio={detection.area_ratio:.3f}")
+            return
+
+        linear_x, angular_z, _ = self._align_command(
+            detection,
+            kp=self.config.final_kp_yaw,
+            forward_speed=self.config.final_linear_speed,
+        )
+        self._send_cmd(linear_x, angular_z, reason="final_approach")
+
+    def _update_hold_position(self) -> None:
+        self.stop("hold_position")
+        if self._state_age() >= self.current_mode.hold_seconds:
+            self.set_state(DockingState.REVERSE_EXIT, "hold_complete")
+
+    def _update_reverse_exit(self) -> None:
+        if self._state_age() < self.current_mode.reverse_seconds:
+            self._send_cmd(self.config.reverse_linear_speed, 0.0, reason="reverse_exit")
+            return
+        self.stop("reverse_complete")
+        if self.current_mode.exit_point.is_valid:
+            self.set_state(DockingState.GO_TO_EXIT_POINT, "reverse_complete")
+        else:
+            self.set_state(DockingState.MODE_FINISHED, "no_exit_point")
+
+    def _update_go_to_exit_point(self) -> None:
+        target_name = f"{self.current_mode_name}_exit"
+        if self._navigate_to_point(self.current_mode.exit_point, target_name):
+            self.set_state(DockingState.MODE_FINISHED, "exit_reached")
+
     def update(self) -> None:
         if self.state == DockingState.FINISHED:
             self.stop("finished")
@@ -598,100 +698,35 @@ class Task3DockingMission:
             return
 
         if self.state == DockingState.WAIT_START:
-            if self.config.auto_start:
-                self.set_state(DockingState.GO_TO_APPROACH_POINT, "auto_start")
-            else:
-                self.stop("wait_start")
+            self._update_wait_start()
             return
 
         if self.state == DockingState.GO_TO_APPROACH_POINT:
-            target = self.current_mode.approach_point
-            if target.is_valid:
-                if self._navigate_to_point(target, f"{self.current_mode_name}_approach"):
-                    self.set_state(DockingState.SEARCH_DOCK, "approach_reached")
-                return
-            key = f"{self.current_mode_name}_approach_missing"
-            if key not in self._missing_config_logged:
-                self.logger.warn(
-                    f"{self.current_mode_name}: approach_point config missing. "
-                    "Skipping GPS approach and using QR visual docking."
-                )
-                self._missing_config_logged.add(key)
-            self.set_state(DockingState.SEARCH_DOCK, "no_approach_point")
+            self._update_go_to_approach_point()
             return
 
         if self.state == DockingState.SEARCH_DOCK:
-            if self._qr_is_usable_for_current_mode():
-                self.set_state(DockingState.ALIGN_TO_TAG, "target_qr_detected")
-                return
-            if self._qr_is_fresh() and not self._payload_matches_current_mode(self.last_qr_detection):
-                det = self.last_qr_detection
-                self.logger.warn(
-                    f"QR detected but not valid for mode={self.current_mode_name}: "
-                    f"payload={det.canonical_payload if det else None}",
-                    throttle_duration_sec=2.0,
-                )
-            if self._state_age() > self.current_mode.search_timeout_seconds:
-                self._enter_failsafe(f"Target QR not detected within {self.current_mode.search_timeout_seconds}s")
-                return
-            self._send_cmd(0.0, self._search_yaw_command(), reason="search_target_qr")
+            self._update_search_dock()
             return
 
         if self.state == DockingState.ALIGN_TO_TAG:
-            if not self._qr_is_usable_for_current_mode():
-                self.set_state(DockingState.SEARCH_DOCK, "target_qr_lost_or_wrong")
-                return
-            if self._align_to_global_dock_heading_if_needed():
-                return
-            detection = self.last_qr_detection
-            linear_x, angular_z, aligned = self._align_command(
-                detection, kp=self.config.align_kp_yaw, forward_speed=0.0
-            )
-            self._send_cmd(linear_x, angular_z, reason="align_to_tag")
-            if aligned:
-                self.set_state(DockingState.FINAL_APPROACH, "tag_centered")
+            self._update_align_to_tag()
             return
 
         if self.state == DockingState.FINAL_APPROACH:
-            if not self._qr_is_usable_for_current_mode():
-                self.set_state(DockingState.SEARCH_DOCK, "target_qr_lost_or_wrong_in_final")
-                return
-            if self._state_age() > self.current_mode.final_approach_timeout_seconds:
-                self._enter_failsafe(
-                    f"Final approach timeout > {self.current_mode.final_approach_timeout_seconds}s"
-                )
-                return
-            detection = self.last_qr_detection
-            if detection.area_ratio >= self.current_mode.stop_area_ratio:
-                self.stop("dock_reached_by_bbox_area")
-                self.set_state(DockingState.HOLD_POSITION, f"area_ratio={detection.area_ratio:.3f}")
-                return
-            linear_x, angular_z, _ = self._align_command(
-                detection, kp=self.config.final_kp_yaw, forward_speed=self.config.final_linear_speed
-            )
-            self._send_cmd(linear_x, angular_z, reason="final_approach")
+            self._update_final_approach()
             return
 
         if self.state == DockingState.HOLD_POSITION:
-            self.stop("hold_position")
-            if self._state_age() >= self.current_mode.hold_seconds:
-                self.set_state(DockingState.REVERSE_EXIT, "hold_complete")
+            self._update_hold_position()
             return
 
         if self.state == DockingState.REVERSE_EXIT:
-            if self._state_age() < self.current_mode.reverse_seconds:
-                self._send_cmd(self.config.reverse_linear_speed, 0.0, reason="reverse_exit")
-                return
-            self.stop("reverse_complete")
-            if self.current_mode.exit_point.is_valid:
-                self.set_state(DockingState.GO_TO_EXIT_POINT, "reverse_complete")
-            else:
-                self.set_state(DockingState.MODE_FINISHED, "no_exit_point")
+            self._update_reverse_exit()
             return
 
         if self.state == DockingState.GO_TO_EXIT_POINT:
-            if self._navigate_to_point(self.current_mode.exit_point, f"{self.current_mode_name}_exit"):
-                self.set_state(DockingState.MODE_FINISHED, "exit_reached")
+            self._update_go_to_exit_point()
             return
 
         if self.state == DockingState.MODE_FINISHED:
