@@ -1,11 +1,14 @@
+import os
 import time
 
 from pymavlink import mavutil
 
-# Jetson 40-pin header UART (8N1, flow control disabled by pymavlink/pyserial defaults).
+# Pixhawk Micro USB usually appears as /dev/ttyACM0 on Jetson.
 DEFAULT_CONNECTION_STRING = "/dev/ttyACM0"
 DEFAULT_BAUD = 921600
 DEFAULT_HEARTBEAT_TIMEOUT = 15
+DEFAULT_SOURCE_SYSTEM = 1
+DEFAULT_SOURCE_COMPONENT = mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
 
 def _close_mavlink(master):
     try:
@@ -45,6 +48,8 @@ def connect_mavlink(
         connection_string=DEFAULT_CONNECTION_STRING,
         baud=DEFAULT_BAUD,
         heartbeat_timeout=DEFAULT_HEARTBEAT_TIMEOUT,
+        source_system=None,
+        source_component=None,
         logger=None,
 ):
     """MAVLink baglantisi kurar ve heartbeat bekledikten sonra master nesnesini dondurur.
@@ -55,10 +60,25 @@ def connect_mavlink(
         - TELEM / USB-TTL: "/dev/ttyUSB0"
         - SITL: "udpin:127.0.0.1:14550"
     """
-    if logger is not None:
-        logger.info(f"MAVLink baglaniyor: {connection_string}, baud={baud}")
+    if source_system is None:
+        source_system = int(os.getenv("MAVLINK_SOURCE_SYSTEM", str(DEFAULT_SOURCE_SYSTEM)))
+    if source_component is None:
+        source_component = int(
+            os.getenv("MAVLINK_SOURCE_COMPONENT", str(DEFAULT_SOURCE_COMPONENT))
+        )
 
-    master = mavutil.mavlink_connection(connection_string, baud=baud)
+    if logger is not None:
+        logger.info(
+            f"MAVLink baglaniyor: {connection_string}, baud={baud}, "
+            f"source_system={source_system}, source_component={source_component}"
+        )
+
+    master = mavutil.mavlink_connection(
+        connection_string,
+        baud=baud,
+        source_system=source_system,
+        source_component=source_component,
+    )
 
     if logger is not None:
         logger.info("Heartbeat bekleniyor...")
@@ -114,7 +134,8 @@ def connect_mavlink(
     if logger is not None:
         logger.info(
             f"MAVLink baglandi. system={master.target_system}, "
-            f"component={master.target_component}"
+            f"component={master.target_component}, "
+            f"source_system={source_system}, source_component={source_component}"
         )
 
     return master
@@ -124,5 +145,7 @@ __all__ = [
     "DEFAULT_CONNECTION_STRING",
     "DEFAULT_BAUD",
     "DEFAULT_HEARTBEAT_TIMEOUT",
+    "DEFAULT_SOURCE_SYSTEM",
+    "DEFAULT_SOURCE_COMPONENT",
     "connect_mavlink",
 ]
