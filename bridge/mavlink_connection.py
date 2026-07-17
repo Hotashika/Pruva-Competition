@@ -131,6 +131,10 @@ def connect_mavlink(
     if master.target_component in (None, 0):
         master.target_component = source_component
 
+    # Baglantiyi kuran heartbeat, bridge state'inin de ilk kaynagi olmalidir.
+    # Aksi halde sonraki heartbeat'e kadar connected=True/mode=UNKNOWN gorulur.
+    master.initial_vehicle_heartbeat = heartbeat
+
     if logger is not None:
         logger.info(
             f"MAVLink baglandi. system={master.target_system}, "

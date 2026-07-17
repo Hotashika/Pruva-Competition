@@ -13,7 +13,6 @@ COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
 if COMPETITION_ROOT not in sys.path:
     sys.path.insert(0, COMPETITION_ROOT)
 
-from utils.mavlink_utilities import call_trigger_service
 from utils.task_selection_state import default_task_selection_file
 from utils import waypoint_server
 from njord.core import capture_proc
@@ -223,8 +222,8 @@ if __name__ == "__main__":
         time.sleep(2)
 
         print(" -> Bridge publishes SCR_USER1 commands to /mission_start.")
-        print(" -> Mission Manager writes /mission_start commands to JSON.")
-        print(" -> Task algorithms will later poll the JSON file.\n")
+        print(" -> Mission Manager starts the selected task process after waypoint sync.")
+        print(" -> Mission selection and process state are written to JSON.\n")
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
@@ -250,16 +249,6 @@ if __name__ == "__main__":
             print(f"[SYSTEM] Error while sub-process shut down: {exc}")
 
         print("[SYSTEM] Sub-processes closed.")
-
-        if p_bridge is not None:
-            print("[SYSTEM] Hold mode & DISARM the AUV...")
-
-            try:
-                call_trigger_service(None, None, "HOLD", timeout_sec=3.0)
-                call_trigger_service(None, None, "DISARM", timeout_sec=3.0)
-            except Exception as exc:
-                print(f"[SYSTEM] Error while sending HOLD/DISARM commands: {exc}")
-
 
         if capture_stop_event is not None:
             capture_stop_event.set()
