@@ -32,7 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 WAYPOINT_PATH = Path(
     os.getenv(
         "NJORD_TASK4_WAYPOINT_PATH",
-        BASE_DIR / "waypoints" / "njord_task4.waypoints",
+        BASE_DIR.parent / "waypoints" / "njord_task4.waypoints",
     )
 )
 ACTIVE_TASK_NAME = "task4"

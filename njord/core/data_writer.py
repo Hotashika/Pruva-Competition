@@ -1,5 +1,6 @@
 # import csv  # IMU CSV logging is disabled for now.
 import logging
+import json
 import os
 import queue
 import threading
@@ -7,11 +8,15 @@ import time
 
 import cv2
 import numpy as np
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
 
 from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
 from njord.core import shared_state
+from njord.core.capture_dataset import ActiveTaskRecordingGate
 from njord.core.shared_memory_utils import attach_existing_shared_memory
-from njord.vision.detector import BuoyDetector, VesselDetector
+from njord.vision.detector import BaseYOLODetector
 
 OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")
@@ -19,20 +24,8 @@ VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 # CSV_PATH = os.path.join(OUTPUT_DIR, "imu_log.csv")  # IMU CSV logging is disabled for now.
 DEPTH_BIN_PATH = os.path.join(OUTPUT_DIR, "depth_stream.bin")  # single append-only file (disabled for now)
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
+DEPTH_VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "depth_run_{ts}.mp4")
 VIDEO_FPS = 5
-
-TASK_DETECTOR_MAP = {
-    "task1": ("buoy",),
-    "task2": ("vessel",),
-    "task3": ("vessel",),
-    "task4": ("buoy",),
-    "none": ("buoy", "vessel"),
-}
-
-DETECTOR_FACTORIES = {
-    "buoy": BuoyDetector,
-    "vessel": VesselDetector,
-}
 
 logger = logging.getLogger("zed_capture")
 
@@ -46,33 +39,67 @@ def attach_shared_memory(name, retries=50, delay=0.1):
     return attach_existing_shared_memory(name, retries=retries, delay=delay)
 
 
-def detector_names_for_task(active_task):
-    task_key = str(active_task or "task1").strip().lower()
-    detector_names = TASK_DETECTOR_MAP.get(task_key)
+class VisionDetectionCache(Node):
+    """Cache vision output so recording never reruns the detector models."""
 
-    if detector_names is None:
-        logger.warning(
-            "Unknown NJORD task '%s' for video annotation, defaulting to task1 detectors.",
-            active_task,
-        )
-        return TASK_DETECTOR_MAP["task1"]
-
-    return detector_names
-
-
-def create_frame_detectors(active_task, fx=None, cx=None):
-    detectors = []
-
-    for detector_name in detector_names_for_task(active_task):
-        detector_cls = DETECTOR_FACTORIES[detector_name]
-        detectors.append(
-            (
-                detector_name,
-                detector_cls(fx=fx, cx=cx),
+    def __init__(
+        self,
+        *,
+        dataset_record_event=None,
+        dataset_task="task2",
+        dataset_task_timeout_sec=2.5,
+    ):
+        super().__init__("njord_video_detection_cache")
+        self._lock = threading.Lock()
+        self._frame_id = None
+        self._detections = []
+        self._dataset_gate = None
+        self.create_subscription(String, "/vision/detections", self._callback, 10)
+        if dataset_record_event is not None:
+            self._dataset_gate = ActiveTaskRecordingGate(
+                dataset_record_event,
+                task_name=dataset_task,
+                timeout_sec=dataset_task_timeout_sec,
             )
-        )
+            self.create_subscription(
+                String,
+                "/mission/active_task",
+                self._active_task_callback,
+                10,
+            )
+            self.create_timer(0.5, self._expire_active_task)
 
-    return detectors
+    def _callback(self, message):
+        try:
+            payload = json.loads(message.data)
+            frame_id = int(payload.get("frame_id"))
+            detections = payload.get("detections", [])
+            if not isinstance(detections, list):
+                return
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self.get_logger().warn("Invalid /vision/detections message ignored.")
+            return
+        with self._lock:
+            self._frame_id = frame_id
+            self._detections = detections
+
+    def latest(self, frame_id, max_frame_lag=3):
+        with self._lock:
+            if self._frame_id is None or abs(int(frame_id) - self._frame_id) > max_frame_lag:
+                return []
+            return [dict(item) for item in self._detections if isinstance(item, dict)]
+
+    def _active_task_callback(self, message):
+        if self._dataset_gate is not None:
+            self._dataset_gate.observe(message.data)
+
+    def _expire_active_task(self):
+        if self._dataset_gate is not None:
+            self._dataset_gate.expire()
+
+    def close(self):
+        if self._dataset_gate is not None:
+            self._dataset_gate.close()
 
 
 def disk_writer_worker(q, video_path, frame_size):
@@ -100,7 +127,7 @@ def disk_writer_worker(q, video_path, frame_size):
         video_writer.write(frame_bgr)
 
         # --- IMU-to-CSV temporarily disabled ---
-        # writer.writerow([timestamp_ms, pitch, yaw, roll, frame_index])
+        # writer.writerow([timestamp_ms, roll, pitch, yaw, frame_index])
 
         # --- depth-to-disk temporarily disabled ---
         # depth_bytes = depth_data.tobytes()
@@ -156,21 +183,9 @@ def draw_frame_timestamp(frame, timestamp_ms, frame_index):
     return frame
 
 
-def annotate_frame(frame_bgr, depth_array, detectors):
-    all_detections = []
-
-    for detector_name, detector in detectors:
-        detections = detector.detect(frame_bgr, depth_array)
-
-        for detection in detections:
-            detection["type"] = detector_name
-
-        all_detections.extend(detections)
-
-    if not detectors:
-        return frame_bgr.copy()
-
-    return detectors[0][1].draw_detections(frame_bgr, all_detections)
+def annotate_frame(frame_bgr, detections):
+    # draw_detections does not access model state; avoid loading a second YOLO model.
+    return BaseYOLODetector.draw_detections(None, frame_bgr, detections)
 
 
 # noinspection D
@@ -181,27 +196,39 @@ def run(
     active_task="task1",
     fx=None,
     cx=None,
+    dataset_record_event=None,
+    dataset_task="task2",
 ):
     setup_output_dirs()
     frame_index = 0
     dropped_frames = 0
+    dropped_depth_frames = 0
 
     write_queue = queue.Queue(maxsize=100)
+    depth_write_queue = queue.Queue(maxsize=100)
     writer_thread = None  # started lazily once we know frame size (see below)
+    depth_writer_thread = None
     rgb_shm = None
     depth_shm = None
+    depth_vision_shm = None
     meta_shm = None
     imu_shm = None
     shm_rgb = None
     shm_depth = None
+    shm_depth_vision = None
     shm_meta = None
     shm_imu = None
+    detection_node = None
+    detection_spin_thread = None
+    owns_rclpy_context = False
 
     # Preallocated reusable buffers -> avoids per-frame np/cv2 allocation churn.
     bgra_buf = np.empty(RGB_SHAPE, dtype=np.uint8)
     depth_buf = np.empty(DEPTH_SHAPE, dtype=np.float32)
+    depth_vision_bgra_buf = np.empty(RGB_SHAPE, dtype=np.uint8)
     h, w = RGB_SHAPE[:2]
     frame_bgr_buf = np.empty((h, w, 3), dtype=np.uint8)
+    depth_vision_bgr_buf = np.empty((h, w, 3), dtype=np.uint8)
     dh, dw = h // 2, w // 2
     downsampled_depth_buf = np.empty((dh, dw), dtype=np.float32)
 
@@ -211,32 +238,47 @@ def run(
     last_record_time_ms = None
 
     try:
-        frame_detectors = create_frame_detectors(active_task, fx=fx, cx=cx)
-    except Exception:
-        logger.exception(
-            "NJORD video annotation detectors could not be loaded for task '%s'.",
-            active_task,
+        if not rclpy.ok():
+            rclpy.init()
+            owns_rclpy_context = True
+        detection_node = VisionDetectionCache(
+            dataset_record_event=dataset_record_event,
+            dataset_task=dataset_task,
         )
-        raise
+        detection_spin_thread = threading.Thread(
+            target=rclpy.spin, args=(detection_node,), daemon=True
+        )
+        detection_spin_thread.start()
 
-    try:
         rgb_shm = attach_shared_memory(shared_state.RGB_SHM_NAME)
         depth_shm = attach_shared_memory(shared_state.DEPTH_SHM_NAME)
+        depth_vision_shm = attach_shared_memory(shared_state.DEPTH_VISION_SHM_NAME)
         meta_shm = attach_shared_memory(shared_state.META_SHM_NAME)
         imu_shm = attach_shared_memory(shared_state.IMU_SHM_NAME)
 
         shm_rgb = np.ndarray(RGB_SHAPE, dtype=np.uint8, buffer=rgb_shm.buf)
         shm_depth = np.ndarray(DEPTH_SHAPE, dtype=np.float32, buffer=depth_shm.buf)
+        shm_depth_vision = np.ndarray(
+            RGB_SHAPE, dtype=np.uint8, buffer=depth_vision_shm.buf
+        )
         shm_meta = np.ndarray(shared_state.META_SHAPE, dtype=np.int64, buffer=meta_shm.buf)
         shm_imu = np.ndarray(shared_state.IMU_SHAPE, dtype=np.float64, buffer=imu_shm.buf)
 
-        video_path = VIDEO_PATH_TEMPLATE.format(ts=int(time.time()))
+        run_timestamp = int(time.time())
+        video_path = VIDEO_PATH_TEMPLATE.format(ts=run_timestamp)
+        depth_video_path = DEPTH_VIDEO_PATH_TEMPLATE.format(ts=run_timestamp)
         writer_thread = threading.Thread(
             target=disk_writer_worker,
             args=(write_queue, video_path, (w, h)),
             daemon=True,
         )
         writer_thread.start()
+        depth_writer_thread = threading.Thread(
+            target=disk_writer_worker,
+            args=(depth_write_queue, depth_video_path, (w, h)),
+            daemon=True,
+        )
+        depth_writer_thread.start()
 
         while stop_event is None or not stop_event.is_set():
             if frame_ready_event is not None:
@@ -246,16 +288,18 @@ def run(
             if frame_lock is None:
                 current_frame_id = int(shm_meta[0])
                 timestamp_ms = int(shm_meta[1])
-                pitch, yaw, roll = shm_imu.tolist()
+                roll, pitch, yaw = shm_imu.tolist()
                 np.copyto(bgra_buf, shm_rgb)
                 np.copyto(depth_buf, shm_depth)
+                np.copyto(depth_vision_bgra_buf, shm_depth_vision)
             else:
                 with frame_lock:
                     current_frame_id = int(shm_meta[0])
                     timestamp_ms = int(shm_meta[1])
-                    pitch, yaw, roll = shm_imu.tolist()
+                    roll, pitch, yaw = shm_imu.tolist()
                     np.copyto(bgra_buf, shm_rgb)
                     np.copyto(depth_buf, shm_depth)
+                    np.copyto(depth_vision_bgra_buf, shm_depth_vision)
 
             if current_frame_id == 0 or current_frame_id == last_frame_id:
                 continue
@@ -263,6 +307,11 @@ def run(
 
             # Reuse output buffers via dst= to avoid new allocations every frame
             cv2.cvtColor(bgra_buf, cv2.COLOR_BGRA2BGR, dst=frame_bgr_buf)
+            cv2.cvtColor(
+                depth_vision_bgra_buf,
+                cv2.COLOR_BGRA2BGR,
+                dst=depth_vision_bgr_buf,
+            )
             cv2.resize(
                 depth_buf, (0, 0), dst=downsampled_depth_buf,
                 fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA,
@@ -278,13 +327,21 @@ def run(
 
             if should_record:
                 try:
-                    processed_frame = annotate_frame(frame_bgr_buf, depth_buf, frame_detectors)
+                    processed_frame = annotate_frame(
+                        frame_bgr_buf, detection_node.latest(current_frame_id)
+                    )
                 except Exception:
                     logger.exception("NJORD video annotation failed. Raw frame will be used.")
                     processed_frame = frame_bgr_buf.copy()
 
                 draw_frame_timestamp(
                     processed_frame,
+                    timestamp_ms=timestamp_ms,
+                    frame_index=current_frame_id,
+                )
+                depth_record_frame = depth_vision_bgr_buf.copy()
+                draw_frame_timestamp(
+                    depth_record_frame,
                     timestamp_ms=timestamp_ms,
                     frame_index=current_frame_id,
                 )
@@ -297,20 +354,34 @@ def run(
 
                 try:
                     write_queue.put_nowait(processed_frame)
-                    last_record_time_ms = now_record_time_ms
                 except queue.Full:
                     dropped_frames += 1
                     now = time.monotonic()
                     if now - last_drop_log > 1.0:  # rate-limit logging, don't block hot path
                         logger.warning(
-                            "Disk write speed is lagging, number of dropped frames: %d", dropped_frames
+                            "RGB disk writer is lagging; dropped frames: %d",
+                            dropped_frames,
                         )
                         last_drop_log = now
+
+                try:
+                    depth_write_queue.put_nowait(depth_record_frame)
+                except queue.Full:
+                    dropped_depth_frames += 1
+                    now = time.monotonic()
+                    if now - last_drop_log > 1.0:
+                        logger.warning(
+                            "Depth disk writer is lagging; dropped frames: %d",
+                            dropped_depth_frames,
+                        )
+                        last_drop_log = now
+
+                last_record_time_ms = now_record_time_ms
 
             # --- minimize time spent holding locks: just pointer/scalar assignment ---
             with shared_state.data_lock:
                 shared_state.latest_depth_array = downsampled_depth_buf.copy()
-                shared_state.latest_imu = {"pitch": pitch, "yaw": yaw, "roll": roll}
+                shared_state.latest_imu = {"roll": roll, "pitch": pitch, "yaw": yaw}
                 shared_state.latest_timestamp = timestamp_ms
 
             shared_state.data_event.set()
@@ -320,12 +391,26 @@ def run(
         if writer_thread is not None:
             write_queue.put(None)
             writer_thread.join()
+        if depth_writer_thread is not None:
+            depth_write_queue.put(None)
+            depth_writer_thread.join()
 
         shm_rgb = None
         shm_depth = None
+        shm_depth_vision = None
         shm_meta = None
         shm_imu = None
 
-        for shm in (rgb_shm, depth_shm, meta_shm, imu_shm):
+        for shm in (rgb_shm, depth_shm, depth_vision_shm, meta_shm, imu_shm):
             if shm is not None:
                 shm.close()
+
+        if detection_node is not None:
+            detection_node.close()
+            detection_node.destroy_node()
+        elif dataset_record_event is not None:
+            dataset_record_event.clear()
+        if owns_rclpy_context and rclpy.ok():
+            rclpy.shutdown()
+        if detection_spin_thread is not None:
+            detection_spin_thread.join(timeout=2.0)
