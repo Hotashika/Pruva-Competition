@@ -22,7 +22,6 @@ OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 # CSV_PATH = os.path.join(OUTPUT_DIR, "imu_log.csv")  # IMU CSV logging is disabled for now.
-DEPTH_BIN_PATH = os.path.join(OUTPUT_DIR, "depth_stream.bin")  # single append-only file (disabled for now)
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
 DEPTH_VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "depth_run_{ts}.mp4")
 VIDEO_FPS = 5
@@ -106,8 +105,7 @@ def disk_writer_worker(q, video_path, frame_size):
     """
     Writes the captured BGR frames to an .mp4 video file.
 
-    IMU CSV logging and depth persistence are disabled for now (see commented
-    blocks below).
+    IMU CSV logging is disabled for now (see the commented block below).
     """
     video_writer = cv2.VideoWriter(
         video_path, cv2.VideoWriter_fourcc(*"mp4v"), VIDEO_FPS, frame_size
@@ -128,11 +126,6 @@ def disk_writer_worker(q, video_path, frame_size):
 
         # --- IMU-to-CSV temporarily disabled ---
         # writer.writerow([timestamp_ms, roll, pitch, yaw, frame_index])
-
-        # --- depth-to-disk temporarily disabled ---
-        # depth_bytes = depth_data.tobytes()
-        # depth_bin.write(depth_bytes)
-        # offset += len(depth_bytes)
 
         q.task_done()
 
@@ -231,11 +224,13 @@ def run(
     depth_vision_bgr_buf = np.empty((h, w, 3), dtype=np.uint8)
     dh, dw = h // 2, w // 2
     downsampled_depth_buf = np.empty((dh, dw), dtype=np.float32)
+    downsampled_depth_f16_buf = np.empty((dh, dw), dtype=np.float16)
 
     last_drop_log = 0.0
     last_frame_id = 0
     record_interval_ms = max(1, int(1000 / VIDEO_FPS))
     last_record_time_ms = None
+    last_metric_depth_timestamp_ms = None
 
     try:
         if not rclpy.ok():
@@ -267,6 +262,8 @@ def run(
         run_timestamp = int(time.time())
         video_path = VIDEO_PATH_TEMPLATE.format(ts=run_timestamp)
         depth_video_path = DEPTH_VIDEO_PATH_TEMPLATE.format(ts=run_timestamp)
+        metric_depth_run_dir = os.path.join(DEPTH_DIR, f"run_{run_timestamp}")
+        os.makedirs(metric_depth_run_dir, exist_ok=True)
         writer_thread = threading.Thread(
             target=disk_writer_worker,
             args=(write_queue, video_path, (w, h)),
@@ -316,8 +313,35 @@ def run(
                 depth_buf, (0, 0), dst=downsampled_depth_buf,
                 fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA,
             )
-            # float16 conversion disabled along with depth-to-disk writing (see below)
-            # np.copyto(downsampled_depth_f16_buf, downsampled_depth_buf, casting="unsafe")
+            metric_depth_recording = (
+                dataset_record_event is None or dataset_record_event.is_set()
+            )
+            if not metric_depth_recording:
+                # Re-anchor sampling to the first frame of the next task run,
+                # just like CaptureDatasetSession does.
+                last_metric_depth_timestamp_ms = None
+            metric_depth_is_due = metric_depth_recording and (
+                last_metric_depth_timestamp_ms is None
+                or timestamp_ms - last_metric_depth_timestamp_ms
+                >= record_interval_ms
+            )
+
+            if metric_depth_is_due:
+                np.copyto(
+                    downsampled_depth_f16_buf,
+                    downsampled_depth_buf,
+                    casting="unsafe",
+                )
+                depth_frame_path = os.path.join(
+                    metric_depth_run_dir,
+                    f"{current_frame_id:08d}_{timestamp_ms}.npy",
+                )
+                np.save(
+                    depth_frame_path,
+                    downsampled_depth_f16_buf,
+                    allow_pickle=False,
+                )
+                last_metric_depth_timestamp_ms = timestamp_ms
 
             now_record_time_ms = int(time.monotonic() * 1000)
             should_record = (

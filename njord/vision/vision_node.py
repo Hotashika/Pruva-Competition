@@ -199,6 +199,7 @@ class VisionNode(Node):
 
     def process_frame(self):
         frame_id = int(self.meta[0])
+        camera_timestamp_ms = int(self.meta[1])
         if frame_id == self.last_frame_id:
             return
 
@@ -242,6 +243,7 @@ class VisionNode(Node):
         msg = String()
         msg.data = json.dumps({
             "frame_id": frame_id,
+            "camera_timestamp_ms": camera_timestamp_ms,
             "detections": all_detections,
         })
         self.pub.publish(msg)

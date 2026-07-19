@@ -1,5 +1,8 @@
+import csv
 import importlib
+import math
 import sys
+import tempfile
 import types
 import unittest
 
@@ -162,13 +165,16 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.mission.update_bridge_state(True, True, "GUIDED", now=now)
 
     @staticmethod
-    def _vessel(distance, angle):
-        return {
+    def _vessel(distance, angle, track_id=7):
+        detection = {
             "type": "vessel",
             "class": "unknown_model_label",
             "distance": distance,
             "Vessel angle: ": angle,
         }
+        if track_id is not None:
+            detection["track_id"] = track_id
+        return detection
 
     @staticmethod
     def _buoy(color, distance, angle):
@@ -337,6 +343,123 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertIsNone(self.mission.aligned_target_key)
+
+    def test_estimates_relative_and_true_vessel_speed_and_course(self):
+        base_latitude = 1.0
+        for index, now in enumerate((10.0, 10.5, 11.0)):
+            elapsed = now - 10.0
+            own_north_m = 0.4 * elapsed
+            target_north_m = 10.0 - 0.6 * elapsed
+            relative_distance_m = target_north_m - own_north_m
+            latitude = base_latitude + math.degrees(
+                own_north_m / task2.EARTH_RADIUS_M
+            )
+            self.mission.update_gps(latitude, 1.0, now=now)
+            self.mission.update_heading(0.0, now=now)
+            self.mission.update_bridge_state(True, True, "GUIDED", now=now)
+            self.mission.update(
+                [self._vessel(relative_distance_m, 0.0, track_id=42)],
+                now=now,
+                frame_id=100 + index,
+                camera_timestamp_ms=int(now * 1000),
+            )
+
+        estimate = self.mission.latest_kinematics
+        self.assertIsNotNone(estimate)
+        self.assertAlmostEqual(1.0, estimate.relative_speed_mps, places=3)
+        self.assertAlmostEqual(180.0, abs(estimate.relative_course_deg), places=3)
+        self.assertAlmostEqual(0.6, estimate.true_speed_mps, places=3)
+        self.assertAlmostEqual(180.0, estimate.true_course_deg, places=3)
+
+    def test_writes_timestamped_vessel_kinematics_csv(self):
+        captured = []
+        self.mission.kinematics_callback = (
+            lambda observation, kinematics, assessment, frame_id,
+            camera_timestamp_ms: captured.append(
+                (
+                    observation,
+                    kinematics,
+                    assessment,
+                    frame_id,
+                    camera_timestamp_ms,
+                )
+            )
+        )
+        for index, (distance, now) in enumerate(
+            ((10.0, 10.0), (9.5, 10.5), (9.0, 11.0))
+        ):
+            self._refresh_sensors(now)
+            self.mission.update(
+                [self._vessel(distance, 0.0, track_id=9)],
+                now=now,
+                frame_id=200 + index,
+                camera_timestamp_ms=int(now * 1000),
+            )
+
+        self.assertEqual(3, len(captured))
+        observation, estimate, assessment, frame_id, camera_timestamp_ms = captured[-1]
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:
+            recorder = task2.VesselKinematicsCsvRecorder(
+                temporary_dir,
+                run_name="kinematics.csv",
+            )
+            recorder.record(
+                None,
+                None,
+                task2.CollisionAssessment(False, "no_vessel"),
+                frame_id=199,
+                camera_timestamp_ms=9500,
+            )
+            recorder.record(
+                observation,
+                estimate,
+                assessment,
+                frame_id=frame_id,
+                camera_timestamp_ms=camera_timestamp_ms,
+            )
+            recorder.close()
+
+            with recorder.path.open(newline="", encoding="utf-8") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual(2, len(rows))
+        self.assertTrue(rows[0]["system_timestamp_utc"])
+        self.assertEqual("9500", rows[0]["camera_timestamp_ms"])
+        self.assertEqual("199", rows[0]["frame_id"])
+        self.assertEqual("0", rows[0]["detected"])
+        for field in task2.KINEMATICS_CSV_FIELDS[4:]:
+            self.assertEqual(0.0, float(rows[0][field]))
+
+        self.assertEqual("11000", rows[1]["camera_timestamp_ms"])
+        self.assertEqual("202", rows[1]["frame_id"])
+        self.assertEqual("1", rows[1]["detected"])
+        self.assertEqual("9", rows[1]["track_id"])
+        self.assertAlmostEqual(1.0, float(rows[1]["relative_speed_mps"]), places=3)
+        self.assertAlmostEqual(1.0, float(rows[1]["true_speed_mps"]), places=3)
+        self.assertAlmostEqual(
+            180.0,
+            float(rows[1]["true_course_deg"]),
+            places=3,
+        )
+
+    def test_missing_vessel_emits_zero_kinematics_sample(self):
+        captured = []
+        self.mission.kinematics_callback = lambda *values: captured.append(values)
+
+        self.mission.update(
+            [],
+            now=10.0,
+            frame_id=300,
+            camera_timestamp_ms=12000,
+        )
+
+        self.assertEqual(1, len(captured))
+        observation, estimate, assessment, frame_id, timestamp_ms = captured[0]
+        self.assertIsNone(observation)
+        self.assertIsNone(estimate)
+        self.assertEqual("no_vessel", assessment.reason)
+        self.assertEqual(300, frame_id)
+        self.assertEqual(12000, timestamp_ms)
 
 
 if __name__ == "__main__":
