@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import math
+import os
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
 
@@ -38,9 +41,27 @@ from utils.read_waypoints import parse_qgc_waypoints
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "njord_task2.waypoints"
+KINEMATICS_OUTPUT_DIR = BASE_DIR / "logs" / "task2_vessel_kinematics"
 ACTIVE_TASK_NAME = "task2"
 HOLD_MODE_NAME = "HOLD"
+EARTH_RADIUS_M = 6_371_000.0
 
+KINEMATICS_CSV_FIELDS = (
+    "system_timestamp_utc",
+    "camera_timestamp_ms",
+    "frame_id",
+    "detected",
+    "track_id",
+    "distance_m",
+    "bearing_deg",
+    "relative_course_deg",
+    "relative_speed_mps",
+    "true_course_deg",
+    "true_speed_mps",
+    "closing_rate_mps",
+    "tcpa_sec",
+    "dcpa_m",
+)
 # Existing movement commands are intentionally preserved. In this project,
 # negative angular_z means starboard/right.
 AVOID_LINEAR_X = 0.5
@@ -107,10 +128,16 @@ class MissionState(Enum):
 @dataclass(frozen=True)
 class VesselObservation:
     timestamp: float
+    camera_timestamp_ms: int | None
+    frame_id: int | None
+    track_id: int | None
     distance_m: float
     angle_deg: float
     forward_m: float
     starboard_m: float
+    latitude: float
+    longitude: float
+    heading_deg: float
 
 
 @dataclass(frozen=True)
@@ -120,6 +147,109 @@ class CollisionAssessment:
     closing_rate_mps: float = 0.0
     tcpa_sec: float | None = None
     dcpa_m: float | None = None
+
+
+@dataclass(frozen=True)
+class VesselKinematics:
+    relative_course_deg: float
+    relative_speed_mps: float
+    true_course_deg: float
+    true_speed_mps: float
+
+
+class VesselKinematicsCsvRecorder:
+    """Write timestamped Task 2 vessel-motion estimates to a line-buffered CSV."""
+
+    def __init__(self, output_dir=KINEMATICS_OUTPUT_DIR, *, run_name=None):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if run_name is None:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+            run_name = f"vessel_kinematics_{timestamp}.csv"
+        run_name = str(run_name)
+        if Path(run_name).name != run_name or not run_name.lower().endswith(".csv"):
+            raise ValueError("run_name must be a single CSV filename")
+
+        self.path = self.output_dir / run_name
+        self._file = self.path.open("x", newline="", encoding="utf-8", buffering=1)
+        self._writer = csv.DictWriter(self._file, fieldnames=KINEMATICS_CSV_FIELDS)
+        self._writer.writeheader()
+        self._file.flush()
+        self._closed = False
+
+    @staticmethod
+    def _number(value, digits=6):
+        if value is None:
+            return ""
+        return f"{float(value):.{digits}f}"
+
+    def record(
+        self,
+        observation,
+        kinematics,
+        assessment,
+        *,
+        frame_id=None,
+        camera_timestamp_ms=None,
+    ):
+        if self._closed:
+            raise RuntimeError("VesselKinematicsCsvRecorder is closed")
+        detected = observation is not None
+        if detected:
+            frame_id = observation.frame_id
+            camera_timestamp_ms = observation.camera_timestamp_ms
+        frame_id = 0 if frame_id is None else int(frame_id)
+        camera_timestamp_ms = (
+            0 if camera_timestamp_ms is None else int(camera_timestamp_ms)
+        )
+        self._writer.writerow(
+            {
+                "system_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "camera_timestamp_ms": camera_timestamp_ms,
+                "frame_id": frame_id,
+                "detected": int(detected),
+                "track_id": 0
+                if not detected or observation.track_id is None
+                else observation.track_id,
+                "distance_m": self._number(
+                    0.0 if not detected else observation.distance_m
+                ),
+                "bearing_deg": self._number(
+                    0.0 if not detected else observation.angle_deg
+                ),
+                "relative_course_deg": self._number(
+                    0.0
+                    if kinematics is None
+                    else kinematics.relative_course_deg
+                ),
+                "relative_speed_mps": self._number(
+                    0.0
+                    if kinematics is None
+                    else kinematics.relative_speed_mps
+                ),
+                "true_course_deg": self._number(
+                    0.0 if kinematics is None else kinematics.true_course_deg
+                ),
+                "true_speed_mps": self._number(
+                    0.0 if kinematics is None else kinematics.true_speed_mps
+                ),
+                "closing_rate_mps": self._number(assessment.closing_rate_mps),
+                "tcpa_sec": self._number(
+                    0.0 if assessment.tcpa_sec is None else assessment.tcpa_sec
+                ),
+                "dcpa_m": self._number(
+                    0.0 if assessment.dcpa_m is None else assessment.dcpa_m
+                ),
+            }
+        )
+        self._file.flush()
+
+    def close(self):
+        if self._closed:
+            return
+        self._file.flush()
+        self._file.close()
+        self._closed = True
 
 
 def load_task2_waypoints(path=WAYPOINT_PATH):
@@ -161,6 +291,8 @@ class Task2CollisionAvoidance:
         self.waypoint_hold_name = None
         self.hold_mode_requested = False
         self.hold_mode_future = None
+        self.kinematics_callback = None
+        self.latest_kinematics = None
 
     def update_gps(self, lat, lon, now=None):
         self.current_lat = float(lat)
@@ -184,6 +316,13 @@ class Task2CollisionAvoidance:
         except (TypeError, ValueError):
             return None
         return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _optional_int(value):
+        try:
+            return None if value is None else int(value)
+        except (TypeError, ValueError):
+            return None
 
     @classmethod
     def _is_vessel(cls, detection):
@@ -217,6 +356,7 @@ class Task2CollisionAvoidance:
         return {
             "distance": distance_m,
             "angle": angle_deg,
+            "track_id": cls._optional_int(detection.get("track_id")),
             "raw": detection,
         }
 
@@ -229,22 +369,41 @@ class Task2CollisionAvoidance:
                 vessels.append(vessel)
         return min(vessels, key=lambda item: item["distance"]) if vessels else None
 
-    def _record_observation(self, vessel, now):
+    def _record_observation(
+        self,
+        vessel,
+        sample_timestamp,
+        *,
+        frame_id=None,
+        camera_timestamp_ms=None,
+    ):
         angle_rad = math.radians(vessel["angle"])
         observation = VesselObservation(
-            timestamp=now,
+            timestamp=float(sample_timestamp),
+            camera_timestamp_ms=self._optional_int(camera_timestamp_ms),
+            frame_id=self._optional_int(frame_id),
+            track_id=vessel.get("track_id"),
             distance_m=vessel["distance"],
             angle_deg=vessel["angle"],
             forward_m=vessel["distance"] * math.cos(angle_rad),
             starboard_m=vessel["distance"] * math.sin(angle_rad),
+            latitude=float(self.current_lat),
+            longitude=float(self.current_lon),
+            heading_deg=float(self.current_heading),
         )
 
         # Without a tracker id, a large jump is treated as another vessel so
         # observations from different targets are not mixed in one CPA track.
         if self.track:
             previous = self.track[-1]
+            track_id_changed = (
+                previous.track_id is not None
+                and observation.track_id is not None
+                and previous.track_id != observation.track_id
+            )
             if (
-                abs(previous.angle_deg - observation.angle_deg) > 30.0
+                track_id_changed
+                or abs(previous.angle_deg - observation.angle_deg) > 30.0
                 or abs(previous.distance_m - observation.distance_m) > 5.0
                 or observation.timestamp - previous.timestamp > 1.5
             ):
@@ -252,6 +411,87 @@ class Task2CollisionAvoidance:
 
         self.track.append(observation)
         return observation
+
+    @staticmethod
+    def _gps_displacement_m(first, latest):
+        first_lat_rad = math.radians(first.latitude)
+        latest_lat_rad = math.radians(latest.latitude)
+        mean_lat_rad = (first_lat_rad + latest_lat_rad) / 2.0
+        north_m = EARTH_RADIUS_M * (latest_lat_rad - first_lat_rad)
+        east_m = (
+            EARTH_RADIUS_M
+            * math.cos(mean_lat_rad)
+            * math.radians(latest.longitude - first.longitude)
+        )
+        return north_m, east_m
+
+    @staticmethod
+    def _relative_offset_world(observation):
+        heading_rad = math.radians(observation.heading_deg)
+        north_m = (
+            observation.forward_m * math.cos(heading_rad)
+            - observation.starboard_m * math.sin(heading_rad)
+        )
+        east_m = (
+            observation.forward_m * math.sin(heading_rad)
+            + observation.starboard_m * math.cos(heading_rad)
+        )
+        return north_m, east_m
+
+    def _estimate_kinematics(self):
+        if len(self.track) < MIN_TRACK_SAMPLES:
+            return None
+
+        first = self.track[0]
+        latest = self.track[-1]
+        elapsed = latest.timestamp - first.timestamp
+        if elapsed < MIN_TRACK_SPAN_SEC:
+            return None
+
+        own_north_m, own_east_m = self._gps_displacement_m(first, latest)
+        first_rel_north_m, first_rel_east_m = self._relative_offset_world(first)
+        latest_rel_north_m, latest_rel_east_m = self._relative_offset_world(latest)
+
+        own_velocity_north = own_north_m / elapsed
+        own_velocity_east = own_east_m / elapsed
+        relative_velocity_north = (
+            latest_rel_north_m - first_rel_north_m
+        ) / elapsed
+        relative_velocity_east = (
+            latest_rel_east_m - first_rel_east_m
+        ) / elapsed
+        true_velocity_north = own_velocity_north + relative_velocity_north
+        true_velocity_east = own_velocity_east + relative_velocity_east
+
+        latest_heading_rad = math.radians(latest.heading_deg)
+        relative_velocity_forward = (
+            relative_velocity_north * math.cos(latest_heading_rad)
+            + relative_velocity_east * math.sin(latest_heading_rad)
+        )
+        relative_velocity_starboard = (
+            -relative_velocity_north * math.sin(latest_heading_rad)
+            + relative_velocity_east * math.cos(latest_heading_rad)
+        )
+
+        relative_speed = math.hypot(
+            relative_velocity_forward,
+            relative_velocity_starboard,
+        )
+        true_speed = math.hypot(true_velocity_north, true_velocity_east)
+        relative_course = math.degrees(
+            math.atan2(relative_velocity_starboard, relative_velocity_forward)
+        )
+        true_course = (
+            math.degrees(math.atan2(true_velocity_east, true_velocity_north))
+            + 360.0
+        ) % 360.0
+
+        return VesselKinematics(
+            relative_course_deg=relative_course,
+            relative_speed_mps=relative_speed,
+            true_course_deg=true_course,
+            true_speed_mps=true_speed,
+        )
 
     def _assess_collision_risk(self):
         if not self.track:
@@ -518,7 +758,15 @@ class Task2CollisionAvoidance:
 
         self._publish_starboard_command()
 
-    def update(self, detections, now=None, record_observation=True):
+    def update(
+        self,
+        detections,
+        now=None,
+        record_observation=True,
+        *,
+        frame_id=None,
+        camera_timestamp_ms=None,
+    ):
         now = time.monotonic() if now is None else float(now)
 
         if self.state in (MissionState.FINISHED, MissionState.FAILSAFE):
@@ -540,14 +788,43 @@ class Task2CollisionAvoidance:
             return
 
         vessel = self._nearest_vessel(detections)
+        observation = None
         if vessel is not None and record_observation:
-            self._record_observation(vessel, now)
+            camera_timestamp_ms = self._optional_int(camera_timestamp_ms)
+            sample_timestamp = (
+                now
+                if camera_timestamp_ms is None
+                else camera_timestamp_ms / 1000.0
+            )
+            observation = self._record_observation(
+                vessel,
+                sample_timestamp,
+                frame_id=frame_id,
+                camera_timestamp_ms=camera_timestamp_ms,
+            )
+
+        assessment = (
+            self._assess_collision_risk()
+            if vessel is not None
+            else CollisionAssessment(False, "no_vessel")
+        )
+        if observation is not None:
+            self.latest_kinematics = self._estimate_kinematics()
+        elif vessel is None:
+            self.latest_kinematics = None
+        if record_observation and self.kinematics_callback is not None:
+            self.kinematics_callback(
+                observation,
+                self.latest_kinematics,
+                assessment,
+                frame_id,
+                camera_timestamp_ms,
+            )
 
         if self.state == MissionState.AVOIDING:
             self._update_avoidance(vessel, now)
             return
 
-        assessment = self._assess_collision_risk() if vessel is not None else CollisionAssessment(False, "no_vessel")
         if vessel is None:
             self.track.clear()
             self.stand_on_risk_since = None
@@ -603,6 +880,8 @@ class Task2Node(Node):
         )
 
         self.latest_detections = []
+        self.latest_frame_id = None
+        self.latest_camera_timestamp_ms = None
         self.last_detection_time = None
         self.last_consumed_detection_time = None
         self.bridge_connected = False
@@ -612,6 +891,7 @@ class Task2Node(Node):
         self.valid_gps_received = False
         self.valid_heading_received = False
         self.mission_active = False
+        self.kinematics_recorder = None
 
         self.vision_sub = self.create_subscription(
             String,
@@ -657,17 +937,75 @@ class Task2Node(Node):
             )
             return
         self.latest_detections = detections
+        self.latest_frame_id = self.task._optional_int(payload.get("frame_id"))
+        self.latest_camera_timestamp_ms = self.task._optional_int(
+            payload.get("camera_timestamp_ms")
+        )
         self.last_detection_time = time.monotonic()
 
     def _current_detection_sample(self):
         if self.last_detection_time is None:
-            return [], False
+            return [], False, None, None
         if time.monotonic() - self.last_detection_time > VISION_DETECTION_TIMEOUT_SEC:
-            return [], False
+            return [], False, None, None
         is_new = self.last_consumed_detection_time != self.last_detection_time
         if is_new:
             self.last_consumed_detection_time = self.last_detection_time
-        return self.latest_detections, is_new
+        return (
+            self.latest_detections,
+            is_new,
+            self.latest_frame_id,
+            self.latest_camera_timestamp_ms,
+        )
+
+    def start_kinematics_recording(self):
+        if self.kinematics_recorder is not None:
+            return self.kinematics_recorder.path
+        output_dir = os.getenv(
+            "NJORD_TASK2_KINEMATICS_DIR",
+            str(KINEMATICS_OUTPUT_DIR),
+        )
+        try:
+            self.kinematics_recorder = VesselKinematicsCsvRecorder(output_dir)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Task 2 vessel kinematics CSV could not be started: {exc}"
+            )
+            return None
+        self.task.kinematics_callback = self._record_kinematics
+        self.get_logger().info(
+            f"Task 2 vessel kinematics CSV -> {self.kinematics_recorder.path}"
+        )
+        return self.kinematics_recorder.path
+
+    def _record_kinematics(
+        self,
+        observation,
+        kinematics,
+        assessment,
+        frame_id,
+        camera_timestamp_ms,
+    ):
+        if self.kinematics_recorder is None:
+            return
+        try:
+            self.kinematics_recorder.record(
+                observation,
+                kinematics,
+                assessment,
+                frame_id=frame_id,
+                camera_timestamp_ms=camera_timestamp_ms,
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f"Task 2 vessel kinematics logging disabled: {exc}"
+            )
+            try:
+                self.kinematics_recorder.close()
+            except Exception:
+                pass
+            self.kinematics_recorder = None
+            self.task.kinematics_callback = None
 
     def gps_callback(self, message):
         if abs(message.latitude) < MIN_VALID_ABS_COORD and abs(message.longitude) < MIN_VALID_ABS_COORD:
@@ -786,11 +1124,33 @@ class Task2Node(Node):
         if not self.mission_active:
             return
         try:
-            detections, is_new = self._current_detection_sample()
-            self.task.update(detections, record_observation=is_new)
+            (
+                detections,
+                is_new,
+                frame_id,
+                camera_timestamp_ms,
+            ) = self._current_detection_sample()
+            self.task.update(
+                detections,
+                record_observation=is_new,
+                frame_id=frame_id,
+                camera_timestamp_ms=camera_timestamp_ms,
+            )
         except Exception as exc:
             self.get_logger().error(f"Unexpected Task 2 control error: {exc}")
             self.task._enter_failsafe(str(exc))
+
+    def destroy_node(self):
+        self.task.kinematics_callback = None
+        if self.kinematics_recorder is not None:
+            try:
+                self.kinematics_recorder.close()
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Task 2 vessel kinematics CSV close failed: {exc}"
+                )
+            self.kinematics_recorder = None
+        super().destroy_node()
 
 
 def main(args=None):
@@ -840,6 +1200,7 @@ def main(args=None):
             )
             return
 
+        node.start_kinematics_recording()
         node.mission_active = True
         node.task.state = MissionState.NAVIGATING
         node.publish_active_task()
