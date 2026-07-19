@@ -11,8 +11,33 @@ def _install_ros_stubs():
     rclpy.shutdown = lambda: None
     rclpy.spin_once = lambda *args, **kwargs: None
     rclpy.spin_until_future_complete = lambda *args, **kwargs: None
+
+    class StubLogger:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    class StubPublisher:
+        def publish(self, message):
+            pass
+
+    class StubNode:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_logger(self):
+            return StubLogger()
+
+        def create_subscription(self, *args, **kwargs):
+            return object()
+
+        def create_publisher(self, *args, **kwargs):
+            return StubPublisher()
+
+        def create_timer(self, *args, **kwargs):
+            return object()
+
     node_module = types.ModuleType("rclpy.node")
-    node_module.Node = object
+    node_module.Node = StubNode
     sys.modules["rclpy"] = rclpy
     sys.modules["rclpy.node"] = node_module
 
@@ -165,6 +190,18 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
     def test_task2_waypoint_loader_discards_qgc_home(self):
         waypoints = task2.load_task2_waypoints("unused.waypoints")
         self.assertEqual([1], [waypoint["seq"] for waypoint in waypoints])
+
+    def test_task2_node_accepts_initial_bridge_state(self):
+        node = task2.Task2Node()
+        message = task2.String()
+        message.data = "connected=True,armed=False,mode=GUIDED"
+
+        node.state_callback(message)
+
+        self.assertTrue(node.bridge_connected)
+        self.assertFalse(node.bridge_armed)
+        self.assertEqual("GUIDED", node.bridge_mode)
+        self.assertEqual((True, False, "GUIDED"), node._last_logged_bridge_state)
 
     def test_receding_vessel_does_not_trigger_avoidance(self):
         self._update(6.0, 0.0, 10.0)
