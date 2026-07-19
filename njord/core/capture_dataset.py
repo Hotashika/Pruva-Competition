@@ -108,6 +108,7 @@ class CaptureDatasetSession:
             "task_name": normalized_task,
             "record_fps": record_fps,
             "record_right": bool(record_right),
+            "record_depth": True,
         }
 
         self.task_name = normalized_task
@@ -132,6 +133,7 @@ class CaptureDatasetSession:
         camera_timestamp_ms: int,
         left_image: np.ndarray,
         right_image: Optional[np.ndarray],
+        depth_map: np.ndarray,
         roll: float,
         pitch: float,
         yaw: float,
@@ -154,6 +156,7 @@ class CaptureDatasetSession:
             camera_timestamp_ms=camera_timestamp_ms,
             left_image=left_image,
             right_image=right_image,
+            depth_map=depth_map,
             roll=roll,
             pitch=pitch,
             yaw=yaw,

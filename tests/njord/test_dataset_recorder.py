@@ -16,6 +16,10 @@ def image(value, shape=(24, 32, 3)):
     return np.full(shape, value, dtype=np.uint8)
 
 
+def depth(value, shape=(24, 32)):
+    return np.full(shape, value, dtype=np.float32)
+
+
 class DatasetRecorderTests(unittest.TestCase):
     def test_writes_stereo_images_metadata_calibration_and_manifest(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:
@@ -36,6 +40,7 @@ class DatasetRecorderTests(unittest.TestCase):
                     system_timestamp_utc="2026-07-17T12:00:00+00:00",
                     left_image=image(25),
                     right_image=image(200),
+                    depth_map=depth(4.5),
                     roll=0.1,
                     pitch=-0.2,
                     yaw=1.5,
@@ -45,8 +50,11 @@ class DatasetRecorderTests(unittest.TestCase):
 
             left_path = run_dir / "left" / "00000001.jpg"
             right_path = run_dir / "right" / "00000001.jpg"
+            depth_path = run_dir / "depth" / "00000001.npy"
             self.assertTrue(left_path.is_file())
             self.assertTrue(right_path.is_file())
+            self.assertTrue(depth_path.is_file())
+            np.testing.assert_array_equal(depth(4.5), np.load(depth_path))
             with Image.open(left_path) as saved_left:
                 self.assertEqual((32, 24), saved_left.size)
                 self.assertEqual("RGB", saved_left.mode)
@@ -72,6 +80,7 @@ class DatasetRecorderTests(unittest.TestCase):
             self.assertNotIn("angular_velocity_x", rows[0])
             self.assertEqual("left/00000001.jpg", rows[0]["left_file"])
             self.assertEqual("right/00000001.jpg", rows[0]["right_file"])
+            self.assertEqual("depth/00000001.npy", rows[0]["depth_file"])
 
             with (run_dir / "calibration.yaml").open(encoding="utf-8") as file:
                 saved_calibration = json.load(file)
@@ -87,6 +96,7 @@ class DatasetRecorderTests(unittest.TestCase):
             self.assertEqual(0, manifest["frames_dropped"])
             self.assertEqual(0, manifest["frames_failed"])
             self.assertEqual(0, manifest["writer_error_count"])
+            self.assertEqual("depth", manifest["depth_directory"])
             self.assertIsNotNone(manifest["closed_utc"])
 
     def test_checkpoints_manifest_while_recording(self):
@@ -102,6 +112,7 @@ class DatasetRecorderTests(unittest.TestCase):
                 camera_timestamp_ms=1000,
                 left_image=image(10),
                 right_image=None,
+                depth_map=depth(1.0),
                 roll=0.0,
                 pitch=0.0,
                 yaw=0.0,
@@ -125,6 +136,7 @@ class DatasetRecorderTests(unittest.TestCase):
     def test_copies_reusable_capture_buffer_before_async_write(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:
             source = image(30)
+            depth_source = depth(3.0)
             recorder = DatasetRecorder(
                 temporary_dir,
                 run_name="buffer_copy",
@@ -136,11 +148,13 @@ class DatasetRecorderTests(unittest.TestCase):
                 camera_timestamp_ms=1000,
                 left_image=source,
                 right_image=None,
+                depth_map=depth_source,
                 roll=0.0,
                 pitch=0.0,
                 yaw=0.0,
             )
             source[:] = 230
+            depth_source[:] = 99.0
             recorder.close()
 
             with Image.open(
@@ -148,6 +162,10 @@ class DatasetRecorderTests(unittest.TestCase):
             ) as saved_image:
                 saved = np.asarray(saved_image)
             self.assertAlmostEqual(30.0, float(saved.mean()), delta=3.0)
+            np.testing.assert_array_equal(
+                depth(3.0),
+                np.load(recorder.run_dir / "depth" / "00000001.npy"),
+            )
 
     def test_converts_bgr_capture_frame_to_rgb_jpeg(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:
@@ -164,6 +182,7 @@ class DatasetRecorderTests(unittest.TestCase):
                     camera_timestamp_ms=1000,
                     left_image=bgr_frame,
                     right_image=None,
+                    depth_map=depth(1.0),
                     roll=0.0,
                     pitch=0.0,
                     yaw=0.0,
@@ -194,6 +213,7 @@ class DatasetRecorderTests(unittest.TestCase):
                         camera_timestamp_ms=1000,
                         left_image=image(1),
                         right_image=RightImageMustNotBeRead(),
+                        depth_map=depth(1.0),
                         roll=0.0,
                         pitch=0.0,
                         yaw=0.0,
@@ -224,6 +244,7 @@ class DatasetRecorderTests(unittest.TestCase):
                     camera_timestamp_ms=1000,
                     left_image=image(1),
                     right_image=None,
+                    depth_map=depth(1.0),
                     roll=0.0,
                     pitch=0.0,
                     yaw=0.0,
@@ -236,6 +257,7 @@ class DatasetRecorderTests(unittest.TestCase):
                     camera_timestamp_ms=1001,
                     left_image=image(2),
                     right_image=None,
+                    depth_map=depth(2.0),
                     roll=0.0,
                     pitch=0.0,
                     yaw=0.0,
@@ -247,6 +269,7 @@ class DatasetRecorderTests(unittest.TestCase):
                     camera_timestamp_ms=1002,
                     left_image=image(3),
                     right_image=None,
+                    depth_map=depth(3.0),
                     roll=0.0,
                     pitch=0.0,
                     yaw=0.0,
@@ -276,6 +299,7 @@ class DatasetRecorderTests(unittest.TestCase):
                 camera_timestamp_ms=1000,
                 left_image=image(1),
                 right_image=None,
+                depth_map=depth(1.0),
                 roll=0.0,
                 pitch=0.0,
                 yaw=0.0,
@@ -317,6 +341,7 @@ class DatasetRecorderTests(unittest.TestCase):
                 camera_timestamp_ms=1000,
                 left_image=image(1),
                 right_image=None,
+                depth_map=depth(1.0),
                 roll=0.0,
                 pitch=0.0,
                 yaw=0.0,
@@ -355,6 +380,30 @@ class DatasetRecorderTests(unittest.TestCase):
                     camera_timestamp_ms=1000,
                     left_image=image(1),
                     right_image=None,
+                    depth_map=depth(1.0),
+                    roll=0.0,
+                    pitch=0.0,
+                    yaw=0.0,
+                )
+
+            with self.assertRaisesRegex(ValueError, "depth_map"):
+                recorder.record_frame(
+                    frame_id=1,
+                    camera_timestamp_ms=1000,
+                    left_image=image(1),
+                    right_image=image(2),
+                    depth_map=None,
+                    roll=0.0,
+                    pitch=0.0,
+                    yaw=0.0,
+                )
+            with self.assertRaisesRegex(ValueError, "dimensions"):
+                recorder.record_frame(
+                    frame_id=1,
+                    camera_timestamp_ms=1000,
+                    left_image=image(1),
+                    right_image=image(2),
+                    depth_map=depth(1.0, shape=(12, 16)),
                     roll=0.0,
                     pitch=0.0,
                     yaw=0.0,
@@ -365,6 +414,7 @@ class DatasetRecorderTests(unittest.TestCase):
                 camera_timestamp_ms=1000,
                 left_image=image(1),
                 right_image=image(2),
+                depth_map=depth(1.0),
                 roll=0.0,
                 pitch=0.0,
                 yaw=0.0,
@@ -375,6 +425,7 @@ class DatasetRecorderTests(unittest.TestCase):
                     camera_timestamp_ms=1001,
                     left_image=image(1),
                     right_image=image(2),
+                    depth_map=depth(1.0),
                     roll=0.0,
                     pitch=0.0,
                     yaw=0.0,
@@ -385,6 +436,7 @@ class DatasetRecorderTests(unittest.TestCase):
                     camera_timestamp_ms=1000,
                     left_image=image(1),
                     right_image=image(2),
+                    depth_map=depth(1.0),
                     roll=0.0,
                     pitch=0.0,
                     yaw=0.0,

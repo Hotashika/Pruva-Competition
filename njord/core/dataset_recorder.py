@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 METADATA_FIELDS = (
     "frame_id",
     "camera_timestamp_ms",
@@ -25,6 +25,7 @@ METADATA_FIELDS = (
     "yaw_rad",
     "left_file",
     "right_file",
+    "depth_file",
 )
 
 
@@ -42,9 +43,11 @@ class FramePacket:
     yaw: float
     left_image: np.ndarray
     right_image: Optional[np.ndarray]
+    depth_map: np.ndarray
 
 
 ImageWriter = Callable[[Path, np.ndarray, int], None]
+DepthWriter = Callable[[Path, np.ndarray], None]
 _STOP = object()
 
 
@@ -116,8 +119,17 @@ def _write_jpeg_atomic(path: Path, image: np.ndarray, jpeg_quality: int) -> None
     os.replace(temporary_path, path)
 
 
+def _write_depth_atomic(path: Path, depth_map: np.ndarray) -> None:
+    temporary_path = path.with_name(f"{path.stem}.part{path.suffix}")
+    with temporary_path.open("wb") as output_file:
+        np.save(output_file, depth_map, allow_pickle=False)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+    os.replace(temporary_path, path)
+
+
 class DatasetRecorder:
-    """Asynchronously persist frame-synchronised stereo and IMU data.
+    """Asynchronously persist frame-synchronised stereo, depth and IMU data.
 
     The recorder deliberately owns only the disk-writing layer. Camera capture
     and object detection can feed it independently using ``frame_id`` as their
@@ -139,6 +151,7 @@ class DatasetRecorder:
         queue_size: int = 64,
         manifest_interval_frames: int = 30,
         image_writer: Optional[ImageWriter] = None,
+        depth_writer: Optional[DepthWriter] = None,
     ):
         if not 1 <= int(jpeg_quality) <= 100:
             raise ValueError("jpeg_quality must be in the range [1, 100]")
@@ -162,6 +175,7 @@ class DatasetRecorder:
         self.run_dir = self.output_root / self.run_name
         self.left_dir = self.run_dir / "left"
         self.right_dir = self.run_dir / "right"
+        self.depth_dir = self.run_dir / "depth"
         self.metadata_path = self.run_dir / "metadata.csv"
         self.manifest_path = self.run_dir / "manifest.json"
         self.calibration_path = self.run_dir / "calibration.yaml"
@@ -169,12 +183,14 @@ class DatasetRecorder:
         self.jpeg_quality = int(jpeg_quality)
         self.manifest_interval_frames = int(manifest_interval_frames)
         self._image_writer = image_writer or _write_jpeg_atomic
+        self._depth_writer = depth_writer or _write_depth_atomic
 
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.run_dir.mkdir(exist_ok=False)
         self.left_dir.mkdir()
         if self.record_right:
             self.right_dir.mkdir()
+        self.depth_dir.mkdir()
 
         calibration_payload = {
             "schema_version": SCHEMA_VERSION,
@@ -235,6 +251,7 @@ class DatasetRecorder:
             "calibration_file": self.calibration_path.name,
             "left_directory": self.left_dir.name,
             "right_directory": self.right_dir.name if self.record_right else None,
+            "depth_directory": self.depth_dir.name,
             "frames_seen": 0,
             "frames_accepted": 0,
             "frames_written": 0,
@@ -284,6 +301,7 @@ class DatasetRecorder:
         camera_timestamp_ms: int,
         left_image: np.ndarray,
         right_image: Optional[np.ndarray],
+        depth_map: np.ndarray,
         roll: float,
         pitch: float,
         yaw: float,
@@ -313,6 +331,12 @@ class DatasetRecorder:
             raise ValueError(
                 "right_image must be a non-empty numpy array when record_right=True"
             )
+        if not isinstance(depth_map, np.ndarray) or depth_map.size == 0:
+            raise ValueError("depth_map must be a non-empty numpy array")
+        if depth_map.ndim != 2 or not np.issubdtype(depth_map.dtype, np.number):
+            raise ValueError("depth_map must be a two-dimensional numeric array")
+        if left_image.shape[:2] != depth_map.shape:
+            raise ValueError("depth_map dimensions must match the camera image")
 
         packet = FramePacket(
             frame_id=frame_id,
@@ -325,6 +349,7 @@ class DatasetRecorder:
             right_image=None
             if not self.record_right or right_image is None
             else np.ascontiguousarray(right_image).copy(),
+            depth_map=np.ascontiguousarray(depth_map).copy(),
         )
 
         # Queue acceptance and close's sentinel insertion share this lock. This
@@ -389,8 +414,10 @@ class DatasetRecorder:
 
     def _write_packet(self, packet: FramePacket) -> None:
         filename = f"{packet.frame_id:08d}.jpg"
+        depth_filename = f"{packet.frame_id:08d}.npy"
         left_path = self.left_dir / filename
         right_path = self.right_dir / filename if self.record_right else None
+        depth_path = self.depth_dir / depth_filename
         created_paths: list[Path] = []
 
         try:
@@ -404,6 +431,8 @@ class DatasetRecorder:
                     self.jpeg_quality,
                 )
                 created_paths.append(right_path)
+            self._depth_writer(depth_path, packet.depth_map)
+            created_paths.append(depth_path)
 
             self._metadata_writer.writerow(
                 {
@@ -417,6 +446,7 @@ class DatasetRecorder:
                     "right_file": ""
                     if right_path is None
                     else right_path.relative_to(self.run_dir).as_posix(),
+                    "depth_file": depth_path.relative_to(self.run_dir).as_posix(),
                 }
             )
             self._metadata_file.flush()

@@ -303,16 +303,17 @@ def run_capture(
 
             frame_index += 1
             left_image = rgb_mat.get_data()
+            depth_image = depth_mat.get_data()
             if lock is None:
                 rgb_buf[:] = left_image
-                depth_buf[:] = depth_mat.get_data()
+                depth_buf[:] = depth_image
                 depth_vision_buf[:] = depth_vision_mat.get_data()
                 imu_buf[:] = (roll, pitch, yaw)
                 meta_buf[:] = (frame_index, timestamp_ms)
             else:
                 with lock:
                     rgb_buf[:] = left_image
-                    depth_buf[:] = depth_mat.get_data()
+                    depth_buf[:] = depth_image
                     depth_vision_buf[:] = depth_vision_mat.get_data()
                     imu_buf[:] = (roll, pitch, yaw)
                     meta_buf[:] = (frame_index, timestamp_ms)
@@ -326,6 +327,7 @@ def run_capture(
                             camera_timestamp_ms=timestamp_ms,
                             left_image=left_image,
                             right_image=right_mat.get_data(),
+                            depth_map=depth_image,
                             roll=roll,
                             pitch=pitch,
                             yaw=yaw,
