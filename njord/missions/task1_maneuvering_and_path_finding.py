@@ -43,21 +43,41 @@ GEOFENCE_RADIUS_M = 100.0  # Başlangıç noktasından izin verilen maksimum uza
 WAYPOINT_SETTLE_SEC = 0.50  # Her ana GPS noktasında kesin duruş süresi
 WAYPOINT_HEADING_TOLERANCE_DEG = 15.0  # Küçük heading farklarında gereksiz salınımı önler
 
-AVOID_ENTER_DIST_M = 3.0  # Kaçınma tetiklenme mesafesi
-AVOID_EXIT_DIST_M = 5.0  # Kaçınma için dikkate alınacak maksimum engel mesafesi
+AVOID_ENTER_DIST_M = 3.0  # Kırmızı/yeşil şamandıra kaçınma tetiklenme mesafesi
+AVOID_EXIT_DIST_M = 6.0  # Aktif kaçınmada şamandıranın izleneceği maksimum mesafe
+AVOID_MIN_CONFIDENCE = 0.45  # Düşük güvenli detection'ların manevra başlatmasını önler
+AVOID_CONFIRMATION_FRAMES = 3  # Manevra öncesi gereken ardışık vision frame sayısı
+AVOID_ASSOCIATION_MAX_ANGLE_DEG = 18.0  # Track ID yoksa frame'ler arası açı kapısı
+AVOID_ASSOCIATION_MAX_DISTANCE_M = 2.5  # Track ID yoksa frame'ler arası mesafe kapısı
+AVOID_FILTER_ALPHA = 0.35  # Açı ve mesafe ölçümleri için EMA katsayısı
 
-AVOID_LINEAR_X = 0.35  # Kaçınma manevrasında ileri hız
-AVOID_TURN_Z = 0.25  # Kaçınma manevrasında sağ/sol dönüş komutu büyüklüğü
+AVOID_MIN_LINEAR_X = 0.10  # Yakın engelde izin verilen minimum ileri komut
+AVOID_MAX_LINEAR_X = 0.35  # Güvenli mesafedeki maksimum ileri komut
+AVOID_STOP_DIST_M = 0.80  # Bu mesafenin altında ileri komut kesilir
+AVOID_DESIRED_SIDE_ANGLE_DEG = 35.0  # Şamandıranın tutulacağı görüntü açısı
+AVOID_TURN_KP = 0.012  # Görüntü açı hatasından dönüş komutuna kazanç
+AVOID_MAX_TURN_Z = 0.35  # Dönüş komutu sınırı
+AVOID_TURN_Z = AVOID_MAX_TURN_Z  # Eski sabit adını kullanan dış kod için uyumluluk
+AVOID_LINEAR_X = AVOID_MAX_LINEAR_X  # Eski sabit adını kullanan dış kod için uyumluluk
 
 AVOID_MANEUVER_MIN_SEC = 0.5  # Temizlenme kabul edilmeden önce minimum manevra süresi
-AVOID_MANEUVER_MAX_SEC = 1.5  # Tek kaçınma manevrasının maksimum süresi
+AVOID_MANEUVER_MAX_SEC = 8.0  # Aşılır ve engel hâlâ yakınsa FAILSAFE'e geçilir
+AVOID_CLEAR_DURATION_SEC = 0.5  # Obje güvenli tarafta kaldıktan sonraki doğrulama süresi
+AVOID_LOST_CONFIRM_SEC = 0.8  # Obje kaybolduktan sonra temiz kabul edilme süresi
+AVOID_CLEAR_ANGLE_DEG = 35.0  # Obje bu açının dışına çıkınca yanda kabul edilir
+AVOID_CLEAR_MIN_DIST_M = 2.0  # Çok yakın obje yalnızca açıyla temiz kabul edilmez
+AVOID_RECEDING_MARGIN_M = 0.5  # Obje en yakın ölçümden sonra bu kadar uzaklaşmalı
+AVOID_CONFLICT_DIST_M = 1.5  # Farklı yakın engelde manevrayı kesip HOLD'a geç
 
-AVOID_CLEAR_DURATION_SEC = 0.3  # Obje temiz göründükten sonra ana rotaya dönüş bekleme süresi
-AVOID_CLEAR_ANGLE_DEG = 25.0  # Obje bu açının dışına çıkınca merkezden temiz kabul edilir
-
-CARDINAL_PASS_CLEARANCE_M = 4.0  # Cardinal marker'ın doğu/batı tarafındaki geçiş mesafesi
+CARDINAL_ENTER_DIST_M = 8.0  # Kardinal rota üretimini daha güvenli mesafede başlat
+CARDINAL_TRACK_DIST_M = 12.0  # Aktif kardinal geçişinde ölçüm güncelleme menzili
+CARDINAL_PASS_CLEARANCE_M = 4.0  # Cardinal marker'ın güvenli tarafındaki hedef mesafesi
+CARDINAL_MIN_ROUTE_CLEARANCE_M = 3.0  # Giriş segmentinin marker'a minimum mesafesi
+CARDINAL_ENTRY_SEARCH_LIMIT_M = 20.0  # Güvenli giriş hedefi arama sınırı
+CARDINAL_EXIT_LEAD_M = 4.0  # Çıkış hedefinin güvenli tarafa ek uzaklığı
+CARDINAL_REPLAN_THRESHOLD_M = 0.75  # Marker tahmini bu kadar değişirse giriş rotasını yenile
 CARDINAL_TARGET_TOLERANCE_M = 1.0  # Geçiş GPS hedefinin tamamlanma toleransı
-CARDINAL_PASS_TIMEOUT_SEC = 20.0  # Geçiş hedefi bu sürede alınmazsa FAILSAFE + HOLD
+CARDINAL_PASS_TIMEOUT_SEC = 25.0  # Geçiş hedefleri bu sürede alınmazsa FAILSAFE + HOLD
 
 VISION_DETECTION_TIMEOUT_SEC = 1.0  # Son vision mesajı bu süreden eskiyse yok say
 EARTH_RADIUS_M = 6378137.0
@@ -130,7 +150,20 @@ class Task1Maneuvering:
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = 0.0  # +1.0 sağ/starboard, -1.0 sol/port
-        self.cardinal_pass_target = None  # Marker'ın coğrafi doğu/batısındaki GPS hedefi
+        self.avoiding_track_id = None
+        self.filtered_obstacle_angle = None
+        self.filtered_obstacle_distance = None
+        self.minimum_obstacle_distance = None
+        self.confirmation_candidate_key = None
+        self.confirmation_candidate_obstacle = None
+        self.confirmation_count = 0
+        self.last_confirmation_frame_token = None
+        self.synthetic_frame_token = 0
+        self.cardinal_marker_estimate = None
+        self.cardinal_route_marker = None
+        self.cardinal_pass_targets = []
+        self.cardinal_target_index = 0
+        self.cardinal_pass_target = None  # Aktif giriş veya çıkış GPS hedefi
         self.aligned_target_key = None
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
@@ -294,17 +327,138 @@ class Task1Maneuvering:
         return True
 
     # Kaçınma için dikkate alınacak en yakın şamandırayı seçer.
+    @staticmethod
+    def _obstacle_tracking_limit(obstacle_class):
+        if obstacle_class in CARDINAL_PASS_SIDES:
+            return CARDINAL_TRACK_DIST_M
+        return AVOID_EXIT_DIST_M
+
+    @staticmethod
+    def _obstacle_enter_distance(obstacle_class):
+        if obstacle_class in CARDINAL_PASS_SIDES:
+            return CARDINAL_ENTER_DIST_M
+        return AVOID_ENTER_DIST_M
+
+    def _valid_relevant_obstacles(self, detections):
+        """Detection alanlarını doğrular ve sayısal değerleri normalize eder."""
+        valid = []
+        for raw in detections:
+            if not isinstance(raw, dict):
+                continue
+
+            obstacle_class = raw.get("class")
+            if obstacle_class not in RELEVANT_OBSTACLE_CLASSES:
+                continue
+
+            try:
+                distance_m = float(raw.get("distance"))
+                confidence = float(raw.get("confidence", 1.0))
+            except (TypeError, ValueError):
+                continue
+
+            if (
+                    not math.isfinite(distance_m)
+                    or not math.isfinite(confidence)
+                    or distance_m <= 0.0
+                    or distance_m >= self._obstacle_tracking_limit(obstacle_class)
+                    or confidence < AVOID_MIN_CONFIDENCE
+            ):
+                continue
+
+            obstacle = dict(raw)
+            obstacle["distance"] = distance_m
+            obstacle["confidence"] = confidence
+            valid.append(obstacle)
+        return valid
+
     def _nearest_relevant_obstacle(self, detections):
         """Kaçınma menzilindeki en yakın ilgili şamandırayı döndürür (None yoksa)."""
-        candidates = [
-            obj for obj in detections
-            if obj.get("class") in RELEVANT_OBSTACLE_CLASSES
-               and obj.get("distance") is not None
-               and 0 < obj["distance"] < AVOID_EXIT_DIST_M
-        ]
+        candidates = self._valid_relevant_obstacles(detections)
         if not candidates:
             return None
         return min(candidates, key=lambda o: o["distance"])
+
+    def _nearest_trigger_obstacle(self, detections):
+        candidates = [
+            obstacle
+            for obstacle in self._valid_relevant_obstacles(detections)
+            if obstacle["distance"] <= self._obstacle_enter_distance(
+                obstacle["class"]
+            )
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda obstacle: obstacle["distance"])
+
+    @staticmethod
+    def _obstacle_confirmation_key(obstacle):
+        track_id = obstacle.get("track_id")
+        if track_id is None:
+            return obstacle["class"], None
+        return obstacle["class"], str(track_id)
+
+    def _same_confirmation_candidate(self, previous, current):
+        if previous is None or previous.get("class") != current.get("class"):
+            return False
+
+        previous_track_id = previous.get("track_id")
+        current_track_id = current.get("track_id")
+        if previous_track_id is not None and current_track_id is not None:
+            return str(previous_track_id) == str(current_track_id)
+
+        if abs(previous["distance"] - current["distance"]) > (
+                AVOID_ASSOCIATION_MAX_DISTANCE_M
+        ):
+            return False
+
+        previous_angle = self._detection_angle_deg(previous)
+        current_angle = self._detection_angle_deg(current)
+        if previous_angle is None or current_angle is None:
+            return True
+        return abs(previous_angle - current_angle) <= AVOID_ASSOCIATION_MAX_ANGLE_DEG
+
+    def _confirmed_nearest_obstacle(self, detections, frame_token=None):
+        """Aynı engel ardışık vision frame'lerinde görülürse manevraya izin verir."""
+        nearest = self._nearest_trigger_obstacle(detections)
+
+        if frame_token is None:
+            self.synthetic_frame_token += 1
+            frame_token = ("synthetic", self.synthetic_frame_token)
+
+        if frame_token == self.last_confirmation_frame_token:
+            if nearest is None:
+                return None
+            key = self._obstacle_confirmation_key(nearest)
+            if key == self.confirmation_candidate_key and (
+                    self.confirmation_count >= AVOID_CONFIRMATION_FRAMES
+            ):
+                return nearest
+            return None
+
+        self.last_confirmation_frame_token = frame_token
+        if nearest is None:
+            self.confirmation_candidate_key = None
+            self.confirmation_candidate_obstacle = None
+            self.confirmation_count = 0
+            return None
+
+        candidate_key = self._obstacle_confirmation_key(nearest)
+        if (
+                candidate_key == self.confirmation_candidate_key
+                and self._same_confirmation_candidate(
+                    self.confirmation_candidate_obstacle,
+                    nearest,
+                )
+        ):
+            self.confirmation_count += 1
+        else:
+            self.confirmation_candidate_key = candidate_key
+            self.confirmation_count = 1
+        self.confirmation_candidate_obstacle = nearest
+
+        if self.confirmation_count >= AVOID_CONFIRMATION_FRAMES:
+            return nearest
+        return None
 
     # Lokal metre offsetini yaklaşık GPS koordinatına dönüştürür.
     @staticmethod
@@ -344,7 +498,12 @@ class Task1Maneuvering:
             return None
 
         angle_deg = self._detection_angle_deg(obstacle)
-        if angle_deg is None or not math.isfinite(distance_m) or distance_m <= 0:
+        if (
+                angle_deg is None
+                or self.current_heading is None
+                or not math.isfinite(distance_m)
+                or distance_m <= 0
+        ):
             return None
 
         # Kamera araç ekseniyle hizalı kabul edilir: pozitif açı sağ/starboard tarafıdır.
@@ -354,37 +513,140 @@ class Task1Maneuvering:
         obstacle_east = distance_m * math.sin(obstacle_bearing_rad)
         return obstacle_north, obstacle_east
 
-    def _create_cardinal_pass_target(self, obstacle):
-        """Cardinal marker'ın istenen coğrafi tarafında geçici bir GPS hedefi üretir."""
-        pass_side = CARDINAL_PASS_SIDES.get(obstacle.get("class"))
-        obstacle_offset = self._obstacle_offset_from_detection(obstacle)
-        if pass_side is None or obstacle_offset is None:
-            return None
+    @staticmethod
+    def _gps_offset_m(origin_lat, origin_lon, target_lat, target_lon):
+        """Yakın GPS noktaları arasındaki north/east farkını metre olarak döndürür."""
+        mean_lat_rad = math.radians((origin_lat + target_lat) / 2.0)
+        north_m = math.radians(target_lat - origin_lat) * EARTH_RADIUS_M
+        east_m = (
+            math.radians(target_lon - origin_lon)
+            * EARTH_RADIUS_M
+            * math.cos(mean_lat_rad)
+        )
+        return north_m, east_m
 
-        obstacle_north, obstacle_east = obstacle_offset
-        marker_gps = self._offset_gps(
+    @staticmethod
+    def _point_to_segment_distance(point, start, end):
+        """İki boyutlu bir noktanın doğru parçasına en kısa mesafesini hesaplar."""
+        segment_north = end[0] - start[0]
+        segment_east = end[1] - start[1]
+        segment_length_sq = segment_north ** 2 + segment_east ** 2
+        if segment_length_sq <= 1e-9:
+            return math.hypot(point[0] - start[0], point[1] - start[1])
+
+        projection = (
+            (point[0] - start[0]) * segment_north
+            + (point[1] - start[1]) * segment_east
+        ) / segment_length_sq
+        projection = max(0.0, min(1.0, projection))
+        nearest = (
+            start[0] + projection * segment_north,
+            start[1] + projection * segment_east,
+        )
+        return math.hypot(point[0] - nearest[0], point[1] - nearest[1])
+
+    def _marker_gps_from_detection(self, obstacle):
+        obstacle_offset = self._obstacle_offset_from_detection(obstacle)
+        if obstacle_offset is None:
+            return None
+        return self._offset_gps(
             self.current_lat,
             self.current_lon,
-            north_m=obstacle_north,
-            east_m=obstacle_east,
+            north_m=obstacle_offset[0],
+            east_m=obstacle_offset[1],
         )
-        pass_east_offset = (
-            CARDINAL_PASS_CLEARANCE_M
-            if pass_side == "east"
-            else -CARDINAL_PASS_CLEARANCE_M
-        )
-        target_gps = self._offset_gps(
+
+    def _build_cardinal_pass_targets(self, marker_gps, pass_side):
+        """Marker çevresinde güvenli giriş ve çıkış hedefleri üretir."""
+        if pass_side not in ("east", "west"):
+            return []
+
+        marker_north, marker_east = self._gps_offset_m(
+            self.current_lat,
+            self.current_lon,
             marker_gps["lat"],
             marker_gps["lon"],
-            north_m=0.0,
-            east_m=pass_east_offset,
         )
-        target_gps.update({
-            "side": pass_side,
-            "marker_lat": marker_gps["lat"],
-            "marker_lon": marker_gps["lon"],
-        })
-        return target_gps
+        start_relative = (-marker_north, -marker_east)
+        start_distance = math.hypot(*start_relative)
+        if start_distance + 1e-6 < CARDINAL_MIN_ROUTE_CLEARANCE_M:
+            return []
+
+        side_sign = 1.0 if pass_side == "east" else -1.0
+        preferred_sign = 1.0 if start_relative[0] >= 0.0 else -1.0
+        if abs(start_relative[0]) < 0.5 and self.current_heading is not None:
+            heading_north = math.cos(math.radians(float(self.current_heading)))
+            if abs(heading_north) >= 0.1:
+                preferred_sign = -1.0 if heading_north > 0.0 else 1.0
+
+        candidates = []
+        search_step = 1.0
+        search_count = int(CARDINAL_ENTRY_SEARCH_LIMIT_M / search_step)
+        for index in range(int(CARDINAL_PASS_CLEARANCE_M), search_count + 1):
+            magnitude = index * search_step
+            for north_sign in (preferred_sign, -preferred_sign):
+                entry_relative = (
+                    north_sign * magnitude,
+                    side_sign * CARDINAL_PASS_CLEARANCE_M,
+                )
+                route_clearance = self._point_to_segment_distance(
+                    (0.0, 0.0),
+                    start_relative,
+                    entry_relative,
+                )
+                if route_clearance + 1e-6 < CARDINAL_MIN_ROUTE_CLEARANCE_M:
+                    continue
+
+                route_length = math.hypot(
+                    entry_relative[0] - start_relative[0],
+                    entry_relative[1] - start_relative[1],
+                )
+                direction_penalty = 0.0 if north_sign == preferred_sign else 2.0
+                candidates.append((
+                    route_length + direction_penalty + magnitude * 0.05,
+                    entry_relative,
+                    route_clearance,
+                ))
+
+        if not candidates:
+            return []
+
+        _, entry_relative, route_clearance = min(candidates, key=lambda item: item[0])
+        exit_relative = (
+            0.0,
+            side_sign * (CARDINAL_PASS_CLEARANCE_M + CARDINAL_EXIT_LEAD_M),
+        )
+
+        targets = []
+        for phase, offset in (("entry", entry_relative), ("exit", exit_relative)):
+            target = self._offset_gps(
+                marker_gps["lat"],
+                marker_gps["lon"],
+                north_m=offset[0],
+                east_m=offset[1],
+            )
+            target.update({
+                "phase": phase,
+                "side": pass_side,
+                "marker_lat": marker_gps["lat"],
+                "marker_lon": marker_gps["lon"],
+                "route_clearance_m": route_clearance,
+            })
+            targets.append(target)
+        return targets
+
+    def _create_cardinal_pass_targets(self, obstacle):
+        """Detection'dan iki aşamalı cardinal geçiş rotası üretir."""
+        pass_side = CARDINAL_PASS_SIDES.get(obstacle.get("class"))
+        marker_gps = self._marker_gps_from_detection(obstacle)
+        if pass_side is None or marker_gps is None:
+            return []
+        return self._build_cardinal_pass_targets(marker_gps, pass_side)
+
+    def _create_cardinal_pass_target(self, obstacle):
+        """Eski tek-hedef API'si için güvenli giriş hedefini döndürür."""
+        targets = self._create_cardinal_pass_targets(obstacle)
+        return targets[0] if targets else None
 
     def _matching_avoidance_obstacle(self, detections):
         """Aktif kaçınma sınıfından hâlâ yakın görünen objeyi döndürür."""
@@ -392,19 +654,80 @@ class Task1Maneuvering:
             return None
 
         candidates = []
-        for obj in detections:
+        for obj in self._valid_relevant_obstacles(detections):
             if obj.get("class") != self.avoiding_class:
                 continue
-            try:
-                distance_m = float(obj.get("distance"))
-            except (TypeError, ValueError):
+            track_id = obj.get("track_id")
+            if (
+                    self.avoiding_track_id is not None
+                    and track_id is not None
+                    and str(track_id) != self.avoiding_track_id
+            ):
                 continue
-            if 0 < distance_m < AVOID_EXIT_DIST_M:
-                candidates.append((distance_m, obj))
+            candidates.append((obj["distance"], obj))
 
         if not candidates:
             return None
         return min(candidates, key=lambda item: item[0])[1]
+
+    def _conflicting_close_obstacle(self, detections):
+        """Aktif hedeften farklı ve acil mesafedeki engeli döndürür."""
+        for obstacle in self._valid_relevant_obstacles(detections):
+            if obstacle["distance"] > AVOID_CONFLICT_DIST_M:
+                continue
+            if obstacle.get("class") != self.avoiding_class:
+                return obstacle
+            track_id = obstacle.get("track_id")
+            if (
+                    self.avoiding_track_id is not None
+                    and track_id is not None
+                    and str(track_id) != self.avoiding_track_id
+            ):
+                return obstacle
+        return None
+
+    def _update_filtered_obstacle(self, obstacle, initialize=False):
+        """Açı ve mesafedeki tek-frame sıçramalarını üstel ortalamayla azaltır."""
+        if obstacle is None:
+            return
+
+        distance_m = float(obstacle["distance"])
+        angle_deg = self._detection_angle_deg(obstacle)
+        if initialize or self.filtered_obstacle_distance is None:
+            self.filtered_obstacle_distance = distance_m
+        else:
+            self.filtered_obstacle_distance = (
+                AVOID_FILTER_ALPHA * distance_m
+                + (1.0 - AVOID_FILTER_ALPHA) * self.filtered_obstacle_distance
+            )
+        if initialize or self.minimum_obstacle_distance is None:
+            self.minimum_obstacle_distance = self.filtered_obstacle_distance
+        else:
+            self.minimum_obstacle_distance = min(
+                self.minimum_obstacle_distance,
+                self.filtered_obstacle_distance,
+            )
+
+        if angle_deg is None:
+            return
+        if initialize or self.filtered_obstacle_angle is None:
+            self.filtered_obstacle_angle = angle_deg
+        else:
+            self.filtered_obstacle_angle = (
+                AVOID_FILTER_ALPHA * angle_deg
+                + (1.0 - AVOID_FILTER_ALPHA) * self.filtered_obstacle_angle
+            )
+
+    def _filtered_obstacle(self):
+        if self.filtered_obstacle_distance is None:
+            return None
+        obstacle = {
+            "class": self.avoiding_class,
+            "distance": self.filtered_obstacle_distance,
+        }
+        if self.filtered_obstacle_angle is not None:
+            obstacle["angle_deg"] = self.filtered_obstacle_angle
+        return obstacle
 
     def _avoid_turn_direction_for_obstacle(self, obstacle):
         """Normal şamandıra veya cardinal GPS fallback manevrasının yönünü seçer."""
@@ -456,26 +779,104 @@ class Task1Maneuvering:
         if angle_deg is None:
             return False
 
+        try:
+            distance_m = float(obstacle.get("distance"))
+        except (TypeError, ValueError):
+            return False
+        if distance_m < AVOID_CLEAR_MIN_DIST_M:
+            return False
+        minimum_distance = self.minimum_obstacle_distance
+        if (
+                minimum_distance is not None
+                and distance_m < minimum_distance + AVOID_RECEDING_MARGIN_M
+        ):
+            return False
+
         if self.avoid_turn_direction > 0:
-            return angle_deg < -AVOID_CLEAR_ANGLE_DEG
+            return angle_deg <= -AVOID_CLEAR_ANGLE_DEG
         if self.avoid_turn_direction < 0:
-            return angle_deg > AVOID_CLEAR_ANGLE_DEG
-        return abs(angle_deg) > AVOID_CLEAR_ANGLE_DEG
+            return angle_deg >= AVOID_CLEAR_ANGLE_DEG
+        return abs(angle_deg) >= AVOID_CLEAR_ANGLE_DEG
 
     def _reset_avoidance_state(self):
         self.avoiding_class = None
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = 0.0
+        self.avoiding_track_id = None
+        self.filtered_obstacle_angle = None
+        self.filtered_obstacle_distance = None
+        self.minimum_obstacle_distance = None
+        self.confirmation_candidate_key = None
+        self.confirmation_candidate_obstacle = None
+        self.confirmation_count = 0
+        self.cardinal_marker_estimate = None
+        self.cardinal_route_marker = None
+        self.cardinal_pass_targets = []
+        self.cardinal_target_index = 0
         self.cardinal_pass_target = None
         self.aligned_target_key = None
         self.state = MissionState.NAVIGATING
 
-    def _update_cardinal_pass(self, now):
+    def _update_cardinal_marker_estimate(self, obstacle):
+        """Yeni detection ile marker konumunu yumuşatır ve gerekirse girişi yeniler."""
+        measurement = self._marker_gps_from_detection(obstacle)
+        if measurement is None:
+            return
+
+        if self.cardinal_marker_estimate is None:
+            self.cardinal_marker_estimate = measurement
+        else:
+            self.cardinal_marker_estimate = {
+                "lat": (
+                    AVOID_FILTER_ALPHA * measurement["lat"]
+                    + (1.0 - AVOID_FILTER_ALPHA) * self.cardinal_marker_estimate["lat"]
+                ),
+                "lon": (
+                    AVOID_FILTER_ALPHA * measurement["lon"]
+                    + (1.0 - AVOID_FILTER_ALPHA) * self.cardinal_marker_estimate["lon"]
+                ),
+            }
+
+        if self.cardinal_target_index != 0 or self.cardinal_route_marker is None:
+            return
+
+        marker_delta = self._gps_offset_m(
+            self.cardinal_route_marker["lat"],
+            self.cardinal_route_marker["lon"],
+            self.cardinal_marker_estimate["lat"],
+            self.cardinal_marker_estimate["lon"],
+        )
+        if math.hypot(*marker_delta) < CARDINAL_REPLAN_THRESHOLD_M:
+            return
+
+        pass_side = CARDINAL_PASS_SIDES[self.avoiding_class]
+        targets = self._build_cardinal_pass_targets(
+            self.cardinal_marker_estimate,
+            pass_side,
+        )
+        if not targets:
+            return
+
+        self.cardinal_pass_targets = targets
+        self.cardinal_pass_target = targets[0]
+        self.cardinal_route_marker = dict(self.cardinal_marker_estimate)
+        self.aligned_target_key = None
+        self.logger.info(
+            f"{pass_side.upper()} cardinal entry replanned after marker update."
+        )
+
+    def _update_cardinal_pass(self, detections, now):
         """Aktif cardinal hedefini mevcut GNSS position akışıyla takip eder."""
         target = self.cardinal_pass_target
         if target is None:
             return False
+
+        active_obstacle = self._matching_avoidance_obstacle(detections)
+        if active_obstacle is not None:
+            self._update_filtered_obstacle(active_obstacle)
+            self._update_cardinal_marker_estimate(active_obstacle)
+            target = self.cardinal_pass_target
 
         elapsed = 0.0 if self.avoid_started_time is None else now - self.avoid_started_time
         if elapsed >= CARDINAL_PASS_TIMEOUT_SEC:
@@ -487,25 +888,95 @@ class Task1Maneuvering:
             stop_vehicle(self.topics.cmd_vel_pub)
             return True
 
-        target_name = f"{target['side'].upper()} cardinal pass"
+        phase = target["phase"]
+        target_name = f"{target['side'].upper()} cardinal {phase}"
         if self._set_position_to_gps_target(
                 target["lat"],
                 target["lon"],
                 target_name,
                 CARDINAL_TARGET_TOLERANCE_M,
         ):
-            self.logger.info(
-                f"{target_name} completed; resuming main GNSS route."
+            if phase == "entry":
+                self.cardinal_target_index = 1
+                self.cardinal_pass_target = self.cardinal_pass_targets[1]
+                self.aligned_target_key = None
+                self.logger.info(
+                    f"{target_name} completed; proceeding to cardinal exit."
+                )
+                return True
+
+            marker = self.cardinal_marker_estimate or {
+                "lat": target["marker_lat"],
+                "lon": target["marker_lon"],
+            }
+            marker_to_vehicle = self._gps_offset_m(
+                marker["lat"],
+                marker["lon"],
+                self.current_lat,
+                self.current_lon,
             )
+            side_sign = 1.0 if target["side"] == "east" else -1.0
+            safe_side_distance = side_sign * marker_to_vehicle[1]
+            marker_distance = math.hypot(*marker_to_vehicle)
+            if (
+                    safe_side_distance
+                    < CARDINAL_PASS_CLEARANCE_M - CARDINAL_TARGET_TOLERANCE_M
+                    or marker_distance < CARDINAL_MIN_ROUTE_CLEARANCE_M
+            ):
+                self._enter_failsafe(
+                    f"{target_name} reached without verified safe clearance! "
+                    "FAILSAFE + HOLD.",
+                    request_hold=True,
+                )
+                stop_vehicle(self.topics.cmd_vel_pub)
+                return True
+
+            self.logger.info(f"{target_name} completed; resuming main GNSS route.")
             self._reset_avoidance_state()
         return True
 
     def _publish_avoidance_maneuver(self):
-        angular_z = self.avoid_turn_direction * AVOID_TURN_Z
+        """Şamandıra açısı ve mesafesine göre hız/dönüş komutunu günceller."""
+        angle_deg = self.filtered_obstacle_angle
+        distance_m = self.filtered_obstacle_distance
+        desired_angle = (
+            -AVOID_DESIRED_SIDE_ANGLE_DEG
+            if self.avoiding_class == RED_BUOY_CLASS
+            else AVOID_DESIRED_SIDE_ANGLE_DEG
+        )
+
+        if angle_deg is None:
+            angular_z = self.avoid_turn_direction * AVOID_MAX_TURN_Z
+            angle_error = AVOID_DESIRED_SIDE_ANGLE_DEG
+        else:
+            angle_error = angle_deg - desired_angle
+            angular_z = max(
+                -AVOID_MAX_TURN_Z,
+                min(AVOID_MAX_TURN_Z, AVOID_TURN_KP * angle_error),
+            )
+
+        if distance_m is None or distance_m <= AVOID_STOP_DIST_M:
+            linear_x = 0.0
+        else:
+            distance_ratio = (
+                (distance_m - AVOID_STOP_DIST_M)
+                / (AVOID_ENTER_DIST_M - AVOID_STOP_DIST_M)
+            )
+            distance_ratio = max(0.0, min(1.0, distance_ratio))
+            linear_x = (
+                AVOID_MIN_LINEAR_X
+                + distance_ratio * (AVOID_MAX_LINEAR_X - AVOID_MIN_LINEAR_X)
+            )
+            steering_factor = max(
+                0.35,
+                1.0 - min(abs(angle_error) / 90.0, 0.65),
+            )
+            linear_x *= steering_factor
+
         self.last_angular_z = angular_z
         publish_cmd_vel(
             self.topics.cmd_vel_pub,
-            linear_x=AVOID_LINEAR_X,
+            linear_x=linear_x,
             angular_z=angular_z
         )
 
@@ -626,7 +1097,17 @@ class Task1Maneuvering:
 
     def _update_active_avoidance(self, detections, now):
         """Aktif kaçınmayı günceller; bu tick tüketildiyse True döndürür."""
-        if self._update_cardinal_pass(now):
+        conflicting = self._conflicting_close_obstacle(detections)
+        if conflicting is not None:
+            self._enter_failsafe(
+                f"Conflicting obstacle {conflicting['class']} at "
+                f"{conflicting['distance']:.1f}m during avoidance! FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            stop_vehicle(self.topics.cmd_vel_pub)
+            return True
+
+        if self._update_cardinal_pass(detections, now):
             return True
 
         elapsed = 0.0
@@ -634,22 +1115,36 @@ class Task1Maneuvering:
             elapsed = now - self.avoid_started_time
 
         active_obstacle = self._matching_avoidance_obstacle(detections)
+        if active_obstacle is not None:
+            self._update_filtered_obstacle(active_obstacle)
         avoidance_done = False
 
         if elapsed >= AVOID_MANEUVER_MAX_SEC:
-            self.logger.info(
-                "Avoidance maneuver max duration reached, returning to main route."
-            )
+            filtered = self._filtered_obstacle()
+            if active_obstacle is not None and not self._is_avoidance_clear(filtered):
+                self._enter_failsafe(
+                    "Avoidance timeout while obstacle is still close! "
+                    "FAILSAFE + HOLD.",
+                    request_hold=True,
+                )
+                stop_vehicle(self.topics.cmd_vel_pub)
+                return True
+            self.logger.info("Avoidance timeout reached after obstacle clearance.")
             avoidance_done = True
         else:
-            clear_enough = (
-                    elapsed >= AVOID_MANEUVER_MIN_SEC
-                    and self._is_avoidance_clear(active_obstacle)
+            filtered = self._filtered_obstacle() if active_obstacle is not None else None
+            clear_enough = elapsed >= AVOID_MANEUVER_MIN_SEC and (
+                active_obstacle is None or self._is_avoidance_clear(filtered)
             )
             if clear_enough:
                 if self.avoid_clear_started_time is None:
                     self.avoid_clear_started_time = now
-                elif (now - self.avoid_clear_started_time) >= AVOID_CLEAR_DURATION_SEC:
+                clear_duration = (
+                    AVOID_LOST_CONFIRM_SEC
+                    if active_obstacle is None
+                    else AVOID_CLEAR_DURATION_SEC
+                )
+                if (now - self.avoid_clear_started_time) >= clear_duration:
                     self.logger.info("Obstacle cleared, returning to main route.")
                     avoidance_done = True
             else:
@@ -666,20 +1161,44 @@ class Task1Maneuvering:
         """Yeni bir engel için mevcut kaçınma davranışını başlatır."""
         self.state = MissionState.AVOIDING
         self.avoiding_class = obstacle["class"]
+        track_id = obstacle.get("track_id")
+        self.avoiding_track_id = None if track_id is None else str(track_id)
         self.avoid_started_time = now
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = self._avoid_turn_direction_for_obstacle(obstacle)
-        self.cardinal_pass_target = self._create_cardinal_pass_target(obstacle)
+        self._update_filtered_obstacle(obstacle, initialize=True)
+        self.cardinal_pass_targets = self._create_cardinal_pass_targets(obstacle)
+        self.cardinal_target_index = 0
+        self.cardinal_pass_target = (
+            self.cardinal_pass_targets[0]
+            if self.cardinal_pass_targets
+            else None
+        )
 
         if self.cardinal_pass_target is not None:
             target = self.cardinal_pass_target
+            self.cardinal_marker_estimate = {
+                "lat": target["marker_lat"],
+                "lon": target["marker_lon"],
+            }
+            self.cardinal_route_marker = dict(self.cardinal_marker_estimate)
             angle_deg = self._detection_angle_deg(obstacle)
+            stop_vehicle(self.topics.cmd_vel_pub)
             self.logger.info(
                 f"{obstacle['class']} ({obstacle['distance']:.1f}m, "
-                f"angle={angle_deg:.1f} deg)! Geographic {target['side']} pass "
-                f"target created at ({target['lat']:.7f}, {target['lon']:.7f}), "
-                f"clearance={CARDINAL_PASS_CLEARANCE_M:.1f}m."
+                f"angle={angle_deg:.1f} deg)! Geographic {target['side']} "
+                f"entry/exit route created; minimum planned clearance="
+                f"{target['route_clearance_m']:.1f}m."
             )
+            return
+
+        if obstacle["class"] in CARDINAL_PASS_SIDES:
+            self._enter_failsafe(
+                f"Safe route could not be created for {obstacle['class']} at "
+                f"{obstacle['distance']:.1f}m! FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            stop_vehicle(self.topics.cmd_vel_pub)
             return
 
         direction_text = self._avoid_direction_text(
@@ -694,7 +1213,7 @@ class Task1Maneuvering:
         )
         self._publish_avoidance_maneuver()
 
-    def update(self, detections):
+    def update(self, detections, detection_frame_token=None):
         """Güvenlik, kaçınma ve waypoint akışlarının ana kontrol döngüsü."""
         if not self._prepare_update():
             return
@@ -711,16 +1230,20 @@ class Task1Maneuvering:
         # ---------------------------------------------------------
         # 1. Engelden kaçınma kontrolü: süre ve detection temizlenme durumu
         # ---------------------------------------------------------
-        nearest = self._nearest_relevant_obstacle(detections)
         now = time.monotonic()
 
         if self.state == MissionState.AVOIDING:
             if self._update_active_avoidance(detections, now):
                 return
 
-        elif nearest is not None and nearest["distance"] <= AVOID_ENTER_DIST_M:
-            self._start_avoidance(nearest, now)
-            return
+        else:
+            confirmed = self._confirmed_nearest_obstacle(
+                detections,
+                frame_token=detection_frame_token,
+            )
+            if confirmed is not None:
+                self._start_avoidance(confirmed, now)
+                return
         # ---------------------------------------------------------
         # 2. WP0 / görev başlangıç kontrolü
         # ---------------------------------------------------------
@@ -775,6 +1298,8 @@ class Task1Node(Node):
 
         self.latest_detections = []
         self.last_detection_time = None
+        self.latest_detection_frame_token = None
+        self.detection_message_sequence = 0
         self.vision_sub = self.create_subscription(
             String,
             '/vision/detections',
@@ -832,6 +1357,13 @@ class Task1Node(Node):
 
         self.latest_detections = detections
         self.last_detection_time = time.monotonic()
+        self.detection_message_sequence += 1
+        payload_frame_id = payload.get("frame_id")
+        self.latest_detection_frame_token = (
+            payload_frame_id
+            if payload_frame_id is not None
+            else ("message", self.detection_message_sequence)
+        )
 
     # Eski vision mesajlarını kullanmamak için güncel detection listesini döndürür.
     def _current_detections(self):
@@ -1114,7 +1646,10 @@ class Task1Node(Node):
         current_detections = self._current_detections()
 
         try:
-            self.task.update(detections=current_detections)
+            self.task.update(
+                detections=current_detections,
+                detection_frame_token=self.latest_detection_frame_token,
+            )
         except Exception as exc:  # noqa: BLE001 - kasıtlı geniş yakalama, failsafe için
             self.get_logger().error(f"Unexpected error in timer_callback: {exc}")
             try:
