@@ -19,7 +19,6 @@ from njord.core.shared_memory_utils import attach_existing_shared_memory
 from njord.vision.detector import BaseYOLODetector
 
 OUTPUT_DIR = "logs"
-DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 # CSV_PATH = os.path.join(OUTPUT_DIR, "imu_log.csv")  # IMU CSV logging is disabled for now.
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
@@ -30,7 +29,6 @@ logger = logging.getLogger("zed_capture")
 
 
 def setup_output_dirs():
-    os.makedirs(DEPTH_DIR, exist_ok=True)
     os.makedirs(VIDEO_DIR, exist_ok=True)
 
 
@@ -224,13 +222,11 @@ def run(
     depth_vision_bgr_buf = np.empty((h, w, 3), dtype=np.uint8)
     dh, dw = h // 2, w // 2
     downsampled_depth_buf = np.empty((dh, dw), dtype=np.float32)
-    downsampled_depth_f16_buf = np.empty((dh, dw), dtype=np.float16)
 
     last_drop_log = 0.0
     last_frame_id = 0
     record_interval_ms = max(1, int(1000 / VIDEO_FPS))
     last_record_time_ms = None
-    last_metric_depth_timestamp_ms = None
 
     try:
         if not rclpy.ok():
@@ -262,8 +258,6 @@ def run(
         run_timestamp = int(time.time())
         video_path = VIDEO_PATH_TEMPLATE.format(ts=run_timestamp)
         depth_video_path = DEPTH_VIDEO_PATH_TEMPLATE.format(ts=run_timestamp)
-        metric_depth_run_dir = os.path.join(DEPTH_DIR, f"run_{run_timestamp}")
-        os.makedirs(metric_depth_run_dir, exist_ok=True)
         writer_thread = threading.Thread(
             target=disk_writer_worker,
             args=(write_queue, video_path, (w, h)),
@@ -313,36 +307,6 @@ def run(
                 depth_buf, (0, 0), dst=downsampled_depth_buf,
                 fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA,
             )
-            metric_depth_recording = (
-                dataset_record_event is None or dataset_record_event.is_set()
-            )
-            if not metric_depth_recording:
-                # Re-anchor sampling to the first frame of the next task run,
-                # just like CaptureDatasetSession does.
-                last_metric_depth_timestamp_ms = None
-            metric_depth_is_due = metric_depth_recording and (
-                last_metric_depth_timestamp_ms is None
-                or timestamp_ms - last_metric_depth_timestamp_ms
-                >= record_interval_ms
-            )
-
-            if metric_depth_is_due:
-                np.copyto(
-                    downsampled_depth_f16_buf,
-                    downsampled_depth_buf,
-                    casting="unsafe",
-                )
-                depth_frame_path = os.path.join(
-                    metric_depth_run_dir,
-                    f"{current_frame_id:08d}_{timestamp_ms}.npy",
-                )
-                np.save(
-                    depth_frame_path,
-                    downsampled_depth_f16_buf,
-                    allow_pickle=False,
-                )
-                last_metric_depth_timestamp_ms = timestamp_ms
-
             now_record_time_ms = int(time.monotonic() * 1000)
             should_record = (
                 last_record_time_ms is None
