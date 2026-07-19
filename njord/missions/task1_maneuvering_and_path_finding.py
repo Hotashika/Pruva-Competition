@@ -34,30 +34,30 @@ WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "njord_task1.waypoints"
 ACTIVE_TASK_NAME = "task1"
 
 # ============================================================
-# SAFETY PARAMS
+# GÜVENLİK PARAMETRELERİ
 # ============================================================
-GPS_TIMEOUT_SEC = 2.0  # Bu sure GPS gelmezse dur ve HOLD moda gecmeyi dene
-HEADING_TIMEOUT_SEC = 2.0  # Bu sure heading gelmezse dur ve HOLD moda gecmeyi dene
-BRIDGE_STATE_TIMEOUT_SEC = 10.0  # /cube/state bu sure gelmezse FAILSAFE + HOLD
-GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
-WAYPOINT_SETTLE_SEC = 0.75  # Her ana GPS noktasinda kesin durus suresi
-WAYPOINT_HEADING_TOLERANCE_DEG = 15.0  # Kucuk heading farklarinda gereksiz salinimi onler
+GPS_TIMEOUT_SEC = 3.0  # Bu süre GPS gelmezse dur ve HOLD moda geçmeyi dene
+HEADING_TIMEOUT_SEC = 3.0  # Bu süre heading gelmezse dur ve HOLD moda geçmeyi dene
+BRIDGE_STATE_TIMEOUT_SEC = 12.0  # /cube/state bu süre gelmezse FAILSAFE + HOLD
+GEOFENCE_RADIUS_M = 100.0  # Başlangıç noktasından izin verilen maksimum uzaklık
+WAYPOINT_SETTLE_SEC = 0.50  # Her ana GPS noktasında kesin duruş süresi
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0  # Küçük heading farklarında gereksiz salınımı önler
 
 AVOID_ENTER_DIST_M = 3.0  # Kaçınma tetiklenme mesafesi
 AVOID_EXIT_DIST_M = 5.0  # Kaçınma için dikkate alınacak maksimum engel mesafesi
 
-AVOID_LINEAR_X = 0.3  # Kacinma manevrasinda ileri hiz
-AVOID_TURN_Z = 0.15  # Kacinma manevrasinda sag/sol donus komutu buyuklugu
+AVOID_LINEAR_X = 0.35  # Kaçınma manevrasında ileri hız
+AVOID_TURN_Z = 0.25  # Kaçınma manevrasında sağ/sol dönüş komutu büyüklüğü
 
-AVOID_MANEUVER_MIN_SEC = 0.5  # Temizlenme kabul edilmeden once minimum manevra suresi
-AVOID_MANEUVER_MAX_SEC = 1.5  # Tek kacinma manevrasinin maksimum suresi
+AVOID_MANEUVER_MIN_SEC = 0.5  # Temizlenme kabul edilmeden önce minimum manevra süresi
+AVOID_MANEUVER_MAX_SEC = 1.5  # Tek kaçınma manevrasının maksimum süresi
 
-AVOID_CLEAR_DURATION_SEC = 0.3  # Obje temiz gorundukten sonra ana rotaya donus bekleme suresi
-AVOID_CLEAR_ANGLE_DEG = 25.0  # Obje bu acinin disina cikinca merkezden temiz kabul edilir
+AVOID_CLEAR_DURATION_SEC = 0.3  # Obje temiz göründükten sonra ana rotaya dönüş bekleme süresi
+AVOID_CLEAR_ANGLE_DEG = 25.0  # Obje bu açının dışına çıkınca merkezden temiz kabul edilir
 
-CARDINAL_PASS_CLEARANCE_M = 4.0  # Cardinal marker'in dogu/bati tarafindaki gecis mesafesi
-CARDINAL_TARGET_TOLERANCE_M = 1.0  # Gecis GPS hedefinin tamamlanma toleransi
-CARDINAL_PASS_TIMEOUT_SEC = 20.0  # Gecis hedefi bu surede alinmazsa FAILSAFE + HOLD
+CARDINAL_PASS_CLEARANCE_M = 4.0  # Cardinal marker'ın doğu/batı tarafındaki geçiş mesafesi
+CARDINAL_TARGET_TOLERANCE_M = 1.0  # Geçiş GPS hedefinin tamamlanma toleransı
+CARDINAL_PASS_TIMEOUT_SEC = 20.0  # Geçiş hedefi bu sürede alınmazsa FAILSAFE + HOLD
 
 VISION_DETECTION_TIMEOUT_SEC = 1.0  # Son vision mesajı bu süreden eskiyse yok say
 EARTH_RADIUS_M = 6378137.0
@@ -90,10 +90,10 @@ class MissionState(Enum):
 
 
 # ============================================================
-# MISSION LOGIC
+# GÖREV MANTIĞI
 # ============================================================
 class Task1Maneuvering:
-    # Gorev durumunu, waypointleri ve guvenlik degiskenlerini hazirlar.
+    # Görev durumunu, waypointleri ve güvenlik değişkenlerini hazırlar.
     def __init__(self, node, mission_topics, mission_clients):
         self.node = node
         self.logger = node.get_logger()
@@ -116,7 +116,7 @@ class Task1Maneuvering:
         self.last_angular_z = 0.0
         self.finished = False
 
-        # --- Güvenlik / state machine alanları ---
+        # Güvenlik ve durum makinesi alanları
         self.state = MissionState.INIT
         self.last_gps_time = None
         self.last_heading_time = None
@@ -126,11 +126,11 @@ class Task1Maneuvering:
         self.last_bridge_state_time = None
         self.home_lat = None
         self.home_lon = None
-        self.avoiding_class = None  # RELEVANT_OBSTACLE_CLASSES icinden biri veya None
+        self.avoiding_class = None  # RELEVANT_OBSTACLE_CLASSES içinden biri veya None
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
-        self.avoid_turn_direction = 0.0  # +1.0 right/starboard, -1.0 left/port
-        self.cardinal_pass_target = None  # Marker'in coğrafi dogu/batisindaki GPS hedefi
+        self.avoid_turn_direction = 0.0  # +1.0 sağ/starboard, -1.0 sol/port
+        self.cardinal_pass_target = None  # Marker'ın coğrafi doğu/batısındaki GPS hedefi
         self.aligned_target_key = None
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
@@ -138,7 +138,7 @@ class Task1Maneuvering:
         self.hold_mode_requested = False
         self.hold_mode_future = None
 
-    # GPS/heading bilgisini gunceller ve ilk konumu home noktasi yapar.
+    # GPS/heading bilgisini günceller ve ilk konumu home noktası yapar.
     def update_gps(self, lat, lon, heading):
         """ROS 2 Node'undan gelen güncel GPS ve yönelim verilerini kaydeder."""
         self.current_lat = lat
@@ -161,9 +161,9 @@ class Task1Maneuvering:
             time.monotonic() if now is None else float(now)
         )
 
-    # GPS veya heading verisi gecikirse gorevi FAILSAFE durumuna alir.
+    # GPS veya heading verisi gecikirse görevi FAILSAFE durumuna alır.
     def _request_hold_mode(self):
-        """FAILSAFE durumunda araci HOLD moda almak icin tek seferlik istek gonderir."""
+        """FAILSAFE durumunda aracı HOLD moda almak için tek seferlik istek gönderir."""
         if self.hold_mode_requested:
             return
 
@@ -176,14 +176,14 @@ class Task1Maneuvering:
             self.hold_mode_future = self.clients.set_mode_client.call_async(req)
             self.hold_mode_future.add_done_callback(self._hold_mode_done)
             self.logger.warn(f"Requesting {HOLD_MODE_NAME} mode due to failsafe.")
-        except Exception as exc:  # noqa: BLE001 - failsafe mod istegi kesinlikle loglanmali
+        except Exception as exc:  # noqa: BLE001 - failsafe mod isteği kesinlikle loglanmalı
             self.logger.error(f"Failed to request {HOLD_MODE_NAME} mode: {exc}")
 
     def _hold_mode_done(self, future):
-        """HOLD mod servis cevabini loglar."""
+        """HOLD mod servis cevabını loglar."""
         try:
             res = future.result()
-        except Exception as exc:  # noqa: BLE001 - ROS future hatasi loglanmali
+        except Exception as exc:  # noqa: BLE001 - ROS future hatası loglanmalı
             self.logger.error(f"{HOLD_MODE_NAME} mode response failed: {exc}")
             return
 
@@ -197,7 +197,7 @@ class Task1Maneuvering:
             )
 
     def _enter_failsafe(self, reason, request_hold=False):
-        """Araci FAILSAFE'e alir; gerekirse HOLD moda gecis istegi yollar."""
+        """Aracı FAILSAFE'e alır; gerekirse HOLD moda geçiş isteği yollar."""
         if self.state != MissionState.FAILSAFE:
             self.logger.error(reason)
 
@@ -272,7 +272,7 @@ class Task1Maneuvering:
 
         return True
 
-    # Arac home merkezli izinli alanin disina cikti mi kontrol eder.
+    # Aracın home merkezli izinli alanın dışına çıkıp çıkmadığını kontrol eder.
     def _check_geofence(self):
         """Home noktasından çok uzaklaşıldıysa FAILSAFE'e geç. True dönerse sınır içinde."""
         if self.home_lat is None or self.current_lat is None:
@@ -293,7 +293,7 @@ class Task1Maneuvering:
 
         return True
 
-    # Kacinma icin dikkate alinacak en yakin samandirayi secer.
+    # Kaçınma için dikkate alınacak en yakın şamandırayı seçer.
     def _nearest_relevant_obstacle(self, detections):
         """Kaçınma menzilindeki en yakın ilgili şamandırayı döndürür (None yoksa)."""
         candidates = [
@@ -306,7 +306,7 @@ class Task1Maneuvering:
             return None
         return min(candidates, key=lambda o: o["distance"])
 
-    # Lokal metre offsetini yaklasik GPS koordinatina donusturur.
+    # Lokal metre offsetini yaklaşık GPS koordinatına dönüştürür.
     @staticmethod
     def _offset_gps(lat, lon, north_m, east_m):
         """Metre cinsinden lokal north/east offset'i yaklaşık GPS koordinatına çevirir."""
@@ -323,7 +323,7 @@ class Task1Maneuvering:
 
     @staticmethod
     def _detection_angle_deg(obstacle):
-        """Detector ciktisindaki aci alanini derece olarak okur."""
+        """Detector çıktısındaki açı alanını derece olarak okur."""
         for key in DETECTION_ANGLE_KEYS:
             value = obstacle.get(key)
             if value is None:
@@ -337,7 +337,7 @@ class Task1Maneuvering:
         return None
 
     def _obstacle_offset_from_detection(self, obstacle):
-        """Aci+mesafe ile samandiranin araca gore north/east offsetini hesaplar."""
+        """Açı ve mesafe ile şamandıranın araca göre north/east offsetini hesaplar."""
         try:
             distance_m = float(obstacle.get("distance"))
         except (TypeError, ValueError):
@@ -347,7 +347,7 @@ class Task1Maneuvering:
         if angle_deg is None or not math.isfinite(distance_m) or distance_m <= 0:
             return None
 
-        # Kamera arac ekseniyle hizali kabul edilir: pozitif aci starboard/right tarafidir.
+        # Kamera araç ekseniyle hizalı kabul edilir: pozitif açı sağ/starboard tarafıdır.
         obstacle_bearing = (self.current_heading + angle_deg) % 360.0
         obstacle_bearing_rad = math.radians(obstacle_bearing)
         obstacle_north = distance_m * math.cos(obstacle_bearing_rad)
@@ -355,7 +355,7 @@ class Task1Maneuvering:
         return obstacle_north, obstacle_east
 
     def _create_cardinal_pass_target(self, obstacle):
-        """Cardinal marker'in istenen coğrafi tarafinda geçici bir GPS hedefi üretir."""
+        """Cardinal marker'ın istenen coğrafi tarafında geçici bir GPS hedefi üretir."""
         pass_side = CARDINAL_PASS_SIDES.get(obstacle.get("class"))
         obstacle_offset = self._obstacle_offset_from_detection(obstacle)
         if pass_side is None or obstacle_offset is None:
@@ -419,15 +419,15 @@ class Task1Maneuvering:
         if pass_side is not None and self.current_heading is not None:
             target_bearing = 90.0 if pass_side == "east" else 270.0
             heading_error = (
-                target_bearing - float(self.current_heading) + 180.0
-            ) % 360.0 - 180.0
+                                    target_bearing - float(self.current_heading) + 180.0
+                            ) % 360.0 - 180.0
             if abs(heading_error) < 1e-6:
                 return 0.0
             return 1.0 if heading_error > 0.0 else -1.0
 
         angle_deg = self._detection_angle_deg(obstacle)
         if angle_deg is not None:
-            # Engel sagdaysa sola, soldaysa saga acil.
+            # Engel sağdaysa sola, soldaysa sağa açıl.
             return -1.0 if angle_deg > 0 else 1.0
 
         return 1.0
@@ -510,7 +510,7 @@ class Task1Maneuvering:
         )
 
     def _begin_waypoint_hold(self, waypoint_name):
-        """Ana GPS noktasinda araci durdurup heading gecisi icin sabitler."""
+        """Ana GPS noktasında aracı durdurup heading geçişi için sabitler."""
         stop_vehicle(self.topics.cmd_vel_pub)
         self.waypoint_hold_until = time.monotonic() + WAYPOINT_SETTLE_SEC
         self.waypoint_hold_name = waypoint_name
@@ -521,7 +521,7 @@ class Task1Maneuvering:
         )
 
     def _waypoint_hold_active(self):
-        """Planli waypoint durusu devam ediyorsa sifir hareket komutu basar."""
+        """Planlı waypoint duruşu devam ediyorsa sıfır hareket komutu yayınlar."""
         if self.waypoint_hold_until is None:
             return False
 
@@ -542,7 +542,7 @@ class Task1Maneuvering:
         )
         return False
 
-    # GPS hedefine MAVLink position target komutu basar.
+    # GPS hedefine MAVLink position target komutu yayınlar.
     def _set_position_to_gps_target(self, target_lat, target_lon, target_name, tolerance_m):
         """Verilen GPS hedefine SET_POSITION_TARGET_GLOBAL_INT ile gider."""
         distance = calculate_gps_distance(
@@ -643,8 +643,8 @@ class Task1Maneuvering:
             avoidance_done = True
         else:
             clear_enough = (
-                elapsed >= AVOID_MANEUVER_MIN_SEC
-                and self._is_avoidance_clear(active_obstacle)
+                    elapsed >= AVOID_MANEUVER_MIN_SEC
+                    and self._is_avoidance_clear(active_obstacle)
             )
             if clear_enough:
                 if self.avoid_clear_started_time is None:
@@ -709,7 +709,7 @@ class Task1Maneuvering:
         )
 
         # ---------------------------------------------------------
-        # 1. ENGELLERDEN KAÇINMA KONTROLÜ (süre + detection temizlenme state'i)
+        # 1. Engelden kaçınma kontrolü: süre ve detection temizlenme durumu
         # ---------------------------------------------------------
         nearest = self._nearest_relevant_obstacle(detections)
         now = time.monotonic()
@@ -722,7 +722,7 @@ class Task1Maneuvering:
             self._start_avoidance(nearest, now)
             return
         # ---------------------------------------------------------
-        # 2. WP0 / MISSION BAŞLANGIÇ KONTROLÜ
+        # 2. WP0 / görev başlangıç kontrolü
         # ---------------------------------------------------------
         if self.state == MissionState.INIT:
             if self.current_target_index == 0 and distance < (self.waypoint_tolerance + 2.0):
@@ -733,13 +733,13 @@ class Task1Maneuvering:
                 return
             else:
                 # Henüz start noktasında değiliz; WP0'a doğru ilerlemeye devam et,
-                # ama mission'ı NAVIGATING'e geçirmeden (WP0'ı atlamadan).
+                # ama görevi NAVIGATING'e geçirmeden (WP0'ı atlamadan).
                 pass
 
         self.state = MissionState.NAVIGATING if self.state == MissionState.INIT else self.state
 
         # ---------------------------------------------------------
-        # 3. MESAFE VE HEDEF KONTROLÜ
+        # 3. Mesafe ve hedef kontrolü
         # ---------------------------------------------------------
         if self._set_position_to_gps_target(
                 target_lat,
@@ -756,16 +756,16 @@ class Task1Maneuvering:
 # ROS 2 NODE (GÖREV YÖNETİCİSİ)
 # ============================================================
 class Task1Node(Node):
-    # ROS node'unu, servisleri, topicleri ve periyodik kontrol timer'ini kurar.
+    # ROS node'unu, servisleri, topicleri ve periyodik kontrol timer'ını kurar.
     def __init__(self):
         super().__init__('task1_mission_node')
         self.get_logger().info("Task 1 (Maneuvering) Node Starting...")
 
-        # 1. Servis İstemcilerini (Clients) Oluştur ve Bekle
+        # Servis istemcilerini oluştur ve hazır olmalarını bekle.
         self.mission_clients = create_mission_clients(self)
         wait_for_mission_services(self, self.mission_clients)
 
-        # 2. Topic Aboneliklerini (Subscribers/Publishers) Oluştur
+        # Topic aboneliklerini ve yayıncılarını oluştur.
         self.mission_topics = create_mission_topics(
             self,
             gps_callback=self.gps_callback,
@@ -787,10 +787,10 @@ class Task1Node(Node):
             10
         )
 
-        # 3. Görev Sınıfını Başlat
+        # Görev sınıfını başlat.
         self.task = Task1Maneuvering(self, self.mission_topics, self.mission_clients)
 
-        # Anlık Yönelim Değişkeni (GPS Callback'e aktarmak için)
+        # Anlık yönelim değişkeni; GPS callback'e aktarılır.
         self.current_heading = None
         self.bridge_connected = False
         self.bridge_armed = False
@@ -800,18 +800,18 @@ class Task1Node(Node):
         self.valid_gps_received = False
         self.valid_heading_received = False
 
-        # 4. Ana Kontrol Döngüsünü Başlat (Saniyede 10 kez çalışır: 0.1 sn)
+        # Ana kontrol döngüsünü başlat; saniyede 10 kez çalışır.
         self.control_timer = self.create_timer(0.1, self.timer_callback)
         self.active_task_timer = self.create_timer(1.0, self.publish_active_task)
         self.publish_active_task()
 
-    # Vision node'a aktif gorevin task1 oldugunu bildirir.
+    # Vision node'a aktif görevin task1 olduğunu bildirir.
     def publish_active_task(self):
         msg = String()
         msg.data = ACTIVE_TASK_NAME
         self.active_task_pub.publish(msg)
 
-    # Vision detection JSON mesajlarini saklar.
+    # Vision detection JSON mesajlarını saklar.
     def vision_callback(self, msg):
         try:
             payload = json.loads(msg.data)
@@ -833,7 +833,7 @@ class Task1Node(Node):
         self.latest_detections = detections
         self.last_detection_time = time.monotonic()
 
-    # Eski vision mesajlarini kullanmamak icin guncel detection listesini dondurur.
+    # Eski vision mesajlarını kullanmamak için güncel detection listesini döndürür.
     def _current_detections(self):
         if self.last_detection_time is None:
             return []
@@ -843,7 +843,7 @@ class Task1Node(Node):
 
         return self.latest_detections
 
-    # GPS mesajlarini dogrular ve gorev mantigina aktarir.
+    # GPS mesajlarını doğrular ve görev mantığına aktarır.
     def gps_callback(self, msg):
         """Araçtan gelen NavSatFix verisini dinler."""
         if abs(msg.latitude) < MIN_VALID_ABS_COORD and abs(msg.longitude) < MIN_VALID_ABS_COORD:
@@ -856,7 +856,7 @@ class Task1Node(Node):
         self.valid_gps_received = True
         self.task.update_gps(msg.latitude, msg.longitude, self.current_heading)
 
-    # Heading mesajini saklar ve watchdog zamanini tazeler.
+    # Heading mesajını saklar ve watchdog zamanını tazeler.
     def heading_callback(self, msg):
         """Araçtan gelen Float32 yön verisini dinler."""
         try:
@@ -876,7 +876,7 @@ class Task1Node(Node):
         self.task.current_heading = self.current_heading
         self.task.last_heading_time = time.monotonic()
 
-    # Bridge durumundan MAVLink baglantisinin hazir olup olmadigini izler.
+    # Bridge durumundan MAVLink bağlantısının hazır olup olmadığını izler.
     def state_callback(self, msg):
         """Bridge durumunu ayrıştırır, değişiklikleri loglar ve göreve aktarır."""
         state = parse_bridge_state(msg.data)
@@ -911,16 +911,16 @@ class Task1Node(Node):
             self.bridge_mode,
         )
 
-    # Mission baslamadan once bridge heartbeat bilgisini bekler.
+    # Mission başlamadan önce bridge heartbeat bilgisini bekler.
     def wait_for_bridge_connection(self, timeout_sec=30.0):
-        """Bridge servisleri hazir olsa bile MAVLink heartbeat gelene kadar bekler."""
+        """Bridge servisleri hazır olsa bile MAVLink heartbeat gelene kadar bekler."""
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and time.monotonic() < deadline:
             now = time.monotonic()
             state_fresh = (
-                self.task.last_bridge_state_time is not None
-                and now - self.task.last_bridge_state_time
-                <= BRIDGE_STATE_TIMEOUT_SEC
+                    self.task.last_bridge_state_time is not None
+                    and now - self.task.last_bridge_state_time
+                    <= BRIDGE_STATE_TIMEOUT_SEC
             )
             if self.bridge_connected and state_fresh:
                 return True
@@ -933,19 +933,19 @@ class Task1Node(Node):
 
         return False
 
-    # ARM oncesi sifir olmayan gecerli GPS konumu bekler.
+    # ARM öncesi sıfır olmayan geçerli GPS konumu bekler.
     def wait_for_valid_navigation_data(self, timeout_sec=30.0):
-        """Mission ARM olmadan once gercek GPS ve heading verisini bekler."""
+        """Mission ARM olmadan önce gerçek GPS ve heading verisini bekler."""
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and time.monotonic() < deadline:
             now = time.monotonic()
             gps_fresh = (
-                self.task.last_gps_time is not None
-                and now - self.task.last_gps_time <= GPS_TIMEOUT_SEC
+                    self.task.last_gps_time is not None
+                    and now - self.task.last_gps_time <= GPS_TIMEOUT_SEC
             )
             heading_fresh = (
-                self.task.last_heading_time is not None
-                and now - self.task.last_heading_time <= HEADING_TIMEOUT_SEC
+                    self.task.last_heading_time is not None
+                    and now - self.task.last_heading_time <= HEADING_TIMEOUT_SEC
             )
             if (
                     self.valid_gps_received
@@ -990,14 +990,14 @@ class Task1Node(Node):
         while rclpy.ok() and time.monotonic() < deadline:
             now = time.monotonic()
             state_fresh = (
-                self.task.last_bridge_state_time is not None
-                and now - self.task.last_bridge_state_time
-                <= BRIDGE_STATE_TIMEOUT_SEC
+                    self.task.last_bridge_state_time is not None
+                    and now - self.task.last_bridge_state_time
+                    <= BRIDGE_STATE_TIMEOUT_SEC
             )
             mode_ok = expected_mode is None or self.bridge_mode == expected_mode
             armed_ok = (
-                expected_armed is None
-                or self.bridge_armed == bool(expected_armed)
+                    expected_armed is None
+                    or self.bridge_armed == bool(expected_armed)
             )
             if self.bridge_connected and state_fresh and mode_ok and armed_ok:
                 self.get_logger().info(
@@ -1023,22 +1023,22 @@ class Task1Node(Node):
         while rclpy.ok() and time.monotonic() < deadline:
             now = time.monotonic()
             gps_fresh = (
-                self.task.last_gps_time is not None
-                and now - self.task.last_gps_time <= GPS_TIMEOUT_SEC
+                    self.task.last_gps_time is not None
+                    and now - self.task.last_gps_time <= GPS_TIMEOUT_SEC
             )
             heading_fresh = (
-                self.task.last_heading_time is not None
-                and now - self.task.last_heading_time <= HEADING_TIMEOUT_SEC
+                    self.task.last_heading_time is not None
+                    and now - self.task.last_heading_time <= HEADING_TIMEOUT_SEC
             )
             state_fresh = (
-                self.task.last_bridge_state_time is not None
-                and now - self.task.last_bridge_state_time
-                <= BRIDGE_STATE_TIMEOUT_SEC
+                    self.task.last_bridge_state_time is not None
+                    and now - self.task.last_bridge_state_time
+                    <= BRIDGE_STATE_TIMEOUT_SEC
             )
             vision_fresh = (
-                self.last_detection_time is not None
-                and now - self.last_detection_time
-                <= VISION_DETECTION_TIMEOUT_SEC
+                    self.last_detection_time is not None
+                    and now - self.last_detection_time
+                    <= VISION_DETECTION_TIMEOUT_SEC
             )
             if (
                     self.bridge_connected
@@ -1066,7 +1066,7 @@ class Task1Node(Node):
         return False
 
     def wait_for_vision(self, timeout_sec=30.0):
-        """ARM oncesi vision node'dan en az bir guncel frame mesaji bekler."""
+        """ARM öncesi vision node'dan en az bir güncel frame mesajı bekler."""
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and time.monotonic() < deadline:
             if (
@@ -1084,7 +1084,7 @@ class Task1Node(Node):
 
         return False
 
-    # Timer tick'lerinde aktif gorevi calistirir ve hatada araci durdurur.
+    # Timer tick'lerinde aktif görevi çalıştırır ve hatada aracı durdurur.
     def timer_callback(self):
         """Görev mantığını sürekli tetikler.
 
@@ -1093,7 +1093,7 @@ class Task1Node(Node):
         donmuş halde sürüklenmeye devam eder. Bu yüzden her tick try/except
         ile korunuyor ve hata durumunda araç durduruluyor.
         """
-        # Vision cache guncel degilse bos liste doner; eski detection ile manevra yapilmaz.
+        # Vision cache güncel değilse boş liste döner; eski detection ile manevra yapılmaz.
         if not self.mission_active:
             return
 
@@ -1127,7 +1127,7 @@ class Task1Node(Node):
 # ============================================================
 # ANA ÇALIŞTIRMA BLOĞU
 # ============================================================
-# ROS 2 node yasam dongusunu baslatir, araci hazirlar ve spin'e girer.
+# ROS 2 node yaşam döngüsünü başlatır, aracı hazırlar ve spin'e girer.
 # noinspection D
 def main(args=None):
     rclpy.init(args=args)
