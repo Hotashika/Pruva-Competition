@@ -83,7 +83,12 @@ class CarpmaGorevi:
     def _process_frame(self,detections,frame_id,now):
         if frame_id is None or frame_id==self.last_processed_frame_id: return
         self.last_processed_frame_id=frame_id; target=self._select_target(detections)
-        if target is None: return
+        if target is None:
+            # Onay kareleri arka arkaya olmalı; aradaki gerçek bir kaçırma
+            # önceki aday dizisini geçersiz kılar.
+            if self.state==CarpmaState.CAMERA_CONFIRM:
+                self.confirm_frame_ids.clear(); self.confirm_distances.clear(); self.confirm_angles.clear()
+            return
         self.latest_target=target; self.last_seen_time=now
         if self.state==CarpmaState.CAMERA_CONFIRM:
             self.confirm_frame_ids.add(frame_id); self.confirm_distances.append(float(target['distance'])); self.confirm_angles.append(float(target['Buoy angle: ']))
@@ -97,7 +102,10 @@ class CarpmaGorevi:
         if not(distance_ok and angle_ok): self._miss('5 kamera karesi tutarlı değil'); return
         self.state=CarpmaState.STRIKING; self.strike_start_time=now
         self.strike_start_lat,self.strike_start_lon=self.current_lat,self.current_lon
-        self.accel_baseline.clear(); self.spike_count=0
+        # CAMERA_CONFIRM boyunca gerçek IMU baseline'ı zaten toplandı.
+        # Temas sürüşü başlarken bunu silmek, ilk saniyelerde fiziksel
+        # teması algılayamamaya neden olurdu.
+        self.spike_count=0
         self.logger.info('[ÇARPMA] Kamera doğrulandı; sınırlı fiziksel temas sürüşü başladı.')
 
     def _register_hit(self,delta):

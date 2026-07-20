@@ -52,7 +52,7 @@ print("UTILS FILE =", utils.__file__)
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Int32, String
 from sensor_msgs.msg import Imu
 
 from utils.mavlink_utilities import (
@@ -461,11 +461,12 @@ class Task3Node(Node):
         self.active_task_pub = self.create_publisher(String, '/mission/active_task', 10)
         self.active_task_timer = self.create_timer(1.0, self._publish_active_task)
 
-        # Komut sistemi entegrasyonu: node açık kalır; /mission_command üzerinden
-        # task3:start gelmeden ARM/hareket yoktur. task3:stop güvenli durdurur.
-        self.mission_command_sub = self.create_subscription(
-            String, '/mission_command', self.mission_command_callback, 10
+        # Bridge gerçek Pixhawk MIS_START parametresini Int32 /mission_start
+        # mesajına çevirir. Farklı isim/türde ikinci bir sahte komut kanalı yoktur.
+        self.mission_start_sub = self.create_subscription(
+            Int32, '/mission_start', self.mission_start_callback, 10
         )
+        self.mission_start_ack_pub = self.create_publisher(Int32, '/mission_start_ack', 10)
 
         self.task = Task3KamikazeEngagement(
             self,
@@ -487,7 +488,7 @@ class Task3Node(Node):
         if self.test_mode:
             self.status_timer = self.create_timer(5.0, self.status_callback)
 
-        self.get_logger().info("✅ Task 3 hazır. /mission_command üzerinden task3:start bekleniyor...")
+        self.get_logger().info("✅ Task 3 hazır. Pixhawk/bridge /mission_start=3 komutu bekleniyor...")
 
     # --------------------------------------------------------
     def _publish_active_task(self):
@@ -509,13 +510,24 @@ class Task3Node(Node):
             return False, "FORCE ARM başarısız."
         return self.task.start_mission()
 
-    def mission_command_callback(self, msg):
-        command = msg.data.strip().lower()
-        if command in ("task3:start", "start_task3", "task3_start", "start"):
+    def _ack_mission_command(self, command):
+        ack = Int32()
+        ack.data = int(command)
+        self.mission_start_ack_pub.publish(ack)
+
+    def mission_start_callback(self, msg):
+        command = int(msg.data)
+        if command == 3:
+            if self.task.mission_enabled:
+                self._ack_mission_command(command)
+                return
             ok, text = self._arm_and_start()
             (self.get_logger().info if ok else self.get_logger().error)(f"[KOMUT SİSTEMİ] {text}")
-        elif command in ("task3:stop", "stop_task3", "task3_stop", "stop"):
-            self.task.stop_mission()
+            if ok:
+                self._ack_mission_command(command)
+        elif command in (90, 99):
+            self.task.stop_mission("Pixhawk/bridge durdurma komutu")
+            self._ack_mission_command(command)
 
     # --------------------------------------------------------
     def gps_callback(self, msg):
@@ -632,46 +644,12 @@ class Task3Node(Node):
         )
 
 def main(args=None):
-    """Node başlatılır, araç GUIDED moda alınır ve FORCE ARM edilir."""
+    """Node pasif başlar; yalnızca gerçek /mission_start=3 komutu ARM eder."""
     rclpy.init(args=args)
     node = None
 
     try:
         node = Task3Node()
-
-        node.get_logger().info("=" * 60)
-        node.get_logger().info(f"Aracı {DRIVE_MODE} moduna alınıyor...")
-
-        mode_ok = call_set_mode(
-            node,
-            node.mission_clients.set_mode_client,
-            DRIVE_MODE,
-        )
-
-        if mode_ok is False:
-            node.get_logger().error(
-                "Mod geçişi başarısız. Görev başlatılamadı."
-            )
-            return
-
-        node.get_logger().info("Mod geçişi başarılı.")
-
-        node.get_logger().info("Motorlar FORCE ARM ediliyor...")
-
-        arm_ok = call_trigger_service(
-            node,
-            node.mission_clients.force_arm_client,
-            "FORCE ARM",
-        )
-
-        if arm_ok is False:
-            node.get_logger().error(
-                "FORCE ARM başarısız. Görev başlatılamadı."
-            )
-            return
-
-        node.get_logger().info("FORCE ARM başarılı.")
-        node.get_logger().info("Task 3 görevi başlıyor.")
 
         rclpy.spin(node)
 

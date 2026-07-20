@@ -231,7 +231,7 @@ if __name__ == "__main__":
         # Mission once kapanir; SIGINT handler'i bridge hâlâ ayaktayken araci
         # durdurup DISARM eder. Ardindan vision, en son bridge kapatilir.
         subprocesses = (
-            ("TEKNOFEST Mission 1 Node", p_teknofest_task1, 7.0),
+            ("TEKNOFEST Mission 3 Node", p_teknofest_task3, 7.0),
             ("Vision Node", p_vision, 3.0),
             ("Bridge Node", p_bridge, 5.0),
         )

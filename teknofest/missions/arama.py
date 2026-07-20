@@ -20,12 +20,7 @@ import time
 from collections import deque
 from enum import Enum, auto
 
-from utils.mavlink_utilities import (
-    calculate_gps_distance,
-    publish_cmd_vel,
-    publish_set_position,
-    stop_vehicle,
-)
+from utils.mavlink_utilities import publish_cmd_vel, stop_vehicle
 
 SEARCH_STEP_DEG = 20.0
 STEP_HOLD_SEC = 5.0
@@ -35,24 +30,16 @@ TURN_LINEAR_X = 0.0  # Fark itkili (skid-steer) tekne yerinde döner; ileri hız
 MAX_YAW_OFFSET_RAD = 0.18
 TURN_MAX_RETRIES = 3
 FULL_SCAN_STEPS = 18
-SEARCH_CONFIRM_FRAMES = 3
-SEARCH_CONFIRM_WINDOW_SEC = 1.5
+SEARCH_CONFIRM_FRAMES = 5
+SEARCH_CONFIRM_WINDOW_SEC = 5.0
 MAX_CONFIRM_ANGLE_SPREAD_DEG = 18.0
 MAX_CONFIRM_DISTANCE_RATIO = 0.45
 SEARCH_MAX_TRACK_ANGLE_JUMP_DEG = 30.0
 SEARCH_MAX_TRACK_DISTANCE_RATIO = 0.60
-RELOCATION_DISTANCE_M = 10.0
-RELOCATION_TOLERANCE_M = 2.5
-RELOCATION_TIMEOUT_SEC = 30.0
-RELOCATION_MAX_RETRIES = 3
-GOLDEN_ANGLE_DEG = 137.5
-
-
 class SearchState(Enum):
     START_STEP = auto()
     TURNING = auto()
     HOLDING = auto()
-    RELOCATING = auto()
     TARGET_FOUND = auto()
     FAILED = auto()
 
@@ -72,10 +59,6 @@ class AramaGorevi:
         self.home_lat = self.home_lon = None
         self.step_target_heading = self.step_start_time = self.hold_until = None
         self.completed_steps = 0
-        self.station_index = 0
-        self.relocation_target = None
-        self.relocation_start_time = None
-        self.relocation_retry_count = 0
         self.turn_retry_count = 0
         self.last_processed_frame_id = None
         self.confirmations = deque(maxlen=SEARCH_CONFIRM_FRAMES)
@@ -145,7 +128,7 @@ class AramaGorevi:
         self.finished = True
         self.state = SearchState.TARGET_FOUND
         stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-        self.logger.info("[ARAMA] Hedef 3 farklı kamera karesinde doğrulandı; yaklaşmaya geçiliyor.")
+        self.logger.info("[ARAMA] Hedef 5 farklı kamera karesinde doğrulandı; yaklaşmaya geçiliyor.")
         return True
 
     def _start_turn(self, now):
@@ -184,69 +167,33 @@ class AramaGorevi:
         yaw_offset = max(-MAX_YAW_OFFSET_RAD, min(MAX_YAW_OFFSET_RAD, math.radians(error_deg)))
         publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=TURN_LINEAR_X, angular_z=yaw_offset)
 
-    @staticmethod
-    def _project_gps(lat, lon, bearing_deg, distance_m):
-        radius = 6378137.0
-        lat1, lon1, bearing = map(math.radians, (lat, lon, bearing_deg))
-        angular_distance = distance_m / radius
-        lat2 = math.asin(math.sin(lat1) * math.cos(angular_distance) + math.cos(lat1) * math.sin(angular_distance) * math.cos(bearing))
-        lon2 = lon1 + math.atan2(math.sin(bearing) * math.sin(angular_distance) * math.cos(lat1), math.cos(angular_distance) - math.sin(lat1) * math.sin(lat2))
-        return math.degrees(lat2), math.degrees(lon2)
-
-    def _start_relocation(self, now):
-        self.station_index += 1
-        bearing = (self.station_index * GOLDEN_ANGLE_DEG) % 360.0
-        distance = RELOCATION_DISTANCE_M * math.sqrt(self.station_index)
-        self.relocation_target = self._project_gps(self.home_lat, self.home_lon, bearing, distance)
-        self.relocation_start_time = now
-        self.relocation_retry_count = 0
-        self.state = SearchState.RELOCATING
-
-    def _relocate(self, now):
-        if None in (self.current_lat, self.current_lon) or self.relocation_target is None:
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            return
-        remaining = calculate_gps_distance(self.current_lat, self.current_lon, *self.relocation_target)
-        if remaining <= RELOCATION_TOLERANCE_M:
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            self.completed_steps = 0
-            self.turn_retry_count = 0
-            self.relocation_target = None
-            self.state = SearchState.START_STEP
-            self.logger.info("[ARAMA] Yeni arama noktasına gerçek GPS ile ulaşıldı.")
-            return
-        if now - self.relocation_start_time > RELOCATION_TIMEOUT_SEC:
-            self.relocation_retry_count += 1
-            if self.relocation_retry_count > RELOCATION_MAX_RETRIES:
-                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-                self.failed = True
-                self.state = SearchState.FAILED
-                self.logger.error("[ARAMA] Yeni noktaya ulaşılamadı; arama güvenli biçimde durduruldu.")
-                return
-            self.relocation_start_time = now
-            self.logger.warning(f"[ARAMA] Konumlanma zaman aşımı; tekrar {self.relocation_retry_count}/{RELOCATION_MAX_RETRIES}.")
-        publish_set_position(self.topics.set_position_pub, *self.relocation_target)
-
     def update(self, detections, frame_id=None):
         if self.finished or self.failed:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return self.finished
         now = time.monotonic()
-        if self._process_camera_frame(detections, frame_id, now):
+        # Dönüş sırasındaki bulanık/değişken kareler hedef onayına
+        # katılmaz. Kamera yalnızca motor komutu sıfırken, 5 saniyelik
+        # sabit bakış penceresinde değerlendirilir.
+        if self.state == SearchState.HOLDING and self._process_camera_frame(detections, frame_id, now):
             return True
         if None in (self.current_heading_deg, self.current_lat, self.current_lon):
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return False
         if self.state == SearchState.START_STEP:
-            self._start_relocation(now) if self.completed_steps >= FULL_SCAN_STEPS else self._start_turn(now)
+            # 360 derece tamamlanınca aynı gerçek konumda yeni bir 360 derece
+            # tarama turuna başla. Konum/tespit verisi uydurulmaz ve GPS hedefi
+            # üretilmez; her bakış açısında en fazla 5 saniye kalınır.
+            if self.completed_steps >= FULL_SCAN_STEPS:
+                self.completed_steps = 0
+                self.logger.info("[ARAMA] 360° tarama tamamlandı; yeni tarama turu başlıyor.")
+            self._start_turn(now)
         elif self.state == SearchState.TURNING:
             self._turn(now)
         elif self.state == SearchState.HOLDING:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             if now >= self.hold_until:
                 self.state = SearchState.START_STEP
-        elif self.state == SearchState.RELOCATING:
-            self._relocate(now)
         return False
 
     def reset_search(self):
@@ -256,8 +203,6 @@ class AramaGorevi:
         self.found_target = None
         self.completed_steps = 0
         self.step_target_heading = self.step_start_time = self.hold_until = None
-        self.relocation_target = self.relocation_start_time = None
-        self.relocation_retry_count = 0
         self.turn_retry_count = 0
         self.last_processed_frame_id = None
         self.confirmations.clear()
