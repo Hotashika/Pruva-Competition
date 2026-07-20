@@ -1,4 +1,3 @@
-import argparse
 import os
 import queue
 import shlex
@@ -18,40 +17,6 @@ if COMPETITION_ROOT not in sys.path:
 from teknofest.core import capture_proc
 from teknofest.core import data_writer
 from teknofest.servers import data_server
-from utils import waypoint_server
-
-
-MISSION_SPECS = {
-    "competition": ("Full Competition", "competition_mission.py"),
-    "task1": ("Mission 1", "task1_point_tracking.py"),
-    "task2": ("Mission 2", "task2_point_tracking_task_in_an_environment_with_obstacle.py"),
-    "task3": ("Mission 3", "task3_kamikaze_engagement.py"),
-}
-
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Start the selected TEKNOFEST mission.")
-    task_group = parser.add_mutually_exclusive_group(required=True)
-    task_group.add_argument(
-        "--competition",
-        dest="task",
-        action="store_const",
-        const="competition",
-        help="Run Missions 1, 2 and 3 continuously using GN transitions.",
-    )
-    for task_number in range(1, 4):
-        task_group.add_argument(
-            f"--task-{task_number}",
-            f"--task{task_number}",
-            dest="task",
-            action="store_const",
-            const=f"task{task_number}",
-            help=(
-                f"Start TEKNOFEST Mission {task_number} with its dedicated "
-                f"teknofest_task{task_number}.waypoints route where applicable."
-            ),
-        )
-    return parser.parse_args(argv)
 
 
 def launch_child_process(command):
@@ -151,9 +116,6 @@ def start_capture_process():
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    mission_name, mission_filename = MISSION_SPECS[args.task]
-
     fx = None
     cx = None
     capture_process = None
@@ -162,12 +124,12 @@ if __name__ == "__main__":
     frame_ready_event = None
     p_bridge = None
     p_vision = None
-    p_teknofest_mission = None
+    p_teknofest_task1 = None
+    p_teknofest_task2 = None
+    p_teknofest_task3 = None
 
     try:
         run_startup_cleanup()
-        threading.Thread(target=waypoint_server.start, args=(8000,), daemon=True).start()
-        print("[SYSTEM] Waypoint upload -> http://0.0.0.0:8000/api/mission/upload_txt")
 
         (
             capture_process,
@@ -202,7 +164,13 @@ if __name__ == "__main__":
 
         vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
 
-        mission_path = os.path.join(PROJECT_ROOT, "missions", mission_filename)
+        ################################################################################################################
+        # SETUP TEKNOFEST MISSION PATHS
+        ################################################################################################################
+        teknofest_task1_path = os.path.join(PROJECT_ROOT, "missions", "task1_point_tracking.py")
+        teknofest_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_point_tracking_task_in_an_environment_with_obstacle.py")
+        teknofest_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_kamikaze_engagement.py")
+        ################################################################################################################
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
@@ -210,10 +178,22 @@ if __name__ == "__main__":
         cmd_bridge = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
-        cmd_teknofest_mission = (
-            f"{ros2_setup} && {python_path_setup} && "
-            f"{shlex.quote(sys.executable)} {shlex.quote(mission_path)}"
+        ################################################################################################################
+        # SETUP TEKNOFEST MISSION COMMANDS
+        ################################################################################################################
+
+        # cmd_teknofest_task1 = (
+        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task1_path)}"
+        # )
+
+        # cmd_teknofest_task2 = (
+        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task2_path)}"
+        # )
+
+        cmd_teknofest_task3 = (
+            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task3_path)}"
         )
+        ################################################################################################################
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
@@ -223,11 +203,18 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        p_teknofest_mission = launch_child_process(cmd_teknofest_mission)
-        print(
-            f" -> TEKNOFEST {mission_name} Node launched "
-            f"(PID: {p_teknofest_mission.pid})\n"
-        )
+        ################################################################################################################
+        #   TEKNOFEST MISSION START CMD
+        ################################################################################################################
+        # p_teknofest_task1 = launch_child_process(cmd_teknofest_task1)
+        # print(f" -> TEKNOFEST Mission 1 Node launched (PID: {p_teknofest_task1.pid})\n")
+
+        # p_teknofest_task2 = launch_child_process(cmd_teknofest_task2)
+        # print(f" -> TEKNOFEST Mission 2 Node launched (PID: {p_teknofest_task2.pid})\n")
+
+        p_teknofest_task3 = launch_child_process(cmd_teknofest_task3)
+        print(f" -> TEKNOFEST Mission 3 Node launched (PID: {p_teknofest_task3.pid})\n")
+        ################################################################################################################
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
@@ -244,7 +231,7 @@ if __name__ == "__main__":
         # Mission once kapanir; SIGINT handler'i bridge hâlâ ayaktayken araci
         # durdurup DISARM eder. Ardindan vision, en son bridge kapatilir.
         subprocesses = (
-            (f"TEKNOFEST {mission_name} Node", p_teknofest_mission, 7.0),
+            ("TEKNOFEST Mission 1 Node", p_teknofest_task1, 7.0),
             ("Vision Node", p_vision, 3.0),
             ("Bridge Node", p_bridge, 5.0),
         )
