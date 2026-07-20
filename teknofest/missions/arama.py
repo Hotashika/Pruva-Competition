@@ -207,6 +207,7 @@ class AramaGorevi:
         self.last_processed_frame_id = None
         self.confirmations.clear()
 
+
     def should_fail(self):
         return self.failed
 

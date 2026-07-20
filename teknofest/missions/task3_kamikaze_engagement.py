@@ -661,6 +661,7 @@ def main(args=None):
         if node is not None:
             node.get_logger().error(f"Beklenmeyen hata: {exc}")
 
+
     finally:
         if node is not None:
             try:

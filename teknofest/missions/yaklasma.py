@@ -221,6 +221,7 @@ class YaklasmaGorevi:
         node, topics, target, distance = self.node, self.topics, self.target_class, self.impact_entry_distance
         self.__init__(node, topics, target, safe_stop_distance=distance)
 
+
     def get_status(self):
         return {
             "state": self.state.name,

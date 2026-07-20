@@ -253,4 +253,5 @@ if __name__ == "__main__":
                 capture_process.join(timeout=2)
             print("[SYSTEM] ZED capture process closed.")
 
+
         print("[SYSTEM] The entire system was safely stopped.")

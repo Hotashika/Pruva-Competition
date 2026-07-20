@@ -155,6 +155,7 @@ class CarpmaGorevi:
         self.state=CarpmaState.MISSED; self.finished=True; self.success=False
         self.logger.warning(f'[ÇARPMA] {reason}; aramaya dönülecek.')
 
+
     def update(self,detections,frame_id=None):
         now=time.monotonic(); self._process_frame(detections,frame_id,now)
         if self.state in (CarpmaState.COMPLETE,CarpmaState.MISSED):
