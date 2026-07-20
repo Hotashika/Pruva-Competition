@@ -131,6 +131,39 @@ def test_buoy_target_uses_vehicle_relative_pass_side(
         * math.sin(math.radians(lateral_angle)),
         abs=0.01,
     )
+    assert task1_module.BUOY_PASS_CLEARANCE_M == 2.5
+
+
+@pytest.mark.parametrize(
+    ("obstacle_class", "expected_east_m"),
+    (
+        ("east_buoys", 2.5),
+        ("west_buoys", -2.5),
+    ),
+)
+def test_cardinal_target_uses_2_5_meter_clearance(
+        task1_module,
+        obstacle_class,
+        expected_east_m,
+):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+
+    target = mission._create_cardinal_pass_target({
+        "class": obstacle_class,
+        "distance": 3.0,
+        "angle_deg": 0.0,
+    })
+
+    north_m, east_m = _gps_offset_m(
+        task1_module,
+        target["marker_lat"],
+        target["marker_lon"],
+        target["lat"],
+        target["lon"],
+    )
+    assert north_m == pytest.approx(0.0, abs=0.01)
+    assert east_m == pytest.approx(expected_east_m, abs=0.01)
+    assert task1_module.CARDINAL_PASS_CLEARANCE_M == 2.5
 
 
 @pytest.mark.parametrize("obstacle_class", ("red_buoys", "green_buoys"))
@@ -138,9 +171,7 @@ def test_buoy_avoidance_follows_generated_gps_target(task1_module, obstacle_clas
     mission = _mission_without_ros(task1_module, heading=0.0)
     mission.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
     mission.topics = types.SimpleNamespace(cmd_vel_pub=object())
-    velocity_commands = []
     gps_targets = []
-    mission._publish_avoidance_maneuver = lambda: velocity_commands.append(True)
     mission._set_position_to_gps_target = (
         lambda lat, lon, name, tolerance: gps_targets.append(
             (lat, lon, name, tolerance)
@@ -156,7 +187,6 @@ def test_buoy_avoidance_follows_generated_gps_target(task1_module, obstacle_clas
     initial_target = mission.cardinal_pass_target
     assert initial_target["pass_type"] == "buoy"
     assert initial_target["reference_heading"] == 0.0
-    assert velocity_commands == []
 
     mission.current_heading = 30.0
     assert mission._update_active_avoidance([{
@@ -176,3 +206,49 @@ def test_buoy_avoidance_follows_generated_gps_target(task1_module, obstacle_clas
     )
     assert gps_targets[0][2].endswith("buoy pass")
     assert gps_targets[0][3] == task1_module.CARDINAL_TARGET_TOLERANCE_M
+
+
+def test_buoy_avoidance_finishes_only_when_temporary_target_is_reached(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+    mission.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    mission.state = task1_module.MissionState.AVOIDING
+    mission.avoiding_class = "red_buoys"
+    mission.avoid_started_time = 10.0
+    mission.cardinal_pass_target = mission._create_buoy_pass_target({
+        "class": "red_buoys",
+        "distance": 2.0,
+        "angle_deg": 0.0,
+    })
+    reached = {"value": False}
+    mission._set_position_to_gps_target = (
+        lambda *args, **kwargs: reached["value"]
+    )
+
+    assert mission._update_active_avoidance([], now=11.0)
+    assert mission.state is task1_module.MissionState.AVOIDING
+
+    reached["value"] = True
+    assert mission._update_active_avoidance([], now=12.0)
+    assert mission.state is task1_module.MissionState.NAVIGATING
+    assert mission.cardinal_pass_target is None
+
+
+def test_missing_detection_angle_fails_safe_without_direct_maneuver(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+    mission.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    mission.topics = types.SimpleNamespace(cmd_vel_pub=object())
+    failsafe_requests = []
+
+    def enter_failsafe(reason, request_hold=False):
+        failsafe_requests.append((reason, request_hold))
+        mission.state = task1_module.MissionState.FAILSAFE
+
+    mission._enter_failsafe = enter_failsafe
+    mission._start_avoidance({
+        "class": "red_buoys",
+        "distance": 2.0,
+    }, now=10.0)
+
+    assert mission.state is task1_module.MissionState.FAILSAFE
+    assert mission.cardinal_pass_target is None
+    assert failsafe_requests[0][1] is True

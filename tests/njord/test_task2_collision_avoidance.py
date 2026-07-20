@@ -193,6 +193,20 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             record_observation=record,
         )
 
+    @staticmethod
+    def _target_clearance_m(target):
+        mean_lat = math.radians((target["marker_lat"] + target["lat"]) / 2.0)
+        north_m = (
+            math.radians(target["lat"] - target["marker_lat"])
+            * task2.EARTH_RADIUS_M
+        )
+        east_m = (
+            math.radians(target["lon"] - target["marker_lon"])
+            * task2.EARTH_RADIUS_M
+            * math.cos(mean_lat)
+        )
+        return math.hypot(north_m, east_m)
+
     def test_task2_waypoint_loader_discards_qgc_home(self):
         waypoints = task2.load_task2_waypoints("unused.waypoints")
         self.assertEqual([1], [waypoint["seq"] for waypoint in waypoints])
@@ -215,15 +229,26 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self._update(7.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
-        self.assertNotIn(("cmd_vel", 0.5, -0.6), self.topics.cmd_vel_pub.messages)
+        self.assertIsNone(self.mission.avoidance_target)
 
-    def test_head_on_collision_risk_always_commands_starboard(self):
+    def test_head_on_collision_risk_creates_starboard_gps_target(self):
         self._update(6.0, 0.0, 10.0)
         self._update(5.0, 0.0, 10.3)
         self._update(4.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        self.assertEqual(("cmd_vel", 0.5, -0.6), self.topics.cmd_vel_pub.messages[-1])
+        target = self.mission.avoidance_target
+        self.assertIsNotNone(target)
+        self.assertEqual("starboard", target["side"])
+        self.assertAlmostEqual(
+            task2.AVOID_PASS_CLEARANCE_M,
+            self._target_clearance_m(target),
+            places=3,
+        )
+        self.assertEqual(
+            ("set_position", target["lat"], target["lon"], 20.0),
+            self.topics.position_target_pub.messages[-1],
+        )
 
     def test_closing_buoy_is_used_as_collision_target(self):
         for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
@@ -235,7 +260,13 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             )
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        self.assertEqual(("cmd_vel", 0.5, -0.6), self.topics.cmd_vel_pub.messages[-1])
+        target = self.mission.avoidance_target
+        self.assertIsNotNone(target)
+        self.assertAlmostEqual(
+            task2.AVOID_PASS_CLEARANCE_M,
+            self._target_clearance_m(target),
+            places=3,
+        )
 
     def test_current_buoy_model_classes_are_collision_targets(self):
         expected_classes = {
@@ -263,31 +294,42 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             )
         )
 
-    def test_port_side_risk_stands_on_then_uses_starboard_fallback(self):
+    def test_port_side_risk_stands_on_then_uses_starboard_gps_target(self):
         self._update(5.0, -25.0, 10.0)
         self._update(4.7, -25.0, 10.3)
         self._update(4.4, -25.0, 10.6)
 
         self.assertEqual(task2.MissionState.STAND_ON, self.mission.state)
-        self.assertNotIn(("cmd_vel", 0.5, -0.6), self.topics.cmd_vel_pub.messages)
+        self.assertIsNone(self.mission.avoidance_target)
 
         self._update(4.4, -25.0, 13.2, record=False)
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        self.assertEqual(("cmd_vel", 0.5, -0.6), self.topics.cmd_vel_pub.messages[-1])
+        self.assertEqual("starboard", self.mission.avoidance_target["side"])
+        self.assertTrue(self.topics.position_target_pub.messages)
 
-    def test_avoidance_resumes_same_waypoint_only_after_clear_duration(self):
+    def test_avoidance_resumes_same_waypoint_only_after_temporary_target(self):
         self._update(6.0, 0.0, 10.0)
         self._update(5.0, 0.0, 10.3)
         self._update(4.0, 0.0, 10.6)
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+        target = dict(self.mission.avoidance_target)
 
         self._refresh_sensors(11.5)
         self.mission.update([], now=11.5)
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
 
-        self._refresh_sensors(12.6)
-        self.mission.update([], now=12.6)
+        original_distance = task2.calculate_gps_distance
+        task2.calculate_gps_distance = lambda lat1, lon1, lat2, lon2: (
+            0.0
+            if lat2 == target["lat"] and lon2 == target["lon"]
+            else 100.0
+        )
+        self.addCleanup(setattr, task2, "calculate_gps_distance", original_distance)
+
+        self._refresh_sensors(12.0)
+        self.mission.update([], now=12.0)
         self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
+        self.assertIsNone(self.mission.avoidance_target)
         self.assertEqual(0, self.mission.current_target_index)
 
     def test_next_waypoint_waits_then_aligns_before_position_command(self):
@@ -334,7 +376,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             self.topics.position_target_pub.messages[-1],
         )
 
-    def test_avoidance_forces_realignment_with_current_waypoint(self):
+    def test_avoidance_aligns_with_temporary_target(self):
         self.mission.aligned_target_key = ("WP0", 10.0, 20.0)
 
         self._update(6.0, 0.0, 10.0)
@@ -342,7 +384,10 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self._update(4.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        self.assertIsNone(self.mission.aligned_target_key)
+        self.assertEqual(
+            "starboard avoidance WP",
+            self.mission.aligned_target_key[0],
+        )
 
     def test_estimates_relative_and_true_vessel_speed_and_course(self):
         base_latitude = 1.0

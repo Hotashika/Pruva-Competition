@@ -137,6 +137,7 @@ def test_avoidance_target_is_created_on_opposite_side(task2_module):
         marker,
         mission.avoidance_target,
     ) == pytest.approx(task2_module.AVOID_PASS_CLEARANCE_M, abs=0.01)
+    assert task2_module.AVOID_PASS_CLEARANCE_M == 2.5
 
 
 def test_active_avoidance_target_is_refreshed_from_vision(task2_module):

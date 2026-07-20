@@ -107,7 +107,7 @@ AVOID_ENTER_DIST_M = 3.0
 AVOID_EXIT_DIST_M = 4.0
 
 # Kacinma GPS hedefini sari dubanin sagina/soluna bu kadar metre aciklikla koy.
-AVOID_PASS_CLEARANCE_M = 2.0
+AVOID_PASS_CLEARANCE_M = 2.5
 
 # Vision gurultusunu elemek icin GPS hedefini ancak bu kadar kayarsa yenile.
 AVOID_TARGET_REFRESH_MIN_SHIFT_M = 0.25
