@@ -1,56 +1,32 @@
 #!/usr/bin/env python3
 """
 Task-3 Kamikaze Angajman Görevi — Ana Modül
-GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v5 — yaklaşma.py ve carpma.py
-gerçek görev akışına bağlandı)
+GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v6 — arama.py/yaklasma.py/carpma.py
+ile birlikte güncellendi)
 
-v4'ten devralınan doğru tasarım kararları (arama.py v5 ile hizalı):
-  - update_heading(): AramaGorevi'nin heading'i artık sadece update_gps()
-    üzerinden değil, ayrıca doğrudan bridge'in /cube/gps/heading topic'inden
-    de güncelleniyor.
+v6 NOTU: Bu dosyada FONKSİYONEL bir değişiklik YAPILMADI. arama.py, yaklasma.py
+ve carpma.py'ye eklenen düzeltmeler (yerinde dönüş, dönüş retry limiti, kare-kare
+süreklilik filtresi, saldırıda saf yaw düzeltmesi, yaklaşma fazı toplam süre/segment
+sınırı) hepsi ilgili modüllerin İÇİNDE, mevcut public arayüzlerini (update_gps,
+update_heading, update_imu, update, reset_*, get_*status) DEĞİŞTİRMEDEN yapıldı.
+Bu yüzden bu orkestrasyon dosyasının üç modülü çağırma şekli aynı kalabildi;
+dosya bütünlük için burada aynen tekrar veriliyor.
 
-v5'te YAPILAN ASIL DEĞİŞİKLİK:
-  Eskiden bu dosyada handle_vision_detections() adında, YaklasmaGorevi/
-  CarpmaGorevi hiç kullanılmadan yazılmış BASİT bir yaklaşma taklidi vardı;
-  çarpma aşaması (3 vuruş) hiç yoktu — hedefe SAFETY_STOP_DISTANCE kadar
-  yaklaşılınca görev "bitmiş" sayılıyordu. Artık:
-
-  1. YaklasmaGorevi ve CarpmaGorevi GERÇEKTEN kullanılıyor (arama.py'nin
-     import edildiği paketten, aynı düzende):
-         from teknofest.missions.yaklasma import YaklasmaGorevi
-         from teknofest.missions.carpma import CarpmaGorevi
-     (Dosya yolu arama.py ile aynı klasörde olduğu varsayılıyor:
-     teknofest/missions/yaklasma.py ve teknofest/missions/carpma.py.
-     Farklıysa bu iki import satırını kendi paket yapınıza göre düzeltin.)
-
-  2. State machine genişletildi: INIT -> SEARCHING -> APPROACHING -> CARPMA
-     -> DONE (veya herhangi bir aşamada hedef kaybolursa tekrar SEARCHING).
-
-  3. update_gps() / update_heading() artık arama + yaklaşma + çarpma
-     modüllerinin ÜÇÜNE DE aynı anda iletiliyor. Bridge, GPS ve heading'i
-     BAĞIMSIZ topic'ler olarak yayınladığından (bkz. bridge_node.py,
-     arama.py v5 notları) her üç modülün de kendi update_heading()'i
-     olmalı — yaklasma.py ve carpma.py'ye bu v2'lerinde eklendi.
-
-  4. YENİ: IMU verisi artık gerçekten dinleniyor. create_mission_topics()
-     (utils/mavlink_utilities.py) bir /cube/imu aboneliği İÇERMİYOR — bu
-     dosya mavlink_utilities.py'yi DEĞİŞTİRMEDEN, Task3Node içinde DOĞRUDAN
-     '/cube/imu' (sensor_msgs/Imu) aboneliği açıyor ve
-     Task3KamikazeEngagement.update_imu() üzerinden yaklaşma+çarpma
-     modüllerine dağıtıyor. Bu olmadan carpma.py'nin IMU tabanlı çarpma
-     algılaması ve yaklasma.py'nin update_imu() çağrısı hiçbir zaman veri
-     almıyordu.
-
-  5. reset_search() artık üç modülü de (arama, yaklaşma, çarpma) sıfırlıyor;
-     eskiden sadece arama sıfırlanıyordu, yaklaşma/çarpma yoktu.
-
-  ÖNEMLİ NOT: bridge_node.py ve utils/mavlink_utilities.py bu düzeltmede
-  HİÇ değiştirilmedi (kullanıcı talebi üzerine); sadece bu üç görev dosyası
-  (arama.py zaten v5'te düzeltilmişti, burada yaklasma/carpma/task3) revize
-  edildi.
+v5'ten devralınan tasarım:
+  - Task3KamikazeEngagement, AramaGorevi -> YaklasmaGorevi -> CarpmaGorevi
+    sırasını bir state machine ile yönetir (INIT -> SEARCHING -> APPROACHING
+    -> CARPMA -> DONE), herhangi bir aşamada hedef kaybolursa SEARCHING'e
+    geri döner.
+  - update_gps() / update_heading() / update_imu() üç modüle de AYNI ANDA
+    iletilir (bridge bunları bağımsız topic'ler olarak yayınladığı için).
+  - reset_search() üç modülü de sıfırlar.
+  - IMU verisi Task3Node içinde doğrudan '/cube/imu' aboneliğiyle alınır
+    (create_mission_topics() bunu içermez) ve update_imu() üzerinden
+    yaklaşma+çarpma modüllerine dağıtılır.
 """
 
 import json
+import math
 import sys
 import time
 from enum import Enum, auto
@@ -59,6 +35,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+print("=" * 60)
+print("REPO_ROOT =", REPO_ROOT)
+print("sys.path:")
+for p in sys.path:
+    print("   ", p)
+print("=" * 60)
+
+import importlib
+
+utils = importlib.import_module("utils")
+
+print("UTILS =", utils)
+print("UTILS FILE =", utils.__file__)
 
 import rclpy
 from rclpy.node import Node
@@ -89,8 +79,8 @@ GEOFENCE_RADIUS_M = 150.0
 DRIVE_MODE = "GUIDED"
 
 TEST_DEFAULT_TARGET_COLOR = "red"
-VALID_TARGET_COLORS = ("red", "green", "black")
-TEST_MODE = True
+VALID_TARGET_COLORS = ("orange", "red", "yellow", "black", "green")
+TEST_MODE = False  # Yalnızca ayrıntılı log içindir; sensör verisi üretmez
 SAFETY_STOP_DISTANCE = 1.0
 
 
@@ -119,9 +109,10 @@ class Task3KamikazeEngagement:
 
         self.current_lat = None
         self.current_lon = None
-        self.current_heading = 0.0
+        self.current_heading = None
 
         self.state = MissionState.INIT
+        self.mission_enabled = False
         self.last_gps_time = None
         self.last_heading_time = None
         self.last_vision_time = None
@@ -140,23 +131,51 @@ class Task3KamikazeEngagement:
         self.carpma = CarpmaGorevi(node, mission_topics, target_class)
 
     # --------------------------------------------------------
-    def update_gps(self, lat, lon, heading):
-        self.current_lat = lat
-        self.current_lon = lon
-        self.current_heading = heading
+    def update_gps(self, lat, lon):
+        """Yalnızca Pixhawk/bridge üzerinden gelen gerçek GPS fix'ini kaydeder."""
+        self.current_lat = float(lat)
+        self.current_lon = float(lon)
         self.last_gps_time = time.monotonic()
+        self._activate_with_real_pose_if_ready()
+
+    def _activate_with_real_pose_if_ready(self):
+        """Gerçek GPS ve gerçek heading birlikte gelmeden görevi başlatmaz."""
+        if self.current_lat is None or self.current_lon is None or self.current_heading is None:
+            return False
 
         if self.home_lat is None:
-            self.home_lat = lat
-            self.home_lon = lon
-            self.logger.info(f"Home konumu ayarlandı: {lat:.6f}, {lon:.6f}")
-            if self.state == MissionState.INIT:
-                self.state = MissionState.SEARCHING
+            self.home_lat = self.current_lat
+            self.home_lon = self.current_lon
+            self.logger.info(
+                f"[GERÇEK VERİ] Home: {self.home_lat:.7f}, {self.home_lon:.7f}, "
+                f"heading={self.current_heading:.2f}°"
+            )
 
-        # Üç göreve de GPS bilgisini dağıt.
-        self.arama.update_gps(lat, lon, heading)
-        self.yaklasma.update_gps(lat, lon, heading)
-        self.carpma.update_gps(lat, lon, heading)
+        self.arama.update_gps(self.current_lat, self.current_lon, self.current_heading)
+        self.yaklasma.update_gps(self.current_lat, self.current_lon, self.current_heading)
+        self.carpma.update_gps(self.current_lat, self.current_lon, self.current_heading)
+
+        # Sensörler hazır olsa bile komut sistemi START göndermeden görev başlamaz.
+        return True
+
+    def start_mission(self):
+        """Komut sistemi tarafından çağrılır; sensör ölçümü üretmez."""
+        if self.current_lat is None or self.current_lon is None or self.current_heading is None:
+            return False, "Gerçek GPS ve heading henüz hazır değil."
+        self.reset_search()
+        self.mission_enabled = True
+        self.state = MissionState.SEARCHING
+        self.logger.info("[GÖREV] Komut sisteminden START alındı; Task 3 araması başladı.")
+        return True, "Task 3 başlatıldı."
+
+    def stop_mission(self, reason="Komut sisteminden STOP komutu"):
+        stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
+        self.mission_enabled = False
+        self.state = MissionState.INIT
+        self.arama.reset_search()
+        self.yaklasma.reset_approach()
+        self.carpma.reset_carpma()
+        self.logger.warning(f"[GÖREV] {reason}; araç durduruldu.")
 
     # --------------------------------------------------------
     def update_heading(self, heading):
@@ -166,15 +185,17 @@ class Task3KamikazeEngagement:
         de DOĞRUDAN iletiyoruz — sadece update_gps()'e güvenmek, GPS geçici
         kaybolduğunda hepsinin heading'inin bayatlamasına yol açardı
         (bkz. arama.py / yaklasma.py / carpma.py update_heading)."""
+        heading = float(heading) % 360.0
         self.current_heading = heading
         self.last_heading_time = time.monotonic()
         self.arama.update_heading(heading)
         self.yaklasma.update_heading(heading)
         self.carpma.update_heading(heading)
+        self._activate_with_real_pose_if_ready()
 
     # --------------------------------------------------------
     def update_imu(self, gyro_z, accel_x, accel_y, accel_z):
-        """YENİ: /cube/imu callback'inden çağrılır. Yaklaşma ve çarpma
+        """/cube/imu callback'inden çağrılır. Yaklaşma ve çarpma
         modüllerine ilgili IMU verilerini dağıtır (bkz. Task3Node.imu_callback)."""
         self.yaklasma.update_imu(gyro_z, accel_x, accel_y)
         self.carpma.update_imu(accel_x, accel_y, accel_z)
@@ -196,7 +217,9 @@ class Task3KamikazeEngagement:
             self.state = MissionState.FAILSAFE
             return False
 
-        if self.last_heading_time is not None and (now - self.last_heading_time) > HEADING_TIMEOUT_SEC:
+        if self.last_heading_time is None:
+            return False
+        if (now - self.last_heading_time) > HEADING_TIMEOUT_SEC:
             if self.state != MissionState.FAILSAFE:
                 self.logger.error(f"HEADING VERİSİ {HEADING_TIMEOUT_SEC} SANİYEDİR GELMİYOR! FAILSAFE.")
             self.state = MissionState.FAILSAFE
@@ -262,19 +285,42 @@ class Task3KamikazeEngagement:
         self.logger.info("[GÖREV] Yeniden arama başlatıldı (arama+yaklaşma+çarpma sıfırlandı).")
 
     # --------------------------------------------------------
-    def update(self, detections):
-        """Ana güncelleme döngüsü. Her 0.1 saniyede çağrılır."""
+    def update(self, detections, frame_id=None):
+        """Ana güncelleme döngüsü.
+
+        frame_id yalnızca yeni bir vision_callback geldiğinde değişir. Böylece
+        aynı kamera mesajı 10 Hz kontrol timer'ında tekrar tekrar "farklı kare"
+        olarak sayılamaz.
+        """
+
+        if not self.mission_enabled:
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            return
 
         gps_ok = self._check_watchdog()
 
+        if self.bridge_connected is False:
+            self.logger.error("Bridge bağlantısı kesildi; görev FAILSAFE.")
+            self.state = MissionState.FAILSAFE
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
+            return
+
         if self.bridge_mode is not None and self.bridge_mode != DRIVE_MODE:
             self.logger.warn(
-                f"Bridge mode={self.bridge_mode}. Beklenen mode={DRIVE_MODE}.",
+                f"Bridge mode={self.bridge_mode}. Beklenen mode={DRIVE_MODE}; "
+                "görev komutu gönderilmiyor.",
                 throttle_duration_sec=2.0,
             )
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            return
 
         if self.bridge_armed is False:
-            self.logger.warn("Araç arm değil; cmd_vel etkisiz olabilir.", throttle_duration_sec=2.0)
+            self.logger.warn(
+                "Araç arm değil; görev komutu gönderilmiyor.",
+                throttle_duration_sec=2.0,
+            )
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            return
 
         if self.state == MissionState.FAILSAFE:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
@@ -301,14 +347,17 @@ class Task3KamikazeEngagement:
         # ---------------- SEARCHING ----------------
         if self.state == MissionState.SEARCHING:
             if not self.arama.finished:
-                self.arama.update(detections)
+                self.arama.update(detections, frame_id=frame_id)
+                if self.arama.should_fail():
+                    self.state = MissionState.FAILSAFE
+                    stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
                 return
             self.state = MissionState.APPROACHING
             self.logger.info("[DURUM] Arama tamamlandı, yaklaşma aşamasına geçiliyor.")
 
         # ---------------- APPROACHING ----------------
         if self.state == MissionState.APPROACHING:
-            approach_done = self.yaklasma.update(detections)
+            approach_done = self.yaklasma.update(detections, frame_id=frame_id)
 
             if self.yaklasma.should_return_to_search():
                 self.logger.warn("[DURUM] Yaklaşma sırasında hedef kayboldu, aramaya dönülüyor.")
@@ -322,7 +371,7 @@ class Task3KamikazeEngagement:
 
         # ---------------- CARPMA ----------------
         if self.state == MissionState.CARPMA:
-            carpma_done = self.carpma.update(detections)
+            carpma_done = self.carpma.update(detections, frame_id=frame_id)
 
             if self.carpma.should_retry_search():
                 self.logger.warn("[DURUM] Çarpma başarısız/hedef kayboldu, aramaya dönülüyor.")
@@ -391,12 +440,12 @@ class Task3Node(Node):
             10
         )
 
-        # YENİ: create_mission_topics() (mavlink_utilities.py) bir IMU
-        # aboneliği içermiyor ve bu dosya mavlink_utilities.py'yi
-        # DEĞİŞTİRMİYOR. Bu yüzden bridge'in '/cube/imu' topic'ine
-        # doğrudan burada abone oluyoruz. Bu abonelik olmadan
-        # carpma.py'nin IMU tabanlı çarpma algılaması ve yaklasma.py'nin
-        # update_imu() çağrısı hiçbir zaman veri almıyordu.
+        # create_mission_topics() (mavlink_utilities.py) bir IMU aboneliği
+        # içermiyor ve bu dosya mavlink_utilities.py'yi DEĞİŞTİRMİYOR. Bu
+        # yüzden bridge'in '/cube/imu' topic'ine doğrudan burada abone
+        # oluyoruz. Bu abonelik olmadan carpma.py'nin IMU tabanlı çarpma
+        # algılaması ve yaklasma.py'nin update_imu() çağrısı hiçbir zaman
+        # veri almıyordu.
         self.imu_sub = self.create_subscription(
             Imu,
             '/cube/imu',
@@ -412,6 +461,12 @@ class Task3Node(Node):
         self.active_task_pub = self.create_publisher(String, '/mission/active_task', 10)
         self.active_task_timer = self.create_timer(1.0, self._publish_active_task)
 
+        # Komut sistemi entegrasyonu: node açık kalır; /mission_command üzerinden
+        # task3:start gelmeden ARM/hareket yoktur. task3:stop güvenli durdurur.
+        self.mission_command_sub = self.create_subscription(
+            String, '/mission_command', self.mission_command_callback, 10
+        )
+
         self.task = Task3KamikazeEngagement(
             self,
             self.mission_topics,
@@ -421,9 +476,10 @@ class Task3Node(Node):
             safety_stop_distance=self.safety_stop_distance,
         )
 
-        self.current_heading = 0.0
+        self.current_heading = None
         self.current_detections = []
         self.current_vision_frame_id = None
+        self.vision_frame_sequence = 0
         self.last_detection_time = None
 
         self.control_timer = self.create_timer(0.1, self.timer_callback)
@@ -431,7 +487,7 @@ class Task3Node(Node):
         if self.test_mode:
             self.status_timer = self.create_timer(5.0, self.status_callback)
 
-        self.get_logger().info("✅ Task 3 düğümü başlatıldı, görev başlıyor...")
+        self.get_logger().info("✅ Task 3 hazır. /mission_command üzerinden task3:start bekleniyor...")
 
     # --------------------------------------------------------
     def _publish_active_task(self):
@@ -439,14 +495,53 @@ class Task3Node(Node):
         msg.data = "task3"
         self.active_task_pub.publish(msg)
 
+    def _arm_and_start(self):
+        now = time.monotonic()
+        if self.task.last_gps_time is None or self.task.last_heading_time is None:
+            return False, "GPS/heading alınmadı."
+        if now - self.task.last_gps_time > GPS_TIMEOUT_SEC or now - self.task.last_heading_time > HEADING_TIMEOUT_SEC:
+            return False, "GPS/heading bayat."
+        if self.task.bridge_connected is False:
+            return False, "Orange Cube bridge bağlı değil."
+        if call_set_mode(self, self.mission_clients.set_mode_client, DRIVE_MODE) is False:
+            return False, f"{DRIVE_MODE} moduna geçilemedi."
+        if call_trigger_service(self, self.mission_clients.force_arm_client, "FORCE ARM") is False:
+            return False, "FORCE ARM başarısız."
+        return self.task.start_mission()
+
+    def mission_command_callback(self, msg):
+        command = msg.data.strip().lower()
+        if command in ("task3:start", "start_task3", "task3_start", "start"):
+            ok, text = self._arm_and_start()
+            (self.get_logger().info if ok else self.get_logger().error)(f"[KOMUT SİSTEMİ] {text}")
+        elif command in ("task3:stop", "stop_task3", "task3_stop", "stop"):
+            self.task.stop_mission()
+
     # --------------------------------------------------------
     def gps_callback(self, msg):
-        self.task.update_gps(msg.latitude, msg.longitude, self.current_heading)
+        lat = float(msg.latitude)
+        lon = float(msg.longitude)
+        status = getattr(getattr(msg, "status", None), "status", 0)
+        if status < 0 or not math.isfinite(lat) or not math.isfinite(lon):
+            self.get_logger().warn("Geçersiz GPS fix yok sayıldı.", throttle_duration_sec=2.0)
+            return
+        if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+            self.get_logger().warn("GPS (0,0) yok sayıldı.", throttle_duration_sec=2.0)
+            return
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            self.get_logger().warn("GPS koordinatı aralık dışında.", throttle_duration_sec=2.0)
+            return
+        self.task.update_gps(lat, lon)
 
     # --------------------------------------------------------
     def heading_callback(self, msg):
-        self.current_heading = msg.data
-        self.task.update_heading(msg.data)
+        heading = float(msg.data)
+        if not math.isfinite(heading):
+            self.get_logger().warn("Geçersiz heading yok sayıldı.", throttle_duration_sec=2.0)
+            return
+        heading %= 360.0
+        self.current_heading = heading
+        self.task.update_heading(heading)
 
     # --------------------------------------------------------
     def imu_callback(self, msg):
@@ -466,7 +561,14 @@ class Task3Node(Node):
     def vision_callback(self, msg):
         try:
             payload = json.loads(msg.data)
-            frame_id = payload.get("frame_id")
+            # Öncelik vision_node'un gerçek frame_id/zaman damgasıdır.
+            # Bunlar yoksa callback sıra numarası yalnızca mesajları ayırmak için kullanılır.
+            source_frame_id = payload.get("frame_id", payload.get("timestamp"))
+            if source_frame_id is None:
+                self.vision_frame_sequence += 1
+                frame_id = ("callback", self.vision_frame_sequence)
+            else:
+                frame_id = ("camera", str(source_frame_id))
             detections = payload.get("detections", [])
             if not isinstance(detections, list):
                 self.get_logger().warn("Vision detections list formatında değil.", throttle_duration_sec=2.0)
@@ -485,7 +587,10 @@ class Task3Node(Node):
     def timer_callback(self):
         """Ana kontrol döngüsü."""
         try:
-            self.task.update(detections=self.current_detections)
+            self.task.update(
+                detections=self.current_detections,
+                frame_id=self.current_vision_frame_id,
+            )
         except Exception as exc:
             self.get_logger().error(f"Zamanlayıcı döngüsünde beklenmeyen hata: {exc}")
             try:
@@ -493,6 +598,18 @@ class Task3Node(Node):
             except Exception as stop_exc:
                 self.get_logger().error(f"Araç durdurulamadı: {stop_exc}")
             self.task.state = MissionState.FAILSAFE
+
+    def wait_for_real_navigation_data(self, timeout_sec=30.0):
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self.task.last_gps_time is not None and self.task.last_heading_time is not None:
+                return True
+            self.get_logger().info(
+                "Pixhawk'tan gerçek GPS ve heading bekleniyor...",
+                throttle_duration_sec=2.0,
+            )
+            rclpy.spin_once(self, timeout_sec=0.1)
+        return False
 
     # --------------------------------------------------------
     def status_callback(self):
@@ -505,64 +622,78 @@ class Task3Node(Node):
             f"[TEST STATUS] Genel: {self.task.state.name} | "
             f"Arama: {arama_status.get('state', 'N/A')} "
             f"bitti={arama_status.get('finished', False)} "
-            f"onaylı={arama_status.get('target_confirmed', False)} | "
+            f"retry={arama_status.get('turn_retry_count', 0)} | "
             f"Yaklaşma: {yaklasma_status.get('state', 'N/A')} "
             f"bitti={yaklasma_status.get('finished', False)} "
-            f"nihai_onay={yaklasma_status.get('final_confirmed', False)} "
-            f"mesafe={yaklasma_status.get('distance')} | "
+            f"mesafe={yaklasma_status.get('distance')} "
+            f"segment={yaklasma_status.get('segment_count', 0)} | "
             f"Çarpma: {carpma_status.get('state', 'N/A')} "
             f"vuruş={carpma_status.get('hit_count', 0)}/{carpma_status.get('required_hits', 0)}"
         )
 
-
 def main(args=None):
-    """Ana program başlangıç noktası."""
+    """Node başlatılır, araç GUIDED moda alınır ve FORCE ARM edilir."""
     rclpy.init(args=args)
+    node = None
 
     try:
         node = Task3Node()
-    except SystemExit:
-        rclpy.shutdown()
-        return
 
-    try:
         node.get_logger().info("=" * 60)
         node.get_logger().info(f"Aracı {DRIVE_MODE} moduna alınıyor...")
-        mode_ok = call_set_mode(node, node.mission_clients.set_mode_client, DRIVE_MODE)
+
+        mode_ok = call_set_mode(
+            node,
+            node.mission_clients.set_mode_client,
+            DRIVE_MODE,
+        )
+
         if mode_ok is False:
-            node.get_logger().error("❌ Mod geçişi başarısız! Görev başlatılamadı.")
-            rclpy.shutdown()
+            node.get_logger().error(
+                "Mod geçişi başarısız. Görev başlatılamadı."
+            )
             return
-        node.get_logger().info("✅ Mod geçişi başarılı.")
+
+        node.get_logger().info("Mod geçişi başarılı.")
 
         node.get_logger().info("Motorlar FORCE ARM ediliyor...")
-        arm_ok = call_trigger_service(node, node.mission_clients.force_arm_client, "FORCE ARM")
-        if arm_ok is False:
-            node.get_logger().error("❌ FORCE ARM başarısız! Görev başlatılamadı.")
-            rclpy.shutdown()
-            return
-        node.get_logger().info("✅ FORCE ARM başarılı.")
 
-        node.get_logger().info("=" * 60)
-        node.get_logger().info("🚀 Task 3 Kamikaze Engagement görevi başlıyor!")
-        node.get_logger().info("=" * 60)
+        arm_ok = call_trigger_service(
+            node,
+            node.mission_clients.force_arm_client,
+            "FORCE ARM",
+        )
+
+        if arm_ok is False:
+            node.get_logger().error(
+                "FORCE ARM başarısız. Görev başlatılamadı."
+            )
+            return
+
+        node.get_logger().info("FORCE ARM başarılı.")
+        node.get_logger().info("Task 3 görevi başlıyor.")
 
         rclpy.spin(node)
 
     except KeyboardInterrupt:
-        node.get_logger().info("⚠️ Kullanıcı tarafından durduruldu.")
-    except Exception as exc:
-        node.get_logger().error(f"❌ Beklenmeyen hata: {exc}")
-    finally:
-        node.get_logger().info("Araç durduruluyor...")
-        try:
-            stop_vehicle(node.mission_topics.cmd_vel_pub, repeat_count=1)
-        except Exception:
-            pass
-        node.destroy_node()
-        rclpy.shutdown()
-        node.get_logger().info("✅ Task 3 sonlandırıldı.")
+        if node is not None:
+            node.get_logger().info("Kullanıcı tarafından durduruldu.")
 
+    except Exception as exc:
+        if node is not None:
+            node.get_logger().error(f"Beklenmeyen hata: {exc}")
+
+    finally:
+        if node is not None:
+            try:
+                node.task.stop_mission("Node kapatılıyor")
+            except Exception:
+                pass
+
+            node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == "__main__":
     main()

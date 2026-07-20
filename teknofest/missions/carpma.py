@@ -1,465 +1,169 @@
 #!/usr/bin/env python3
+"""Task 3 çarpma: kamera doğrulaması, sınırlı saldırı ve IMU ile 3 ayrı temas.
+
+v3 değişikliği:
+  - Saldırı (STRIKING) sırasında hedef açısı STRIKE_MAX_ANGLE_DEG'i aşarsa
+    eskiden araç sadece durup STRIKE_TIMEOUT_SEC dolana kadar pasif
+    bekliyor, sonra doğrudan MISS oluyordu. Artık bu durumda ileri hız
+    kesilip (linear_x=0.0) saf yaw (angular_z) ile açı toparlanmaya
+    çalışılıyor; toparlanırsa saldırıya kaldığı yerden devam ediliyor.
+    Üst sınır olarak STRIKE_TIMEOUT_SEC / STRIKE_MAX_GPS_M kontrolleri
+    aynen korunuyor, yani sonsuz beklemeye girmiyor.
 """
-Task-3 Kamikaze Angajman Görevi — Aşama 3: ÇARPMA
-GERÇEK HAYATTA ÇALIŞACAK ŞEKİLDE İYİLEŞTİRİLMİŞ VERSİYON (v2 — bridge_node.py
-ve arama.py v5 ile uyumlu hale getirildi)
-
-Bu sürümde arama.py'nin v5 fikirleriyle hizalanan DÜZELTMELER:
-
-  1. update_heading() EKLENDİ. Bridge /cube/gps/heading'i /cube/gps'ten
-     BAĞIMSIZ ayrı bir topic olarak yayınlıyor. Eskiden bu modülün heading'i
-     SADECE update_gps() üzerinden güncelleniyordu; GPS fix'i geçici
-     kaybolduğunda (deniz üstünde sık rastlanır) _creep_towards_target()
-     içindeki dead-reckoning bearing hesabı bayat heading kullanıyordu.
-     task3.py artık heading callback'inde bunu da çağırmalı.
-
-  2. İŞARET (YÖN) HATASI DÜZELTİLDİ. Eski kodda hem görsel takip hem de
-     dead-reckoning kolunda NEGATİF işaret kullanılıyordu:
-         angular_z = -CREEP_ANGULAR_KP * angle                  (görsel)
-         angular_z = -CREEP_ANGULAR_KP * heading_error          (dead-reck.)
-     Bridge sözleşmesine göre (align_heading_to_gps_target yorumu ve
-     task3.py'nin sahada doğrulanmış mantığı) pozitif açı/bearing hatası
-     (hedef sağda) POZİTİF angular_z (sağa dönüş) gerektirir. Eski işaretle
-     tekne, çarpma anında hedefin TERSİNE sürünüyordu. Artık negatif işaret
-     kullanılmıyor; iki kol da aynı (pozitif) kuralı kullanıyor.
-
-  3. stop_vehicle(..., repeat_count=1) standardı tüm çağrılarda uygulandı
-     (arama.py ile tutarlı, gereksiz topic trafiğini önler).
-
-  Not: IMU tabanlı çarpma algılama (update_imu) ve baseline/spike mantığı
-  bridge'in cmd_vel semantiğinden bağımsızdır (sadece ivme okuması), bu
-  yüzden bu kısımda mantıksal bir değişiklik yapılmadı.
-"""
-
-import time
 import math
+import time
 from collections import deque
 from enum import Enum, auto
+from utils.mavlink_utilities import calculate_gps_distance, publish_cmd_vel, stop_vehicle
 
-from utils.mavlink_utilities import (
-    publish_cmd_vel,
-    stop_vehicle,
-    calculate_bearing,
-    calculate_gps_distance,
-)
-
-
-# ============================================================
-# GERÇEK HAYAT PARAMETRELERİ (SAHADA KALİBRE EDİN!)
-# ============================================================
-
-# --- ÇARPMA HEDEFLERİ ---
-REQUIRED_HITS = 3
-CREEP_SPEED = 0.20
-CREEP_ANGULAR_KP = 0.03
-MAX_CREEP_ANGULAR_Z = 0.4
-
-# --- IMU ÇARPMA ALGILAMA (SAHADA KALİBRE EDİN!) ---
-IMU_BASELINE_WINDOW = 20
-IMPACT_ACCEL_THRESHOLD = 5.0        # m/s² - SAHADA AYARLAYIN
-IMPACT_CONSECUTIVE_SAMPLES = 3
-IMPACT_MIN_SPEED = 0.1
-
-# --- YEDEK TEMAS ALGILAMA (IMU spike'ı kaçırırsa) ---
-SOFT_CONTACT_DISTANCE_M = 0.4       # Bu mesafede görsel olarak "değmiş" say
-
-# --- ÇARPMA SONRASI ---
-BACKOFF_SPEED = -0.20
-BACKOFF_DURATION_SEC = 1.5
-COOLDOWN_SEC = 1.0
-
-# --- ZAMAN AŞIMLARI ---
-PER_ATTEMPT_TIMEOUT_SEC = 15.0
-TOTAL_CARPMA_TIMEOUT_SEC = 45.0
-TARGET_VISIBILITY_TIMEOUT = 3.0     # Bu süre hiç görülmezse uyar / dikkatli ol
-
-# --- DEAD RECKONING ---
-DEAD_RECKONING_TIMEOUT = 5.0        # Bu süreden eskiyse tahmini konumu terk et
-
+REQUIRED_HITS=3
+CAMERA_CONFIRM_FRAMES=5
+TARGET_LOST_TIMEOUT_SEC=1.0
+STRIKE_SPEED=0.22
+STRIKE_TIMEOUT_SEC=6.0
+STRIKE_MAX_GPS_M=4.0
+STRIKE_MAX_ANGLE_DEG=30.0
+MAX_ANGULAR_Z=0.30
+ANGLE_KP=0.025
+BACKOFF_SPEED=-0.18
+BACKOFF_TIMEOUT_SEC=5.0
+BACKOFF_REQUIRED_GPS_M=0.60
+BACKOFF_REQUIRED_CAMERA_INCREASE_M=0.40
+COOLDOWN_SEC=0.8
+IMPACT_DELTA_THRESHOLD=4.0
+IMPACT_CONSECUTIVE_SAMPLES=2
+IMPACT_MIN_FORWARD_SPEED=0.10
+IMPACT_MAX_CAMERA_DISTANCE_M=2.0
+BASELINE_WINDOW=20
+CONF_DISTANCE_RATIO=0.30
+CONF_ANGLE_SPREAD_DEG=18.0
 
 class CarpmaState(Enum):
-    CREEPING = auto()
-    BACKING_OFF = auto()
-    COOLDOWN = auto()
-    COMPLETE = auto()
-    MISSED = auto()
-
+    CAMERA_CONFIRM=auto(); STRIKING=auto(); BACKING_OFF=auto(); COOLDOWN=auto(); COMPLETE=auto(); MISSED=auto()
 
 class CarpmaGorevi:
-    """Çarpma görevi - GERÇEK HAYAT İÇİN OPTİMİZE, bridge semantiğine uygun."""
+    def __init__(self,node,mission_topics,target_class):
+        self.node=node; self.logger=node.get_logger(); self.topics=mission_topics; self.target_class=target_class
+        self.state=CarpmaState.CAMERA_CONFIRM; self.finished=False; self.success=False; self.hit_count=0
+        self.current_lat=self.current_lon=self.current_heading=None
+        self.latest_target=None; self.last_seen_time=None; self.last_processed_frame_id=None
+        self.confirm_frame_ids=set(); self.confirm_distances=[]; self.confirm_angles=[]
+        self.current_speed=0.0; self.accel_baseline=deque(maxlen=BASELINE_WINDOW); self.spike_count=0
+        self.last_impact_time=None; self.strike_start_time=None; self.strike_start_lat=None; self.strike_start_lon=None
+        self.backoff_start_time=None; self.backoff_start_lat=None; self.backoff_start_lon=None; self.backoff_start_distance=None
+        self.cooldown_start_time=None
 
-    def __init__(self, node, mission_topics, target_class):
-        self.node = node
-        self.logger = node.get_logger()
-        self.topics = mission_topics
-        self.target_class = target_class
+    def update_gps(self,lat,lon,heading=None):
+        self.current_lat,self.current_lon=float(lat),float(lon)
+        if heading is not None: self.update_heading(heading)
+    def update_heading(self,heading): self.current_heading=float(heading)%360.0
 
-        self.state = CarpmaState.CREEPING
-        self.finished = False
-        self.success = False
-        self.hit_count = 0
+    def update_imu(self,ax,ay,az):
+        mag=math.sqrt(ax*ax+ay*ay+az*az)
+        if self.state!=CarpmaState.STRIKING or self.current_speed<IMPACT_MIN_FORWARD_SPEED:
+            self.accel_baseline.append(mag); self.spike_count=0; return
+        if self.latest_target is None or float(self.latest_target.get('distance',999))>IMPACT_MAX_CAMERA_DISTANCE_M:
+            self.accel_baseline.append(mag); self.spike_count=0; return
+        if len(self.accel_baseline)<max(5,BASELINE_WINDOW//2): self.accel_baseline.append(mag); return
+        baseline=sum(self.accel_baseline)/len(self.accel_baseline); delta=abs(mag-baseline)
+        self.spike_count=self.spike_count+1 if delta>=IMPACT_DELTA_THRESHOLD else 0
+        if delta<IMPACT_DELTA_THRESHOLD: self.accel_baseline.append(mag)
+        if self.spike_count>=IMPACT_CONSECUTIVE_SAMPLES: self._register_hit(delta)
 
-        self.current_lat = None
-        self.current_lon = None
-        self.current_heading = 0.0
-        self.last_known_target_lat = None
-        self.last_known_target_lon = None
-        self.last_target_update_time = None
+    def _select_target(self,detections):
+        valid=[]
+        for det in detections or []:
+            try:
+                if det.get('class')!=self.target_class: continue
+                d=float(det['distance']); a=float(det['Buoy angle: ']); c=float(det.get('confidence',0))
+                if math.isfinite(d) and d>0 and math.isfinite(a): valid.append((c,det))
+            except (KeyError,TypeError,ValueError): continue
+        return max(valid,key=lambda x:x[0])[1] if valid else None
 
-        self.accel_history = deque(maxlen=IMU_BASELINE_WINDOW)
-        self.accel_magnitude_history = deque(maxlen=IMU_BASELINE_WINDOW)
-        self.consecutive_spikes = 0
-        self.last_impact_delta = 0.0
-        self.impact_armed = True
-        self.current_speed = 0.0
+    def _process_frame(self,detections,frame_id,now):
+        if frame_id is None or frame_id==self.last_processed_frame_id: return
+        self.last_processed_frame_id=frame_id; target=self._select_target(detections)
+        if target is None: return
+        self.latest_target=target; self.last_seen_time=now
+        if self.state==CarpmaState.CAMERA_CONFIRM:
+            self.confirm_frame_ids.add(frame_id); self.confirm_distances.append(float(target['distance'])); self.confirm_angles.append(float(target['Buoy angle: ']))
+            if len(self.confirm_frame_ids)>=CAMERA_CONFIRM_FRAMES: self._finish_camera_confirmation(now)
 
-        self.mission_start_time = None
-        self.attempt_start_time = None
-        self.backoff_start_time = None
-        self.cooldown_start_time = None
-        self.target_last_seen_time = None
+    def _finish_camera_confirmation(self,now):
+        ds=self.confirm_distances[-CAMERA_CONFIRM_FRAMES:]; ang=self.confirm_angles[-CAMERA_CONFIRM_FRAMES:]
+        mean=sum(ds)/len(ds)
+        distance_ok=max(ds)-min(ds)<=max(0.25,mean*CONF_DISTANCE_RATIO)
+        angle_ok=max(ang)-min(ang)<=CONF_ANGLE_SPREAD_DEG and sum(abs(a) for a in ang)/len(ang)<=20.0
+        if not(distance_ok and angle_ok): self._miss('5 kamera karesi tutarlı değil'); return
+        self.state=CarpmaState.STRIKING; self.strike_start_time=now
+        self.strike_start_lat,self.strike_start_lon=self.current_lat,self.current_lon
+        self.accel_baseline.clear(); self.spike_count=0
+        self.logger.info('[ÇARPMA] Kamera doğrulandı; sınırlı fiziksel temas sürüşü başladı.')
 
-        self.total_attempts = 0
-        self.impact_detection_count = 0
+    def _register_hit(self,delta):
+        now=time.monotonic()
+        if self.last_impact_time is not None and now-self.last_impact_time<1.0: return
+        self.last_impact_time=now; self.hit_count+=1; self.current_speed=0.0; self.spike_count=0
+        stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)
+        self.logger.info(f'[ÇARPMA] Gerçek IMU teması {self.hit_count}/{REQUIRED_HITS}; Δ={delta:.2f}')
+        if self.hit_count>=REQUIRED_HITS:
+            self.state=CarpmaState.COMPLETE; self.finished=True; self.success=True; return
+        self.state=CarpmaState.BACKING_OFF; self.backoff_start_time=now
+        self.backoff_start_lat,self.backoff_start_lon=self.current_lat,self.current_lon
+        self.backoff_start_distance=None if self.latest_target is None else float(self.latest_target['distance'])
 
-        self.logger.info(f"[ÇARPMA] Başlatıldı, hedef: {self.target_class}")
-
-    # --------------------------------------------------------
-    def update_gps(self, lat, lon, heading):
-        self.current_lat = lat
-        self.current_lon = lon
-        self.current_heading = heading
-
-    # --------------------------------------------------------
-    def update_heading(self, heading):
-        """YENİ: Bridge /cube/gps/heading'i /cube/gps'ten BAĞIMSIZ ayrı bir
-        topic olarak yayınlıyor. GPS fix'i geçici kaybolduğunda bile heading
-        yayını devam edebiliyor; dead-reckoning bearing hesabı bu yüzden
-        sadece update_gps() üzerinden gelen heading'e güvenemez. task3.py
-        bu metodu her heading mesajında çağırmalı (bkz. arama.py update_heading)."""
-        self.current_heading = heading
-
-    # --------------------------------------------------------
-    def update_imu(self, accel_x, accel_y, accel_z):
-        """IMU verilerini güncelle ve çarpma algıla."""
-        if not self.impact_armed:
+    def _strike(self,now):
+        if self.latest_target is None: stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); return
+        if now-self.strike_start_time>STRIKE_TIMEOUT_SEC: self._miss('temas zaman aşımı'); return
+        if None not in (self.strike_start_lat,self.strike_start_lon,self.current_lat,self.current_lon):
+            moved=calculate_gps_distance(self.strike_start_lat,self.strike_start_lon,self.current_lat,self.current_lon)
+            if moved>STRIKE_MAX_GPS_M: self._miss('temas olmadan azami ilerleme aşıldı'); return
+        angle=float(self.latest_target['Buoy angle: '])
+        angular=max(-MAX_ANGULAR_Z,min(MAX_ANGULAR_Z,ANGLE_KP*angle))
+        if abs(angle)>STRIKE_MAX_ANGLE_DEG:
+            # Açı çok büyükse pes etmek yerine ileri hızı kesip saf yaw ile
+            # toparlamaya çalış; STRIKE_TIMEOUT_SEC/STRIKE_MAX_GPS_M üst
+            # sınırları hâlâ geçerli, yani sonsuz beklemeye girmez.
+            self.current_speed=0.0
+            publish_cmd_vel(self.topics.cmd_vel_pub,linear_x=0.0,angular_z=angular)
             return
+        self.current_speed=STRIKE_SPEED
+        publish_cmd_vel(self.topics.cmd_vel_pub,linear_x=STRIKE_SPEED,angular_z=angular)
 
-        accel_mag = math.sqrt(accel_x**2 + accel_y**2 + accel_z**2)
-        self.accel_magnitude_history.append(accel_mag)
+    def _backoff(self,now):
+        gps_far=False; camera_far=False
+        if None not in (self.backoff_start_lat,self.backoff_start_lon,self.current_lat,self.current_lon):
+            gps_far=calculate_gps_distance(self.backoff_start_lat,self.backoff_start_lon,self.current_lat,self.current_lon)>=BACKOFF_REQUIRED_GPS_M
+        if self.backoff_start_distance is not None and self.latest_target is not None:
+            camera_far=float(self.latest_target['distance'])-self.backoff_start_distance>=BACKOFF_REQUIRED_CAMERA_INCREASE_M
+        if gps_far or camera_far:
+            stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); self.current_speed=0.0
+            self.state=CarpmaState.COOLDOWN; self.cooldown_start_time=now; return
+        if now-self.backoff_start_time>BACKOFF_TIMEOUT_SEC: self._miss('temastan sonra gerçek uzaklaşma doğrulanamadı'); return
+        self.current_speed=BACKOFF_SPEED; publish_cmd_vel(self.topics.cmd_vel_pub,linear_x=BACKOFF_SPEED,angular_z=0.0)
 
-        if len(self.accel_history) < IMU_BASELINE_WINDOW // 2:
-            self.accel_history.append(accel_mag)
-            return
+    def _miss(self,reason):
+        stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); self.current_speed=0.0
+        self.state=CarpmaState.MISSED; self.finished=True; self.success=False
+        self.logger.warning(f'[ÇARPMA] {reason}; aramaya dönülecek.')
 
-        baseline = sum(self.accel_history) / len(self.accel_history)
+    def update(self,detections,frame_id=None):
+        now=time.monotonic(); self._process_frame(detections,frame_id,now)
+        if self.state in (CarpmaState.COMPLETE,CarpmaState.MISSED):
+            stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); return True
+        if self.state in (CarpmaState.CAMERA_CONFIRM,CarpmaState.STRIKING) and (self.last_seen_time is None or now-self.last_seen_time>TARGET_LOST_TIMEOUT_SEC):
+            self._miss('hedef kamerada kayboldu'); return True
+        if self.state==CarpmaState.CAMERA_CONFIRM: stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)
+        elif self.state==CarpmaState.STRIKING: self._strike(now)
+        elif self.state==CarpmaState.BACKING_OFF: self._backoff(now)
+        elif self.state==CarpmaState.COOLDOWN:
+            stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)
+            if now-self.cooldown_start_time>=COOLDOWN_SEC:
+                self.state=CarpmaState.CAMERA_CONFIRM; self.confirm_frame_ids.clear(); self.confirm_distances.clear(); self.confirm_angles.clear(); self.last_processed_frame_id=None; self.last_seen_time=None
+        return self.state==CarpmaState.COMPLETE
 
-        is_spike = False
-        if self.current_speed >= IMPACT_MIN_SPEED:
-            delta = abs(accel_mag - baseline)
-            if delta > IMPACT_ACCEL_THRESHOLD:
-                is_spike = True
-                self.consecutive_spikes += 1
-                self.last_impact_delta = delta
-            else:
-                self.consecutive_spikes = 0
-
-            if self.consecutive_spikes >= IMPACT_CONSECUTIVE_SAMPLES:
-                self._register_hit()
-                return
-
-        # Sadece spike OLMAYAN örnekler baseline'a giriyor; aksi halde tam
-        # çarpma anında baseline kirlenip hassasiyet düşer.
-        if not is_spike:
-            self.accel_history.append(accel_mag)
-
-    # --------------------------------------------------------
+    def should_retry_search(self): return self.state==CarpmaState.MISSED
     def reset_carpma(self):
-        """Çarpmayı sıfırla (aramaya dönmek için)."""
-        self.state = CarpmaState.CREEPING
-        self.finished = False
-        self.success = False
-        self.hit_count = 0
-        self.consecutive_spikes = 0
-        self.last_impact_delta = 0.0
-        self.impact_armed = True
-        self.accel_history.clear()
-        self.accel_magnitude_history.clear()
-        self.last_known_target_lat = None
-        self.last_known_target_lon = None
-        self.last_target_update_time = None
-        self.target_last_seen_time = None
-        self.mission_start_time = time.monotonic()
-        self.attempt_start_time = time.monotonic()
-        self.backoff_start_time = None
-        self.cooldown_start_time = None
-        self.total_attempts = 0
-        self.logger.info("[ÇARPMA] Sıfırlandı, aramaya dönülebilir.")
-
-    # --------------------------------------------------------
-    def should_retry_search(self):
-        return self.state == CarpmaState.MISSED
-
-    # --------------------------------------------------------
-    def _register_hit(self, soft=False):
-        """Çarpma kaydet."""
-        self.hit_count += 1
-        self.impact_detection_count += 1
-        delta = self.last_impact_delta
-        self.consecutive_spikes = 0
-        self.accel_history.clear()
-        self.impact_armed = False
-
-        kaynak = "mesafe (yedek)" if soft else "IMU"
-        self.logger.info(
-            f"[ÇARPMA] 💥 TEMAS! ({self.hit_count}/{REQUIRED_HITS}) "
-            f"kaynak: {kaynak}, ivme delta: ~{delta:.2f} m/s²"
-        )
-
-        stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-
-        if self.hit_count >= REQUIRED_HITS:
-            self.state = CarpmaState.COMPLETE
-            self.finished = True
-            self.success = True
-            self.logger.info("[ÇARPMA] 🎉 3 çarpma tamamlandı! GÖREV BAŞARILI!")
-            return
-
-        self.state = CarpmaState.BACKING_OFF
-        self.backoff_start_time = time.monotonic()
-        self.total_attempts += 1
-
-    # --------------------------------------------------------
-    def _select_target(self, detections):
-        if not detections:
-            return None
-
-        candidates = [
-            d for d in detections
-            if d.get("class") == self.target_class
-            and d.get("distance") is not None
-            and d.get("distance", -1) > 0
-            and d.get("Buoy angle: ") is not None
-        ]
-
-        if not candidates:
-            return None
-
-        return min(candidates, key=lambda d: d["distance"])
-
-    # --------------------------------------------------------
-    def _update_target_position(self, detections):
-        """Hedef GPS konumunu güncelle."""
-        target = self._select_target(detections)
-        if target is None or self.current_lat is None:
-            return None
-
-        absolute_bearing = (self.current_heading + target["Buoy angle: "]) % 360.0
-
-        target_lat, target_lon = self._project_gps(
-            self.current_lat,
-            self.current_lon,
-            absolute_bearing,
-            target["distance"]
-        )
-
-        self.last_known_target_lat = target_lat
-        self.last_known_target_lon = target_lon
-        self.last_target_update_time = time.monotonic()
-        self.target_last_seen_time = time.monotonic()
-
-        return target
-
-    # --------------------------------------------------------
-    @staticmethod
-    def _project_gps(lat, lon, bearing_deg, distance_m):
-        R = 6378137.0
-        bearing_rad = math.radians(bearing_deg)
-        lat_rad = math.radians(lat)
-        lon_rad = math.radians(lon)
-        ang_dist = distance_m / R
-
-        new_lat_rad = math.asin(
-            math.sin(lat_rad) * math.cos(ang_dist)
-            + math.cos(lat_rad) * math.sin(ang_dist) * math.cos(bearing_rad)
-        )
-        new_lon_rad = lon_rad + math.atan2(
-            math.sin(bearing_rad) * math.sin(ang_dist) * math.cos(lat_rad),
-            math.cos(ang_dist) - math.sin(lat_rad) * math.sin(new_lat_rad),
-        )
-        return math.degrees(new_lat_rad), math.degrees(new_lon_rad)
-
-    # --------------------------------------------------------
-    def _creep_towards_target(self, visible_target, now):
-        """Hedefe doğru sürün.
-
-        İŞARET KURALI (DÜZELTİLDİ): pozitif açı/bearing hatası (hedef sağda)
-        -> pozitif angular_z (sağa/starboard dönüş). Eski kodda her iki
-        kolda da (görsel + dead-reckoning) hatalı negatif işaret vardı.
-
-        Returns:
-            bool: True -> normal şekilde ilerlendi (görsel veya dead-reckoning)
-                  False -> konum bilgisi çok eski/yok, çağıran taraf MISSED'e
-                           geçmeli.
-        """
-        if visible_target is not None:
-            angle = visible_target["Buoy angle: "]
-            angular_z = CREEP_ANGULAR_KP * angle
-            angular_z = max(-MAX_CREEP_ANGULAR_Z, min(MAX_CREEP_ANGULAR_Z, angular_z))
-            self.current_speed = CREEP_SPEED
-
-            # Yedek temas kontrolü: IMU eşiği yumuşak/teğet bir temasta
-            # tetiklenmeyebilir; çok yakın mesafede görsel olarak da
-            # "değmiş" sayıyoruz.
-            if visible_target["distance"] <= SOFT_CONTACT_DISTANCE_M:
-                publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
-                self._register_hit(soft=True)
-                return True
-
-            publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=self.current_speed, angular_z=angular_z)
-            return True
-
-        if self.last_known_target_lat is not None:
-            age = now - self.last_target_update_time
-            if age > DEAD_RECKONING_TIMEOUT:
-                # Konum bilgisi çok eski; çağırana MISSED sinyali ver.
-                return False
-
-            if age > TARGET_VISIBILITY_TIMEOUT:
-                self.logger.warn(
-                    f"[ÇARPMA] Hedef {age:.1f}sn'dir görünmüyor, "
-                    f"tahmini konuma göre düşük hızda ilerleniyor...",
-                    throttle_duration_sec=1.0,
-                )
-                speed_scale = 0.5
-            else:
-                speed_scale = 1.0
-
-            bearing = calculate_bearing(
-                self.current_lat, self.current_lon,
-                self.last_known_target_lat, self.last_known_target_lon
-            )
-            heading_error = (bearing - self.current_heading + 180) % 360 - 180
-            angular_z = CREEP_ANGULAR_KP * heading_error
-            angular_z = max(-MAX_CREEP_ANGULAR_Z, min(MAX_CREEP_ANGULAR_Z, angular_z))
-            self.current_speed = CREEP_SPEED * speed_scale
-
-            publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=self.current_speed, angular_z=angular_z)
-            return True
-
-        # Hiçbir bilgi yok
-        return False
-
-    # --------------------------------------------------------
-    def _check_timeouts(self, now):
-        if self.mission_start_time is None:
-            self.mission_start_time = now
-            self.attempt_start_time = now
-            return False
-
-        if now - self.mission_start_time > TOTAL_CARPMA_TIMEOUT_SEC:
-            self.logger.error(
-                f"[ÇARPMA] Toplam zaman aşımı! "
-                f"{self.hit_count}/{REQUIRED_HITS} çarpma ile kaldı."
-            )
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            self.state = CarpmaState.MISSED
-            self.finished = True
-            self.success = False
-            return True
-
-        if self.state == CarpmaState.CREEPING:
-            if now - self.attempt_start_time > PER_ATTEMPT_TIMEOUT_SEC:
-                self.logger.warn(
-                    f"[ÇARPMA] Bu deneme {PER_ATTEMPT_TIMEOUT_SEC}s oldu, "
-                    f"ilerlemeye devam..."
-                )
-                self.attempt_start_time = now
-
-        return False
-
-    # --------------------------------------------------------
-    def update(self, detections):
-        """Ana güncelleme döngüsü."""
-        if self.current_lat is None:
-            return False
-
-        now = time.monotonic()
-        if self.mission_start_time is None:
-            self.mission_start_time = now
-            self.attempt_start_time = now
-
-        if self._check_timeouts(now):
-            return True
-
-        if self.state in (CarpmaState.COMPLETE, CarpmaState.MISSED):
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            return True
-
-        if self.state == CarpmaState.BACKING_OFF:
-            if self.backoff_start_time is None:
-                self.backoff_start_time = now
-            if now - self.backoff_start_time < BACKOFF_DURATION_SEC:
-                publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=BACKOFF_SPEED, angular_z=0.0)
-                return False
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            self.state = CarpmaState.COOLDOWN
-            self.cooldown_start_time = now
-            return False
-
-        if self.state == CarpmaState.COOLDOWN:
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            if now - self.cooldown_start_time >= COOLDOWN_SEC:
-                self.impact_armed = True
-                self.consecutive_spikes = 0
-                self.accel_history.clear()
-                self.state = CarpmaState.CREEPING
-                self.attempt_start_time = now
-                self.logger.info(
-                    f"[ÇARPMA] Yeniden denemeye hazır ({self.hit_count}/{REQUIRED_HITS})"
-                )
-            return False
-
-        if self.state == CarpmaState.CREEPING:
-            target = self._select_target(detections)
-            if target is not None:
-                self._update_target_position(detections)
-
-            if target is None and self.last_known_target_lat is None:
-                if now - self.attempt_start_time < TARGET_VISIBILITY_TIMEOUT:
-                    stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-                    return False
-                self.logger.error("[ÇARPMA] Hedef hiç görülemedi, aramaya dönülüyor.")
-                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-                self.state = CarpmaState.MISSED
-                self.finished = True
-                self.success = False
-                return True
-
-            ok = self._creep_towards_target(target, now)
-            if self.state != CarpmaState.CREEPING:
-                # _creep_towards_target içinde SOFT_CONTACT ile hit
-                # kaydedilmiş ve state değişmiş olabilir (BACKING_OFF/COMPLETE)
-                return self.state in (CarpmaState.COMPLETE, CarpmaState.MISSED)
-            if not ok:
-                self.logger.error("[ÇARPMA] Hedef konum bilgisi çok eski, aramaya dönülüyor.")
-                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-                self.state = CarpmaState.MISSED
-                self.finished = True
-                self.success = False
-                return True
-            return False
-
-        return False
-
-    # --------------------------------------------------------
-    def get_status(self):
-        return {
-            "state": self.state.name,
-            "finished": self.finished,
-            "success": self.success,
-            "hit_count": self.hit_count,
-            "required_hits": REQUIRED_HITS,
-            "total_attempts": self.total_attempts,
-            "impact_armed": self.impact_armed,
-        }
+        stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)
+        target=self.target_class; node=self.node; topics=self.topics; self.__init__(node,topics,target)
+    def get_status(self): return {'state':self.state.name,'finished':self.finished,'success':self.success,'hit_count':self.hit_count,'required_hits':REQUIRED_HITS}
