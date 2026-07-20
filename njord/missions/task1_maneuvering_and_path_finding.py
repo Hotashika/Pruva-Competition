@@ -56,6 +56,8 @@ AVOID_CLEAR_DURATION_SEC = 0.3  # Obje temiz gorundukten sonra ana rotaya donus 
 AVOID_CLEAR_ANGLE_DEG = 25.0  # Obje bu acinin disina cikinca merkezden temiz kabul edilir
 
 CARDINAL_PASS_CLEARANCE_M = 4.0  # Cardinal marker'in dogu/bati tarafindaki gecis mesafesi
+BUOY_PASS_CLEARANCE_M = 2.0  # Kirmizi/yesil samandira gecis acikligi
+BUOY_TARGET_REFRESH_MIN_SHIFT_M = 0.25  # Vision gurultusunde GPS hedefinin titremesini onler
 CARDINAL_TARGET_TOLERANCE_M = 1.0  # Gecis GPS hedefinin tamamlanma toleransi
 CARDINAL_PASS_TIMEOUT_SEC = 20.0  # Gecis hedefi bu surede alinmazsa FAILSAFE + HOLD
 
@@ -71,6 +73,10 @@ WEST_CARDINAL_CLASS = "west_buoys"
 CARDINAL_PASS_SIDES = {
     EAST_CARDINAL_CLASS: "east",
     WEST_CARDINAL_CLASS: "west",
+}
+BUOY_PASS_SIDES = {
+    RED_BUOY_CLASS: "starboard",
+    GREEN_BUOY_CLASS: "port",
 }
 RELEVANT_OBSTACLE_CLASSES = (
     RED_BUOY_CLASS,
@@ -130,7 +136,7 @@ class Task1Maneuvering:
         self.avoid_started_time = None
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = 0.0  # +1.0 right/starboard, -1.0 left/port
-        self.cardinal_pass_target = None  # Marker'in coğrafi dogu/batisindaki GPS hedefi
+        self.cardinal_pass_target = None  # Aktif samandira/cardinal GPS gecis hedefi
         self.aligned_target_key = None
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
@@ -381,10 +387,103 @@ class Task1Maneuvering:
         )
         target_gps.update({
             "side": pass_side,
+            "pass_type": "cardinal",
             "marker_lat": marker_gps["lat"],
             "marker_lon": marker_gps["lon"],
         })
         return target_gps
+
+    def _create_buoy_pass_target(self, obstacle, reference_heading=None):
+        """Kirmizi/yesil samandiranin uygun tarafinda gecici GPS hedefi uretir."""
+        pass_side = BUOY_PASS_SIDES.get(obstacle.get("class"))
+        obstacle_offset = self._obstacle_offset_from_detection(obstacle)
+        if pass_side is None or obstacle_offset is None:
+            return None
+
+        obstacle_north, obstacle_east = obstacle_offset
+        marker_gps = self._offset_gps(
+            self.current_lat,
+            self.current_lon,
+            north_m=obstacle_north,
+            east_m=obstacle_east,
+        )
+
+        # Gecis tarafi ilk tespit anindaki heading'e sabitlenir. Vision hedefi
+        # yenilerken aracin donusu hedefi samandiranin etrafinda dondurmez.
+        if reference_heading is None:
+            reference_heading = float(self.current_heading)
+        lateral_bearing = (
+            float(reference_heading) + (90.0 if pass_side == "starboard" else -90.0)
+        ) % 360.0
+        lateral_bearing_rad = math.radians(lateral_bearing)
+        target_gps = self._offset_gps(
+            marker_gps["lat"],
+            marker_gps["lon"],
+            north_m=BUOY_PASS_CLEARANCE_M * math.cos(lateral_bearing_rad),
+            east_m=BUOY_PASS_CLEARANCE_M * math.sin(lateral_bearing_rad),
+        )
+        target_gps.update({
+            "side": pass_side,
+            "pass_type": "buoy",
+            "reference_heading": float(reference_heading),
+            "marker_lat": marker_gps["lat"],
+            "marker_lon": marker_gps["lon"],
+        })
+        return target_gps
+
+    def _create_obstacle_pass_target(self, obstacle):
+        """Desteklenen samandira veya cardinal icin GPS gecis hedefi uretir."""
+        if obstacle.get("class") in CARDINAL_PASS_SIDES:
+            return self._create_cardinal_pass_target(obstacle)
+        return self._create_buoy_pass_target(obstacle)
+
+    @staticmethod
+    def _pass_clearance_m(target):
+        if target.get("pass_type") == "buoy":
+            return BUOY_PASS_CLEARANCE_M
+        return CARDINAL_PASS_CLEARANCE_M
+
+    @staticmethod
+    def _gps_target_shift_m(old_target, new_target):
+        """Iki yakin GPS hedefi arasindaki yaklasik metre farkini hesaplar."""
+        mean_lat = math.radians((old_target["lat"] + new_target["lat"]) / 2.0)
+        north_m = (
+            math.radians(new_target["lat"] - old_target["lat"])
+            * EARTH_RADIUS_M
+        )
+        east_m = (
+            math.radians(new_target["lon"] - old_target["lon"])
+            * EARTH_RADIUS_M
+            * math.cos(mean_lat)
+        )
+        return math.hypot(north_m, east_m)
+
+    def _refresh_buoy_pass_target(self, detections):
+        """Aktif samandira GPS hedefini her vision guncellemesinde kontrol eder."""
+        target = self.cardinal_pass_target
+        if target is None or target.get("pass_type") != "buoy":
+            return
+
+        obstacle = self._matching_avoidance_obstacle(detections)
+        if obstacle is None:
+            return
+
+        refreshed_target = self._create_buoy_pass_target(
+            obstacle,
+            reference_heading=target["reference_heading"],
+        )
+        if refreshed_target is None:
+            return
+
+        target_shift_m = self._gps_target_shift_m(target, refreshed_target)
+        if target_shift_m < BUOY_TARGET_REFRESH_MIN_SHIFT_M:
+            return
+
+        self.cardinal_pass_target = refreshed_target
+        self.logger.info(
+            f"Buoy GPS pass target refreshed by vision ({target_shift_m:.2f}m shift).",
+            throttle_duration_sec=0.5,
+        )
 
     def _matching_avoidance_obstacle(self, detections):
         """Aktif kaçınma sınıfından hâlâ yakın görünen objeyi döndürür."""
@@ -472,22 +571,23 @@ class Task1Maneuvering:
         self.state = MissionState.NAVIGATING
 
     def _update_cardinal_pass(self, now):
-        """Aktif cardinal hedefini mevcut GNSS position akışıyla takip eder."""
+        """Aktif samandira/cardinal hedefini mevcut GNSS position akisiyla takip eder."""
         target = self.cardinal_pass_target
         if target is None:
             return False
 
         elapsed = 0.0 if self.avoid_started_time is None else now - self.avoid_started_time
+        pass_type = target.get("pass_type", "cardinal")
         if elapsed >= CARDINAL_PASS_TIMEOUT_SEC:
             self._enter_failsafe(
-                f"{target['side'].upper()} CARDINAL PASS TARGET TIMEOUT "
+                f"{target['side'].upper()} {pass_type.upper()} PASS TARGET TIMEOUT "
                 f"({elapsed:.1f}s)! FAILSAFE + HOLD.",
                 request_hold=True,
             )
             stop_vehicle(self.topics.cmd_vel_pub)
             return True
 
-        target_name = f"{target['side'].upper()} cardinal pass"
+        target_name = f"{target['side'].upper()} {pass_type} pass"
         if self._set_position_to_gps_target(
                 target["lat"],
                 target["lon"],
@@ -626,6 +726,7 @@ class Task1Maneuvering:
 
     def _update_active_avoidance(self, detections, now):
         """Aktif kaçınmayı günceller; bu tick tüketildiyse True döndürür."""
+        self._refresh_buoy_pass_target(detections)
         if self._update_cardinal_pass(now):
             return True
 
@@ -669,16 +770,21 @@ class Task1Maneuvering:
         self.avoid_started_time = now
         self.avoid_clear_started_time = None
         self.avoid_turn_direction = self._avoid_turn_direction_for_obstacle(obstacle)
-        self.cardinal_pass_target = self._create_cardinal_pass_target(obstacle)
+        self.cardinal_pass_target = self._create_obstacle_pass_target(obstacle)
 
         if self.cardinal_pass_target is not None:
             target = self.cardinal_pass_target
             angle_deg = self._detection_angle_deg(obstacle)
+            side_reference = (
+                "Geographic" if target["pass_type"] == "cardinal"
+                else "Vehicle-relative"
+            )
             self.logger.info(
                 f"{obstacle['class']} ({obstacle['distance']:.1f}m, "
-                f"angle={angle_deg:.1f} deg)! Geographic {target['side']} pass "
+                f"angle={angle_deg:.1f} deg)! {side_reference} "
+                f"{target['side']} pass "
                 f"target created at ({target['lat']:.7f}, {target['lon']:.7f}), "
-                f"clearance={CARDINAL_PASS_CLEARANCE_M:.1f}m."
+                f"clearance={self._pass_clearance_m(target):.1f}m."
             )
             return
 

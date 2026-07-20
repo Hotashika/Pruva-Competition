@@ -57,9 +57,9 @@ from utils.mavlink_utilities import (
     wait_for_mission_services,
 )
 from utils.read_waypoints import parse_qgc_waypoints
-from teknofest.missions.utils.orange_boundary_guard import (
-    OrangeBoundaryGuard,
-    is_orange_boundary_detection,
+from teknofest.missions.utils.yellow_buoy_course_keeper import (
+    YellowBuoyCourseConfig,
+    YellowBuoyCourseKeeper,
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -89,13 +89,31 @@ WAYPOINT_SETTLE_SEC = 0.75
 WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 
 # ============================================================
-# KAÇINMA PARAMETRELERİ
+# SARI DUBA PARKUR / KAÇINMA PARAMETRELERİ
 # ============================================================
+# Gorev basinda iki sari duba bulunamazsa bu sure boyunca ana GPS hedefine git.
+INITIAL_YELLOW_SEARCH_GRACE_SEC = 3.0
+
+# Ikinci en yakin sari dubaya yonelirken uretilecek kisa GPS hedefinin ust mesafesi.
+YELLOW_COURSE_LOOKAHEAD_M = 5.0
+
+# Sari parkur bir kez bulunduktan sonra tespit kaybinda son yonu koruma suresi.
+YELLOW_TARGET_MEMORY_SEC = 1.0
+
+# Sari duba bu mesafeden daha yakina geldiginde GPS hedefli kacinmayi baslat.
 AVOID_ENTER_DIST_M = 3.0
+
+# Aktif kacinmada vision ile izlenecek sari duba icin en uzak kabul mesafesi.
 AVOID_EXIT_DIST_M = 4.0
-AVOID_FORWARD_DIST_M = 5.0
-AVOID_SIDE_DIST_M = 3.0
-AVOID_WAYPOINT_TOLERANCE_M = 1.0
+
+# Kacinma GPS hedefini sari dubanin sagina/soluna bu kadar metre aciklikla koy.
+AVOID_PASS_CLEARANCE_M = 2.0
+
+# Vision gurultusunu elemek icin GPS hedefini ancak bu kadar kayarsa yenile.
+AVOID_TARGET_REFRESH_MIN_SHIFT_M = 0.25
+
+# Kacinma GPS hedefine bu mesafeden daha yakin olunca gecisi tamamlanmis say.
+AVOID_WAYPOINT_TOLERANCE_M = 0.5
 
 # Duba kameranın tam ortasındaysa seçilecek kaçış yönü.
 DEFAULT_CENTER_AVOIDANCE_SIDE = "right"
@@ -137,7 +155,13 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.last_angular_z = 0.0
         self.finished = False
         self.state = MissionState.INIT
-        self.boundary_guard = OrangeBoundaryGuard()
+        self.course_keeper = YellowBuoyCourseKeeper(YellowBuoyCourseConfig(
+            min_confidence=MIN_OBSTACLE_CONFIDENCE,
+            lookahead_m=YELLOW_COURSE_LOOKAHEAD_M,
+            target_memory_sec=YELLOW_TARGET_MEMORY_SEC,
+        ))
+        self.yellow_course_acquired = False
+        self.yellow_initial_search_started_time = None
         self.aligned_target_key = None
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
@@ -407,11 +431,6 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.obstacle_data_uncertain = False
 
         for raw_detection in detections or []:
-            # Turuncu dubalar engel değil parkur sınırıdır; aşağıdaki kaçınma
-            # hedefi yerine OrangeBoundaryGuard tarafından ele alınırlar.
-            if is_orange_boundary_detection(raw_detection):
-                continue
-
             obstacle = self._normalize_detection(raw_detection)
             if obstacle is None:
                 continue
@@ -471,34 +490,96 @@ class Task2PointTrackingWithObstacleAvoidance:
             return "left"
         return DEFAULT_CENTER_AVOIDANCE_SIDE
 
-    def _create_avoidance_target(self, avoidance_side, main_target_lat, main_target_lon):
-        route_bearing = calculate_bearing(
-            self.current_lat,
-            self.current_lon,
+    def _create_avoidance_target(
+            self,
+            obstacle,
+            avoidance_side,
             main_target_lat,
             main_target_lon,
-        )
-        bearing_rad = math.radians(route_bearing)
+            reference_heading=None,
+    ):
+        """Sari dubanin uygun tarafinda, vision tabanli kisa GPS hedefi uretir."""
+        if reference_heading is None:
+            reference_heading = calculate_bearing(
+                self.current_lat,
+                self.current_lon,
+                main_target_lat,
+                main_target_lon,
+            )
 
-        # Ana rota yönünde ileri bileşen.
-        forward_north = AVOID_FORWARD_DIST_M * math.cos(bearing_rad)
-        forward_east = AVOID_FORWARD_DIST_M * math.sin(bearing_rad)
-
-        # Compass bearing için sağ = +90°, sol = -90°.
-        side_sign = 1.0 if avoidance_side == "right" else -1.0
-        side_north = side_sign * AVOID_SIDE_DIST_M * (-math.sin(bearing_rad))
-        side_east = side_sign * AVOID_SIDE_DIST_M * math.cos(bearing_rad)
-
-        return self._offset_gps(
+        obstacle_angle = obstacle.get("angle")
+        if obstacle_angle is None:
+            obstacle_angle = 0.0
+        obstacle_bearing = (self.current_heading + float(obstacle_angle)) % 360.0
+        obstacle_bearing_rad = math.radians(obstacle_bearing)
+        marker_gps = self._offset_gps(
             self.current_lat,
             self.current_lon,
-            forward_north + side_north,
-            forward_east + side_east,
+            north_m=obstacle["distance"] * math.cos(obstacle_bearing_rad),
+            east_m=obstacle["distance"] * math.sin(obstacle_bearing_rad),
+        )
+
+        lateral_bearing = (
+            float(reference_heading) + (90.0 if avoidance_side == "right" else -90.0)
+        ) % 360.0
+        lateral_bearing_rad = math.radians(lateral_bearing)
+        target = self._offset_gps(
+            marker_gps["lat"],
+            marker_gps["lon"],
+            north_m=AVOID_PASS_CLEARANCE_M * math.cos(lateral_bearing_rad),
+            east_m=AVOID_PASS_CLEARANCE_M * math.sin(lateral_bearing_rad),
+        )
+        target.update({
+            "marker_lat": marker_gps["lat"],
+            "marker_lon": marker_gps["lon"],
+            "reference_heading": float(reference_heading),
+        })
+        return target
+
+    @staticmethod
+    def _gps_target_shift_m(old_target, new_target):
+        mean_lat = math.radians((old_target["lat"] + new_target["lat"]) / 2.0)
+        north_m = (
+            math.radians(new_target["lat"] - old_target["lat"])
+            * EARTH_RADIUS_M
+        )
+        east_m = (
+            math.radians(new_target["lon"] - old_target["lon"])
+            * EARTH_RADIUS_M
+            * math.cos(mean_lat)
+        )
+        return math.hypot(north_m, east_m)
+
+    def _refresh_avoidance_target(self, obstacle, main_target_lat, main_target_lon):
+        """Aktif kacis GPS hedefini her vision dongusunde kontrol edip gunceller."""
+        if obstacle is None or self.avoidance_target is None:
+            return
+
+        refreshed_target = self._create_avoidance_target(
+            obstacle,
+            self.avoidance_side,
+            main_target_lat,
+            main_target_lon,
+            reference_heading=self.avoidance_target["reference_heading"],
+        )
+        target_shift_m = self._gps_target_shift_m(
+            self.avoidance_target,
+            refreshed_target,
+        )
+        if target_shift_m < AVOID_TARGET_REFRESH_MIN_SHIFT_M:
+            return
+
+        self.avoidance_target = refreshed_target
+        self.logger.info(
+            f"Kaçınma GPS hedefi vision ile yenilendi "
+            f"(değişim={target_shift_m:.2f} m).",
+            throttle_duration_sec=0.5,
         )
 
     def _start_avoidance(self, obstacle, main_target_lat, main_target_lon):
         avoidance_side = self._choose_avoidance_side(obstacle["side"])
         target = self._create_avoidance_target(
+            obstacle,
             avoidance_side,
             main_target_lat,
             main_target_lon,
@@ -522,7 +603,8 @@ class Task2PointTrackingWithObstacleAvoidance:
             f"ENGEL: class={obstacle['class']}, distance={obstacle['distance']:.2f} m, "
             f"camera_side={obstacle['side']}, vehicle_position={vehicle_side_text}. "
             f"Kaçınma yönü={avoidance_side}; geçici WP="
-            f"{target['lat']:.7f}, {target['lon']:.7f}"
+            f"{target['lat']:.7f}, {target['lon']:.7f}; "
+            f"duba açıklığı={AVOID_PASS_CLEARANCE_M:.1f} m"
         )
 
     def _finish_avoidance(self):
@@ -548,6 +630,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             target_name,
             tolerance_m,
             detections,
+            follow_yellow_course=True,
     ):
         distance = calculate_gps_distance(
             self.current_lat,
@@ -560,31 +643,64 @@ class Task2PointTrackingWithObstacleAvoidance:
             self.logger.info(f"{target_name} ulaşıldı. Kalan mesafe: {distance:.2f} m")
             return True
 
-        boundary_decision = self.boundary_guard.compute(
-            detections=detections,
-            current_lat=self.current_lat,
-            current_lon=self.current_lon,
-            current_heading=self.current_heading,
-            main_target_lat=target_lat,
-            main_target_lon=target_lon,
-        )
-        if boundary_decision.should_stop:
-            publish_cmd_vel(
-                self.topics.cmd_vel_pub,
-                linear_x=0.0,
-                angular_z=0.0,
+        navigation_lat = target_lat
+        navigation_lon = target_lon
+        navigation_status = "direct_avoidance"
+        if follow_yellow_course:
+            now = time.monotonic()
+            course_decision = self.course_keeper.compute(
+                detections=detections,
+                current_lat=self.current_lat,
+                current_lon=self.current_lon,
+                current_heading=self.current_heading,
+                now=now,
             )
-            self.logger.warn(
-                f"Turuncu parkur sınırı güvenle hesaplanamadı "
-                f"({boundary_decision.reason}); araç bekletiliyor.",
-                throttle_duration_sec=1.0,
-            )
-            return False
+            if course_decision.should_stop:
+                initial_search_active = (
+                    not self.yellow_course_acquired
+                    and course_decision.reason == "fewer_than_two_yellow_buoys"
+                )
+                if initial_search_active:
+                    if self.yellow_initial_search_started_time is None:
+                        self.yellow_initial_search_started_time = now
+                    search_elapsed = now - self.yellow_initial_search_started_time
+                    if search_elapsed < INITIAL_YELLOW_SEARCH_GRACE_SEC:
+                        navigation_status = (
+                            f"initial_yellow_search/{search_elapsed:.1f}s/"
+                            "direct_main_waypoint"
+                        )
+                    else:
+                        initial_search_active = False
+
+                if not initial_search_active:
+                    publish_cmd_vel(
+                        self.topics.cmd_vel_pub,
+                        linear_x=0.0,
+                        angular_z=0.0,
+                    )
+                    self.logger.warn(
+                        f"Sarı duba parkur hedefi hesaplanamadı "
+                        f"({course_decision.reason}); araç bekletiliyor.",
+                        throttle_duration_sec=1.0,
+                    )
+                    return False
+            if (
+                    course_decision.target_lat is not None
+                    and course_decision.target_lon is not None
+            ):
+                if course_decision.status == "live":
+                    self.yellow_course_acquired = True
+                navigation_lat = course_decision.target_lat
+                navigation_lon = course_decision.target_lon
+                navigation_status = (
+                    f"yellow_course/{course_decision.status}/"
+                    f"{course_decision.reason}"
+                )
 
         target_key = (
             target_name,
-            round(float(target_lat), 7),
-            round(float(target_lon), 7),
+            round(float(navigation_lat), 7),
+            round(float(navigation_lon), 7),
         )
         if self.aligned_target_key != target_key:
             if not align_heading_to_gps_target(
@@ -592,8 +708,8 @@ class Task2PointTrackingWithObstacleAvoidance:
                     self.current_lat,
                     self.current_lon,
                     self.current_heading,
-                    boundary_decision.target_lat,
-                    boundary_decision.target_lon,
+                    navigation_lat,
+                    navigation_lon,
                     logger=self.logger,
                     target_name=target_name,
                     tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
@@ -603,16 +719,14 @@ class Task2PointTrackingWithObstacleAvoidance:
 
         publish_set_position(
             self.topics.position_target_pub,
-            boundary_decision.target_lat,
-            boundary_decision.target_lon,
+            navigation_lat,
+            navigation_lon,
         )
         self.last_angular_z = 0.0
 
         self.logger.info(
             f"Hedef={target_name} | mesafe={distance:.2f} m | "
-            f"boundary={boundary_decision.status}/{boundary_decision.reason} | "
-            f"safe_angle={boundary_decision.relative_bearing_deg:.1f}° | "
-            f"corridor={boundary_decision.corridor_width_m:.1f}m",
+            f"navigation={navigation_status}",
             throttle_duration_sec=1.0,
         )
         return False
@@ -688,6 +802,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                 "WP0 (başlangıç)",
                 self.waypoint_tolerance + 2.0,
                 detections,
+                follow_yellow_course=False,
             )
 
             if reached_wp0:
@@ -708,12 +823,19 @@ class Task2PointTrackingWithObstacleAvoidance:
                 stop_vehicle(self.topics.cmd_vel_pub)
                 return
 
+            self._refresh_avoidance_target(
+                nearest_obstacle,
+                target_lat,
+                target_lon,
+            )
+
             reached_avoidance_wp = self._navigate_to_gps_target(
                 self.avoidance_target["lat"],
                 self.avoidance_target["lon"],
                 f"kaçınma WP ({self.avoidance_side})",
                 AVOID_WAYPOINT_TOLERANCE_M,
                 detections,
+                follow_yellow_course=False,
             )
 
             if reached_avoidance_wp:
@@ -740,6 +862,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                 f"kaçınma WP ({self.avoidance_side})",
                 AVOID_WAYPOINT_TOLERANCE_M,
                 detections,
+                follow_yellow_course=False,
             )
             return
 
