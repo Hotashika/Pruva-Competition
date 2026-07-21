@@ -189,8 +189,11 @@ if __name__ == "__main__":
         print(f"[SYSTEM] ROS 2 distribution: {ros_distro}")
 
         python_path_setup = (
-            f"export PYTHONPATH={shlex.quote(PROJECT_ROOT)}:"
-            f"{shlex.quote(COMPETITION_ROOT)}:${{PYTHONPATH:-}}"
+            # Depo kokunu once ekle. Aksi halde Jetson'da PROJECT_ROOT veya
+            # eski kurulumlardan gelen baska bir ``utils`` paketi, ortak
+            # /utils paketini golgeleyebilir ve alt prosesler baslatilamaz.
+            f"export PYTHONPATH={shlex.quote(COMPETITION_ROOT)}:"
+            f"{shlex.quote(PROJECT_ROOT)}:${{PYTHONPATH:-}}"
         )
 
         vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")

@@ -33,8 +33,14 @@ from enum import Enum, auto
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+repo_root_str = str(REPO_ROOT)
+# Bu dosya dogrudan calistirildiginda script dizini
+# ``teknofest/missions`` sys.path[0] olur. Buradaki missions/utils paketi,
+# depo kokundeki ortak utils paketini golgelememeli. Kok zaten listede olsa
+# bile ilk siraya tasimak bu isim cakismasini kesin olarak engeller.
+while repo_root_str in sys.path:
+    sys.path.remove(repo_root_str)
+sys.path.insert(0, repo_root_str)
 
 import rclpy
 from rclpy.node import Node
