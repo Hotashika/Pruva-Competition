@@ -180,6 +180,14 @@ class Task2PointTrackingWithObstacleAvoidance:
         stop_vehicle(self.topics.cmd_vel_pub)
         self._request_hold_mode()
 
+    def reset_geofence_origin(self, lat, lon):
+        self.home_lat = float(lat)
+        self.home_lon = float(lon)
+        self.logger.info(
+            f"Task 2 geofence merkezi yenilendi: "
+            f"{self.home_lat:.7f}, {self.home_lon:.7f}"
+        )
+
     # ========================================================
     # VERİ GÜNCELLEME
     # ========================================================
