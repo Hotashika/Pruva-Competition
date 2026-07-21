@@ -515,6 +515,7 @@ class Task3Node(Node):
 
         self.start_action_in_progress = False
         self.start_cancel_requested = False
+        self.failsafe_disarm_in_progress = False
         self.control_timer = self.create_timer(0.1, self.timer_callback)
 
         if self.test_mode:
@@ -602,6 +603,7 @@ class Task3Node(Node):
         if self.start_action_in_progress or self.task.mission_enabled:
             return False
         self.start_cancel_requested = False
+        self.failsafe_disarm_in_progress = False
         self.start_action_in_progress = True
         threading.Thread(
             target=self._start_mission_worker,
@@ -636,6 +638,35 @@ class Task3Node(Node):
     def _emergency_disarm_worker(self):
         if not self._trigger_and_wait(self.mission_clients.disarm_client, "ACİL DISARM"):
             self.get_logger().error("[ACİL DURDURMA] DISARM doğrulanamadı.")
+
+    def _launch_failsafe_disarm(self):
+        """FAILSAFE'te sıfır itkiyle yetinmeyip bir kez DISARM doğrula."""
+        if self.failsafe_disarm_in_progress:
+            return
+        self.failsafe_disarm_in_progress = True
+        threading.Thread(
+            target=self._failsafe_disarm_worker,
+            daemon=True,
+        ).start()
+
+    def _failsafe_disarm_worker(self):
+        try:
+            # Önce hareket komutunu kes ve görevi pasifleştir. Bazı ESC/mikser
+            # ayarlarında sıfır thrust tek başına motoru kesin durdurmadığı için
+            # ardından Pixhawk DISARM servisini heartbeat ile doğruluyoruz.
+            self.task.stop_mission("FAILSAFE")
+            if not self._trigger_and_wait(
+                self.mission_clients.disarm_client,
+                "FAILSAFE DISARM",
+            ):
+                self.get_logger().error(
+                    "[FAILSAFE] DISARM doğrulanamadı; Mission Planner'dan "
+                    "hemen DISARM uygulayın."
+                )
+        finally:
+            # stop_mission() durumu INIT'e aldığı için aynı hata yeniden
+            # tetiklenmez; bayrağı indirmek sonraki güvenli teste izin verir.
+            self.failsafe_disarm_in_progress = False
 
     # --------------------------------------------------------
     def gps_callback(self, msg):
@@ -711,6 +742,8 @@ class Task3Node(Node):
                 detections=self.current_detections,
                 frame_id=self.current_vision_frame_id,
             )
+            if self.task.state == MissionState.FAILSAFE:
+                self._launch_failsafe_disarm()
         except Exception as exc:
             self.get_logger().error(f"Zamanlayıcı döngüsünde beklenmeyen hata: {exc}")
             try:
@@ -718,6 +751,7 @@ class Task3Node(Node):
             except Exception as stop_exc:
                 self.get_logger().error(f"Araç durdurulamadı: {stop_exc}")
             self.task.state = MissionState.FAILSAFE
+            self._launch_failsafe_disarm()
 
     def wait_for_real_navigation_data(self, timeout_sec=30.0):
         deadline = time.monotonic() + timeout_sec

@@ -188,7 +188,12 @@ class OrangeCubeBridgeNode(Node):
         self.gps_lon = None
         self.gps_alt = None
         self.relative_alt = None
+        # GLOBAL_POSITION_INT.hdg hareket yonu/course bilgisidir ve arac
+        # yerinde donerken degismeyebilir. Task 3'te 20 derecelik donusu
+        # dogrulamak icin Pixhawk EKF attitude yaw degerini ayri tutuyoruz.
         self.heading_deg = None
+        self.attitude_heading_deg = None
+        self.last_attitude_time = 0.0
         self.roll = None
         self.pitch = None
         self.yaw = None
@@ -397,6 +402,8 @@ class OrangeCubeBridgeNode(Node):
         self.gps_alt = None
         self.relative_alt = None
         self.heading_deg = None
+        self.attitude_heading_deg = None
+        self.last_attitude_time = 0.0
         self.roll = None
         self.pitch = None
         self.yaw = None
@@ -783,6 +790,11 @@ class OrangeCubeBridgeNode(Node):
                     self.roll = float(msg.roll)
                     self.pitch = float(msg.pitch)
                     self.yaw = float(msg.yaw)
+                    # MAVLink ATTITUDE.yaw NED ekseninde radyandir. Dereceye
+                    # cevirip 0..360 araligina alinan bu deger, arac yerinde
+                    # donerken de gercek Pixhawk pusula/EKF basligini izler.
+                    self.attitude_heading_deg = math.degrees(self.yaw) % 360.0
+                    self.last_attitude_time = time.time()
 
                 elif msg_type == "HIGHRES_IMU":
                     # HIGHRES_IMU: ivme m/s^2, acisal hiz rad/s.
@@ -1202,9 +1214,18 @@ class OrangeCubeBridgeNode(Node):
             gps_msg.altitude = float(self.gps_alt) if self.gps_alt is not None else 0.0
             self.topics.gps_pub.publish(gps_msg)
 
-        if link_ready and self.heading_deg is not None:
+        # Arama kontrolunde yalnizca taze attitude yaw kullan. GPS course'a
+        # geri donmek yerinde donen aracta heading'i tekrar sabitleyip motorun
+        # durmadan donmesine yol acabilir. Akis kesilirse yayin da kesilir ve
+        # Task 3 heading watchdog'u araci guvenli durdurur.
+        attitude_is_fresh = (
+            self.attitude_heading_deg is not None
+            and self.last_attitude_time > 0.0
+            and time.time() - self.last_attitude_time <= 1.0
+        )
+        if link_ready and attitude_is_fresh:
             heading_msg = Float32()
-            heading_msg.data = float(self.heading_deg)
+            heading_msg.data = float(self.attitude_heading_deg)
             self.topics.gps_heading_pub.publish(heading_msg)
 
         if link_ready and self.relative_alt is not None:
