@@ -61,7 +61,7 @@ class FakeLogger:
         print(f"[ERROR] {msg}")
 
 
-# Test başında doldurulur: gerçek hayatta "--ros-args -p carpilacak_duba:=black"
+# Test başında doldurulur: gerçek hayatta ROS parametre override'ını simüle eder.
 # ile verilen değeri simüle eder.
 SIMULATED_PARAM_OVERRIDES = {}
 
@@ -258,32 +258,32 @@ def senaryo_1_parametre_verilmezse_red_secilmeli():
     print("  SONUÇ: Senaryo 1 BAŞARILI -- parametre verilmeyince otomatik red seçildi.\n")
 
 
-def senaryo_2_gecerli_parametre_black():
+def senaryo_2_acikca_red_parametresi():
     print("=" * 60)
-    print("SENARYO 2: 'carpilacak_duba:=black' verilerek çalıştır")
-    print("Beklenen: target_class = black_buoy olmalı")
+    print("SENARYO 2: 'carpilacak_duba:=red' verilerek çalıştır")
+    print("Beklenen: target_class = red_buoy olmalı")
     print("=" * 60)
 
     SIMULATED_PARAM_OVERRIDES.clear()
-    SIMULATED_PARAM_OVERRIDES["carpilacak_duba"] = "black"
+    SIMULATED_PARAM_OVERRIDES["carpilacak_duba"] = "red"
 
     node = t3.Task3Node()
 
-    assert node.target_class == "black_buoy", (
-        f"BEKLENMEYEN: target_class='{node.target_class}' (black_buoy olmalıydı)"
+    assert node.target_class == "red_buoy", (
+        f"BEKLENMEYEN: target_class='{node.target_class}' (red_buoy olmalıydı)"
     )
     print(f"  target_class = {node.target_class}")
-    print("  SONUÇ: Senaryo 2 BAŞARILI -- verilen renk doğru işlendi.\n")
+    print("  SONUÇ: Senaryo 2 BAŞARILI -- kırmızı hedef etkin.\n")
 
 
 def senaryo_3_gecersiz_parametre():
     print("=" * 60)
-    print("SENARYO 3: 'carpilacak_duba:=mavi' (GEÇERSİZ bir renk) verilerek çalıştır")
+    print("SENARYO 3: 'carpilacak_duba:=black' verilerek çalıştır")
     print("Beklenen: SystemExit ile durmalı, görev başlatılmamalı")
     print("=" * 60)
 
     SIMULATED_PARAM_OVERRIDES.clear()
-    SIMULATED_PARAM_OVERRIDES["carpilacak_duba"] = "mavi"
+    SIMULATED_PARAM_OVERRIDES["carpilacak_duba"] = "black"
 
     try:
         t3.Task3Node()
@@ -294,6 +294,6 @@ def senaryo_3_gecersiz_parametre():
 
 if __name__ == "__main__":
     senaryo_1_parametre_verilmezse_red_secilmeli()
-    senaryo_2_gecerli_parametre_black()
+    senaryo_2_acikca_red_parametresi()
     senaryo_3_gecersiz_parametre()
     print("Tüm renk-çözümleme senaryoları tamamlandı.")

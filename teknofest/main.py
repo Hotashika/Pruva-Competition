@@ -84,6 +84,23 @@ def stop_child_process(name, process, timeout_sec=5.0, sig=signal.SIGINT):
     process.wait(timeout=2)
 
 
+def monitor_child_processes(processes, shutdown_event, poll_interval_sec=0.25):
+    """Kritik bir ROS alt prosesi kapanırsa ana veri döngüsünü durdurur."""
+    while shutdown_event is not None and not shutdown_event.is_set():
+        for name, process in processes:
+            if process is None:
+                continue
+            return_code = process.poll()
+            if return_code is not None:
+                print(
+                    f"[SYSTEM] CRITICAL: {name} beklenmedik şekilde kapandı "
+                    f"(exit={return_code}). Sistem güvenli kapatılıyor."
+                )
+                shutdown_event.set()
+                return
+        time.sleep(poll_interval_sec)
+
+
 def run_startup_cleanup():
     cleanup_script = os.path.join(PROJECT_ROOT, "scripts", "cleanup_shm.sh")
     if not os.path.isfile(cleanup_script):
@@ -231,6 +248,18 @@ if __name__ == "__main__":
 
         p_teknofest_task3 = launch_child_process(cmd_teknofest_task3)
         print(f" -> TEKNOFEST Mission 3 Node launched (PID: {p_teknofest_task3.pid})\n")
+        threading.Thread(
+            target=monitor_child_processes,
+            args=(
+                (
+                    ("Bridge Node", p_bridge),
+                    ("Vision Node", p_vision),
+                    ("TEKNOFEST Mission 3 Node", p_teknofest_task3),
+                ),
+                capture_stop_event,
+            ),
+            daemon=True,
+        ).start()
         ################################################################################################################
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")

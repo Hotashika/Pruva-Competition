@@ -22,6 +22,7 @@ from teknofest.missions.task2_point_tracking_task_in_an_environment_with_obstacl
     Task2PointTrackingWithObstacleAvoidance,
 )
 from teknofest.missions.task3_kamikaze_engagement import (
+    ACTIVE_TARGET_CLASS,
     MissionState as Task3State,
     Task3KamikazeEngagement,
 )
@@ -60,7 +61,7 @@ class CompetitionNode(Task1Node):
             self,
             self.mission_topics,
             self.mission_clients,
-            target_class="red_buoy",
+            target_class=ACTIVE_TARGET_CLASS,
         )
 
         routes = build_competition_routes(competition_points)

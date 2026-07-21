@@ -64,8 +64,10 @@ VISION_TIMEOUT_SEC = 1.0
 GEOFENCE_RADIUS_M = 150.0
 DRIVE_MODE = "GUIDED"
 
-TEST_DEFAULT_TARGET_COLOR = "red"
-VALID_TARGET_COLORS = ("orange", "red", "yellow", "black", "green")
+# Yarışma denemesinde vurulacak tek renk. Sonradan renk değişecekse
+# yalnızca bu sabiti ve yeni modelin sınıf adını güncelleyin.
+ACTIVE_TARGET_COLOR = "red"
+ACTIVE_TARGET_CLASS = f"{ACTIVE_TARGET_COLOR}_buoy"
 TEST_MODE = False  # Yalnızca ayrıntılı log içindir; sensör verisi üretmez
 SAFETY_STOP_DISTANCE = 1.0
 MIN_TARGET_CONFIDENCE = 0.65
@@ -403,7 +405,7 @@ class Task3Node(Node):
         self.get_logger().info("Task 3 Kamikaze Engagement düğümü başlatılıyor...")
         self.get_logger().info("=" * 60)
 
-        self.declare_parameter('carpilacak_duba', TEST_DEFAULT_TARGET_COLOR)
+        self.declare_parameter('carpilacak_duba', ACTIVE_TARGET_COLOR)
         self.declare_parameter('test_mode', TEST_MODE)
         self.declare_parameter('safety_stop_distance', SAFETY_STOP_DISTANCE)
         self.declare_parameter('min_target_confidence', MIN_TARGET_CONFIDENCE)
@@ -423,15 +425,15 @@ class Task3Node(Node):
         if self.impact_delta_threshold <= 0.0:
             raise ValueError("impact_delta_threshold pozitif olmalıdır.")
 
-        if color not in VALID_TARGET_COLORS:
+        if color != ACTIVE_TARGET_COLOR:
             self.get_logger().error(
-                f"'carpilacak_duba' parametresi geçersiz (girilen: '{color}'). "
-                f"Geçerli değerler: {VALID_TARGET_COLORS}. "
-                f"Örnek: --ros-args -p carpilacak_duba:=red"
+                f"Bu denemede yalnızca '{ACTIVE_TARGET_COLOR}' duba etkin "
+                f"(girilen: '{color}'). Hedefi değiştirmek için "
+                "ACTIVE_TARGET_COLOR sabitini ve YOLO model sınıfını birlikte güncelleyin."
             )
             raise SystemExit(1)
 
-        self.target_class = f"{color}_buoy"
+        self.target_class = ACTIVE_TARGET_CLASS
         self.get_logger().info(f"🎯 Çarpılacak duba: {self.target_class}")
         self.get_logger().info(f"🧪 Test modu: {self.test_mode}")
         self.get_logger().info(f"🛑 Durma mesafesi: {self.safety_stop_distance}m")

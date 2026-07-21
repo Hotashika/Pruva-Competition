@@ -250,6 +250,8 @@ class BaseYOLODetector:
 
 
 class BuoyDetector(BaseYOLODetector):
+    REQUIRED_CLASSES = {"red_buoy"}
+
     def __init__(
             self,
             model_path=BUOY_MODEL_PATH,
@@ -265,6 +267,17 @@ class BuoyDetector(BaseYOLODetector):
             use_tracking=use_tracking,
             tracker=tracker,
         )
+
+        if isinstance(self.class_names, dict):
+            available_classes = {str(name).strip().lower() for name in self.class_names.values()}
+        else:
+            available_classes = {str(name).strip().lower() for name in self.class_names}
+        missing_classes = self.REQUIRED_CLASSES - available_classes
+        if missing_classes:
+            raise ValueError(
+                "Buoy YOLO modeli gerekli hedef sınıfını içermiyor: "
+                f"eksik={sorted(missing_classes)}, model_sınıfları={sorted(available_classes)}"
+            )
 
         self.fx = fx
         self.cx = cx if cx is not None else CAMERA_WIDTH / 2
