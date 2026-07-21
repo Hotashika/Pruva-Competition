@@ -120,9 +120,11 @@ class Task3RealSensorFlowTests(unittest.TestCase):
             self.assertEqual(mission.state, arama.SearchState.TURNING)
             self.assertAlmostEqual(mission.step_target_heading, (step * 20.0) % 360.0)
 
-            # Dönüş komutu ileri itki içermemeli.
+            # Saat yönü dönüşte skid-steer mikserinin dış motoru sürmesi için
+            # küçük pozitif taban itki ve pozitif yaw birlikte gönderilir.
             mission.update([], frame_id=frame_id)
-            self.assertEqual(commands[-1][0], 0.0)
+            self.assertGreater(commands[-1][0], 0.0)
+            self.assertGreater(commands[-1][1], 0.0)
             mission.update_heading((step * 20.0) % 360.0)
             clock.advance(0.1)
             mission.update([], frame_id=frame_id)
@@ -161,6 +163,21 @@ class Task3RealSensorFlowTests(unittest.TestCase):
 
         clock.advance(arama.RELOCATION_TIMEOUT_SEC + 0.1)
         mission.update([], frame_id=2)
+        self.assertTrue(mission.failed)
+        self.assertEqual(mission.state, arama.SearchState.FAILED)
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
+    def test_search_stops_if_clockwise_heading_does_not_progress(self):
+        mission = arama.AramaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        mission.update([], frame_id=1)
+        self.assertEqual(mission.state, arama.SearchState.TURNING)
+
+        mission.update([], frame_id=2)
+        self.assertGreater(commands[-1][0], 0.0)
+        clock.advance(arama.TURN_PROGRESS_TIMEOUT_SEC + 0.1)
+        mission.update([], frame_id=3)
+
         self.assertTrue(mission.failed)
         self.assertEqual(mission.state, arama.SearchState.FAILED)
         self.assertEqual(commands[-1], (0.0, 0.0))

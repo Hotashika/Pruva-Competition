@@ -30,9 +30,14 @@ SEARCH_STEP_DEG = 20.0
 STEP_HOLD_SEC = 5.0
 TURN_TIMEOUT_SEC = 12.0
 HEADING_TOLERANCE_DEG = 3.0
-TURN_LINEAR_X = 0.0  # Fark itkili (skid-steer) tekne yerinde döner; ileri hıza gerek yok.
+# Skid-steer mikserinde saat yönü steering ile birlikte küçük pozitif taban
+# itki, dıştaki (sol) motoru ileri sürüp içteki (sağ) motoru durdurmak içindir.
+# Saf thrust=0 komutu sahada iki ESC tarafından aynı yönde uygulanmıştı.
+TURN_LINEAR_X = 0.18
 MAX_YAW_OFFSET_RAD = 0.18
 TURN_MAX_RETRIES = 3
+TURN_PROGRESS_TIMEOUT_SEC = 3.0
+TURN_MIN_PROGRESS_DEG = 2.0
 FULL_SCAN_STEPS = 18
 RELOCATION_DISTANCE_M = 2.0
 RELOCATION_THRUST = 0.20
@@ -70,6 +75,7 @@ class AramaGorevi:
         self.current_lat = self.current_lon = self.current_heading_deg = None
         self.home_lat = self.home_lon = None
         self.step_target_heading = self.step_start_time = self.hold_until = None
+        self.turn_start_heading_deg = None
         self.completed_steps = 0
         self.turn_retry_count = 0
         self.gps_update_sequence = 0
@@ -155,6 +161,7 @@ class AramaGorevi:
         if self.current_heading_deg is None:
             return
         self.step_target_heading = (self.current_heading_deg + SEARCH_STEP_DEG) % 360.0
+        self.turn_start_heading_deg = self.current_heading_deg
         self.step_start_time = now
         self.state = SearchState.TURNING
 
@@ -184,6 +191,21 @@ class AramaGorevi:
                 f"[ARAMA] 20° dönüş doğrulanamadı ({self.turn_retry_count}/{TURN_MAX_RETRIES}); aynı adım yeniden denenecek."
             )
             return
+        if now - self.step_start_time >= TURN_PROGRESS_TIMEOUT_SEC:
+            clockwise_progress_deg = self._angle_error(
+                self.current_heading_deg,
+                self.turn_start_heading_deg,
+            )
+            if clockwise_progress_deg < TURN_MIN_PROGRESS_DEG:
+                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
+                self.failed = True
+                self.state = SearchState.FAILED
+                self.logger.error(
+                    "[ARAMA] Dönüş komutuna rağmen heading 3 sn içinde "
+                    f"saat yönünde {TURN_MIN_PROGRESS_DEG:.1f}° değişmedi "
+                    f"(ölçülen={clockwise_progress_deg:.1f}°); motorlar durduruldu."
+                )
+                return
         yaw_offset = max(-MAX_YAW_OFFSET_RAD, min(MAX_YAW_OFFSET_RAD, math.radians(error_deg)))
         publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=TURN_LINEAR_X, angular_z=yaw_offset)
 
@@ -212,7 +234,6 @@ class AramaGorevi:
                 "araç güvenli biçimde durduruldu."
             )
             return
-
         distance_m = calculate_gps_distance(
             self.relocation_start_lat,
             self.relocation_start_lon,
@@ -290,6 +311,7 @@ class AramaGorevi:
         self.found_target = None
         self.completed_steps = 0
         self.step_target_heading = self.step_start_time = self.hold_until = None
+        self.turn_start_heading_deg = None
         self.turn_retry_count = 0
         self.relocation_start_lat = self.relocation_start_lon = None
         self.relocation_heading_deg = self.relocation_start_time = None
