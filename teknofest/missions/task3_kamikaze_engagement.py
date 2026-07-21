@@ -36,20 +36,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-print("=" * 60)
-print("REPO_ROOT =", REPO_ROOT)
-print("sys.path:")
-for p in sys.path:
-    print("   ", p)
-print("=" * 60)
-
-import importlib
-
-utils = importlib.import_module("utils")
-
-print("UTILS =", utils)
-print("UTILS FILE =", utils.__file__)
-
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32, String
@@ -84,6 +70,7 @@ TEST_MODE = False  # Yalnızca ayrıntılı log içindir; sensör verisi üretme
 SAFETY_STOP_DISTANCE = 1.0
 MIN_TARGET_CONFIDENCE = 0.65
 IMPACT_THRESHOLD_MPS2 = 4.0
+USE_FORCE_ARM = False
 
 
 class MissionState(Enum):
@@ -421,6 +408,7 @@ class Task3Node(Node):
         self.declare_parameter('safety_stop_distance', SAFETY_STOP_DISTANCE)
         self.declare_parameter('min_target_confidence', MIN_TARGET_CONFIDENCE)
         self.declare_parameter('impact_delta_threshold', IMPACT_THRESHOLD_MPS2)
+        self.declare_parameter('use_force_arm', USE_FORCE_ARM)
 
         color = self.get_parameter('carpilacak_duba').get_parameter_value().string_value
         color = color.strip().lower()
@@ -428,6 +416,7 @@ class Task3Node(Node):
         self.safety_stop_distance = self.get_parameter('safety_stop_distance').get_parameter_value().double_value
         self.min_target_confidence = self.get_parameter('min_target_confidence').get_parameter_value().double_value
         self.impact_delta_threshold = self.get_parameter('impact_delta_threshold').get_parameter_value().double_value
+        self.use_force_arm = self.get_parameter('use_force_arm').get_parameter_value().bool_value
 
         if not 0.0 < self.min_target_confidence <= 1.0:
             raise ValueError("min_target_confidence 0 ile 1 arasında olmalıdır.")
@@ -448,6 +437,7 @@ class Task3Node(Node):
         self.get_logger().info(f"🛑 Durma mesafesi: {self.safety_stop_distance}m")
         self.get_logger().info(f"📷 Minimum tespit güveni: {self.min_target_confidence:.2f}")
         self.get_logger().info(f"💥 IMU temas eşiği: {self.impact_delta_threshold:.2f} m/s²")
+        self.get_logger().info(f"🔐 ARM yöntemi: {'FORCE ARM' if self.use_force_arm else 'normal ARM'}")
 
         self.mission_clients = create_mission_clients(self)
         wait_for_mission_services(self, self.mission_clients)
@@ -534,8 +524,14 @@ class Task3Node(Node):
             return False, "Orange Cube bridge bağlı değil."
         if call_set_mode(self, self.mission_clients.set_mode_client, DRIVE_MODE) is False:
             return False, f"{DRIVE_MODE} moduna geçilemedi."
-        if call_trigger_service(self, self.mission_clients.force_arm_client, "FORCE ARM") is False:
-            return False, "FORCE ARM başarısız."
+        arm_client = (
+            self.mission_clients.force_arm_client
+            if self.use_force_arm
+            else self.mission_clients.arm_client
+        )
+        arm_label = "FORCE ARM" if self.use_force_arm else "ARM"
+        if call_trigger_service(self, arm_client, arm_label) is False:
+            return False, f"{arm_label} başarısız."
         return self.task.start_mission()
 
     def _ack_mission_command(self, command):

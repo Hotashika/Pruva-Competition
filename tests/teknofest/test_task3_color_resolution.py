@@ -28,8 +28,10 @@ import types
 # 1) SAHTE rclpy / rclpy.node.Node
 # ============================================================
 class FakeParameterValue:
-    def __init__(self, string_value):
-        self.string_value = string_value
+    def __init__(self, value):
+        self.string_value = value if isinstance(value, str) else ""
+        self.bool_value = value if isinstance(value, bool) else False
+        self.double_value = float(value) if isinstance(value, (int, float)) else 0.0
 
 
 class FakeParameter:
@@ -89,6 +91,9 @@ class FakeNode:
     def create_timer(self, *args, **kwargs):
         return None
 
+    def create_publisher(self, *args, **kwargs):
+        return types.SimpleNamespace(publish=lambda msg: None)
+
 
 fake_rclpy = types.ModuleType("rclpy")
 fake_rclpy.init = lambda args=None: None
@@ -115,10 +120,23 @@ class FakeString:
         self.data = ""
 
 
+class FakeInt32:
+    def __init__(self):
+        self.data = 0
+
+
 fake_std_msgs_msg.String = FakeString
+fake_std_msgs_msg.Int32 = FakeInt32
 fake_std_msgs.msg = fake_std_msgs_msg
 sys.modules["std_msgs"] = fake_std_msgs
 sys.modules["std_msgs.msg"] = fake_std_msgs_msg
+
+fake_sensor_msgs = types.ModuleType("sensor_msgs")
+fake_sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
+fake_sensor_msgs_msg.Imu = type("FakeImu", (), {})
+fake_sensor_msgs.msg = fake_sensor_msgs_msg
+sys.modules["sensor_msgs"] = fake_sensor_msgs
+sys.modules["sensor_msgs.msg"] = fake_sensor_msgs_msg
 
 # ============================================================
 # 3) SAHTE utils.mavlink_utilities
@@ -128,7 +146,7 @@ fake_mavlink = types.ModuleType("utils.mavlink_utilities")
 
 def create_mission_clients(node):
     return types.SimpleNamespace(
-        set_mode_client=None, force_arm_client=None, disarm_client=None
+        set_mode_client=None, arm_client=None, force_arm_client=None, disarm_client=None
     )
 
 
@@ -148,7 +166,7 @@ def call_trigger_service(node, client, label):
     return True
 
 
-def stop_vehicle(pub):
+def stop_vehicle(pub, repeat_count=1):
     pass
 
 
@@ -183,6 +201,8 @@ sys.modules["utils.mavlink_utilities"] = fake_mavlink
 # 4) SAHTE teknofest.missions.arama (gerçek arama.py'yi kullanıyoruz)
 # ============================================================
 import arama as real_arama  # noqa: E402  (aynı klasördeki gerçek arama.py)
+import yaklasma as real_yaklasma  # noqa: E402
+import carpma as real_carpma  # noqa: E402
 
 # arama.py'nin kendi içindeki utils.mavlink_utilities importu zaten
 # yukarıda sahte modülle karşılanıyor, bu yüzden real_arama sorunsuz çalışır.
@@ -191,13 +211,21 @@ fake_teknofest_pkg = types.ModuleType("teknofest")
 fake_teknofest_missions_pkg = types.ModuleType("teknofest.missions")
 fake_teknofest_missions_arama = types.ModuleType("teknofest.missions.arama")
 fake_teknofest_missions_arama.AramaGorevi = real_arama.AramaGorevi
+fake_teknofest_missions_yaklasma = types.ModuleType("teknofest.missions.yaklasma")
+fake_teknofest_missions_yaklasma.YaklasmaGorevi = real_yaklasma.YaklasmaGorevi
+fake_teknofest_missions_carpma = types.ModuleType("teknofest.missions.carpma")
+fake_teknofest_missions_carpma.CarpmaGorevi = real_carpma.CarpmaGorevi
 
 fake_teknofest_pkg.missions = fake_teknofest_missions_pkg
 fake_teknofest_missions_pkg.arama = fake_teknofest_missions_arama
+fake_teknofest_missions_pkg.yaklasma = fake_teknofest_missions_yaklasma
+fake_teknofest_missions_pkg.carpma = fake_teknofest_missions_carpma
 
 sys.modules["teknofest"] = fake_teknofest_pkg
 sys.modules["teknofest.missions"] = fake_teknofest_missions_pkg
 sys.modules["teknofest.missions.arama"] = fake_teknofest_missions_arama
+sys.modules["teknofest.missions.yaklasma"] = fake_teknofest_missions_yaklasma
+sys.modules["teknofest.missions.carpma"] = fake_teknofest_missions_carpma
 
 # ============================================================
 # 5) ŞİMDİ task3_kamikaze_engagement.py'Yİ İÇE AKTARABİLİRİZ
