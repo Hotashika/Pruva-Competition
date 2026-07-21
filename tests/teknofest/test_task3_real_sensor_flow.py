@@ -136,8 +136,34 @@ class Task3RealSensorFlowTests(unittest.TestCase):
 
         self.assertEqual(mission.completed_steps, 18)
         mission.update([], frame_id=frame_id + 1)
+        self.assertEqual(mission.completed_steps, 18)
+        self.assertEqual(mission.state, arama.SearchState.RELOCATING)
+
+        # Aynı kontrol döngüsündeki tekrarlı okumalar değil, üç farklı gerçek
+        # GPS örneği 2 m yer değiştirmeyi doğrulamalı.
+        relocated_lat = 41.0 + 2.10 / 111_320.0
+        for _ in range(arama.RELOCATION_CONFIRM_GPS_SAMPLES):
+            mission.update_gps(relocated_lat, 29.0, 0.0)
+            clock.advance(0.2)
+            mission.update([], frame_id=frame_id + 2)
+
         self.assertEqual(mission.completed_steps, 0)
+        self.assertEqual(mission.state, arama.SearchState.START_STEP)
+        mission.update([], frame_id=frame_id + 3)
         self.assertEqual(mission.state, arama.SearchState.TURNING)
+
+    def test_search_relocation_timeout_stops_and_fails(self):
+        mission = arama.AramaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        mission.completed_steps = arama.FULL_SCAN_STEPS
+        mission.update([], frame_id=1)
+        self.assertEqual(mission.state, arama.SearchState.RELOCATING)
+
+        clock.advance(arama.RELOCATION_TIMEOUT_SEC + 0.1)
+        mission.update([], frame_id=2)
+        self.assertTrue(mission.failed)
+        self.assertEqual(mission.state, arama.SearchState.FAILED)
+        self.assertEqual(commands[-1], (0.0, 0.0))
 
     def test_approach_averages_five_frames_then_moves_one_third_straight(self):
         mission = yaklasma.YaklasmaGorevi(Node(), Topics(), "red_buoy")

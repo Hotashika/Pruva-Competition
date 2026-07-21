@@ -20,7 +20,11 @@ import time
 from collections import deque
 from enum import Enum, auto
 
-from utils.mavlink_utilities import publish_cmd_vel, stop_vehicle
+from utils.mavlink_utilities import (
+    calculate_gps_distance,
+    publish_cmd_vel,
+    stop_vehicle,
+)
 
 SEARCH_STEP_DEG = 20.0
 STEP_HOLD_SEC = 5.0
@@ -30,6 +34,10 @@ TURN_LINEAR_X = 0.0  # Fark itkili (skid-steer) tekne yerinde döner; ileri hız
 MAX_YAW_OFFSET_RAD = 0.18
 TURN_MAX_RETRIES = 3
 FULL_SCAN_STEPS = 18
+RELOCATION_DISTANCE_M = 2.0
+RELOCATION_THRUST = 0.20
+RELOCATION_TIMEOUT_SEC = 20.0
+RELOCATION_CONFIRM_GPS_SAMPLES = 3
 SEARCH_CONFIRM_FRAMES = 5
 SEARCH_CONFIRM_WINDOW_SEC = 5.0
 MAX_CONFIRM_ANGLE_SPREAD_DEG = 18.0
@@ -41,6 +49,7 @@ class SearchState(Enum):
     START_STEP = auto()
     TURNING = auto()
     HOLDING = auto()
+    RELOCATING = auto()
     TARGET_FOUND = auto()
     FAILED = auto()
 
@@ -63,11 +72,17 @@ class AramaGorevi:
         self.step_target_heading = self.step_start_time = self.hold_until = None
         self.completed_steps = 0
         self.turn_retry_count = 0
+        self.gps_update_sequence = 0
+        self.relocation_start_lat = self.relocation_start_lon = None
+        self.relocation_heading_deg = self.relocation_start_time = None
+        self.relocation_confirm_count = 0
+        self.relocation_last_checked_gps_sequence = None
         self.last_processed_frame_id = None
         self.confirmations = deque(maxlen=SEARCH_CONFIRM_FRAMES)
 
     def update_gps(self, lat, lon, heading_deg=None):
         self.current_lat, self.current_lon = float(lat), float(lon)
+        self.gps_update_sequence += 1
         if heading_deg is not None:
             self.update_heading(heading_deg)
         if self.home_lat is None:
@@ -172,6 +187,72 @@ class AramaGorevi:
         yaw_offset = max(-MAX_YAW_OFFSET_RAD, min(MAX_YAW_OFFSET_RAD, math.radians(error_deg)))
         publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=TURN_LINEAR_X, angular_z=yaw_offset)
 
+    def _start_relocation(self, now):
+        self.relocation_start_lat = self.current_lat
+        self.relocation_start_lon = self.current_lon
+        self.relocation_heading_deg = self.current_heading_deg
+        self.relocation_start_time = now
+        self.relocation_confirm_count = 0
+        self.relocation_last_checked_gps_sequence = self.gps_update_sequence
+        self.confirmations.clear()
+        self.state = SearchState.RELOCATING
+        self.logger.info(
+            "[ARAMA] 360° taramada hedef bulunamadı; gerçek GPS ile "
+            f"{RELOCATION_DISTANCE_M:.1f} m yeni konuma ilerleniyor."
+        )
+
+    def _relocate(self, now):
+        if now - self.relocation_start_time > RELOCATION_TIMEOUT_SEC:
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
+            self.failed = True
+            self.state = SearchState.FAILED
+            self.logger.error(
+                f"[ARAMA] {RELOCATION_DISTANCE_M:.1f} m yer değiştirme "
+                f"{RELOCATION_TIMEOUT_SEC:.0f} sn içinde GPS ile doğrulanamadı; "
+                "araç güvenli biçimde durduruldu."
+            )
+            return
+
+        distance_m = calculate_gps_distance(
+            self.relocation_start_lat,
+            self.relocation_start_lon,
+            self.current_lat,
+            self.current_lon,
+        )
+
+        # Kontrol döngüsü GPS'ten hızlıdır; aynı GPS örneğini üç kez sayma.
+        if self.gps_update_sequence != self.relocation_last_checked_gps_sequence:
+            self.relocation_last_checked_gps_sequence = self.gps_update_sequence
+            if distance_m >= RELOCATION_DISTANCE_M:
+                self.relocation_confirm_count += 1
+            else:
+                self.relocation_confirm_count = 0
+
+        if self.relocation_confirm_count >= RELOCATION_CONFIRM_GPS_SAMPLES:
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
+            self.completed_steps = 0
+            self.turn_retry_count = 0
+            self.state = SearchState.START_STEP
+            self.logger.info(
+                f"[ARAMA] Yeni konum {self.relocation_confirm_count} ardışık "
+                f"GPS örneğiyle doğrulandı ({distance_m:.2f} m); yeni 360° tarama başlıyor."
+            )
+            return
+
+        heading_error_deg = self._angle_error(
+            self.relocation_heading_deg,
+            self.current_heading_deg,
+        )
+        yaw_offset = max(
+            -MAX_YAW_OFFSET_RAD,
+            min(MAX_YAW_OFFSET_RAD, math.radians(heading_error_deg)),
+        )
+        publish_cmd_vel(
+            self.topics.cmd_vel_pub,
+            linear_x=RELOCATION_THRUST,
+            angular_z=yaw_offset,
+        )
+
     def update(self, detections, frame_id=None):
         if self.finished or self.failed:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
@@ -186,19 +267,20 @@ class AramaGorevi:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return False
         if self.state == SearchState.START_STEP:
-            # 360 derece tamamlanınca aynı gerçek konumda yeni bir 360 derece
-            # tarama turuna başla. Konum/tespit verisi uydurulmaz ve GPS hedefi
-            # üretilmez; her bakış açısında en fazla 5 saniye kalınır.
+            # Bir tam turda hedef bulunmazsa aynı GPS konumunda ikinci turu
+            # başlatma; gerçek GPS ile 2 m ilerleyip yeni konumda tekrar tara.
             if self.completed_steps >= FULL_SCAN_STEPS:
-                self.completed_steps = 0
-                self.logger.info("[ARAMA] 360° tarama tamamlandı; yeni tarama turu başlıyor.")
-            self._start_turn(now)
+                self._start_relocation(now)
+            else:
+                self._start_turn(now)
         elif self.state == SearchState.TURNING:
             self._turn(now)
         elif self.state == SearchState.HOLDING:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             if now >= self.hold_until:
                 self.state = SearchState.START_STEP
+        elif self.state == SearchState.RELOCATING:
+            self._relocate(now)
         return False
 
     def reset_search(self):
@@ -209,6 +291,10 @@ class AramaGorevi:
         self.completed_steps = 0
         self.step_target_heading = self.step_start_time = self.hold_until = None
         self.turn_retry_count = 0
+        self.relocation_start_lat = self.relocation_start_lon = None
+        self.relocation_heading_deg = self.relocation_start_time = None
+        self.relocation_confirm_count = 0
+        self.relocation_last_checked_gps_sequence = None
         self.last_processed_frame_id = None
         self.confirmations.clear()
 
@@ -223,4 +309,6 @@ class AramaGorevi:
             "failed": self.failed,
             "completed_steps": self.completed_steps,
             "turn_retry_count": self.turn_retry_count,
+            "relocation_distance_m": RELOCATION_DISTANCE_M,
+            "relocation_confirm_count": self.relocation_confirm_count,
         }
