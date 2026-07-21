@@ -28,7 +28,17 @@ class BaseYOLODetector:
 
     def detect(self, bgr_image, depth_array):
         t0 = time.time()
-        results = self.model(bgr_image, device=self.device, verbose=False)
+        # Suppress overlapping boxes even when the model assigns different
+        # colour classes to the same physical buoy. A lower IoU threshold than
+        # the Ultralytics default removes the occasional double detection while
+        # preserving separate, non-overlapping buoys.
+        results = self.model(
+            bgr_image,
+            device=self.device,
+            verbose=False,
+            iou=0.35,
+            agnostic_nms=True,
+        )
         t1 = time.time()
 
         boxes = results[0].boxes

@@ -85,6 +85,8 @@ def run_startup_cleanup():
 
 def configure_mavlink_bridge_environment():
     defaults = {
+        "MAVLINK20": "1",
+        "DETECTION_MIN_CONFIDENCE": "0.30",
         "MAVLINK_CONNECTION_STRING": "/dev/ttyACM0",
         "MAVLINK_BAUD": "921600",
         "MAVLINK_SOURCE_SYSTEM": "1",

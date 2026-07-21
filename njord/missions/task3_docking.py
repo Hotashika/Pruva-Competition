@@ -20,6 +20,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Float32, String
 
+from njord.core.mission_decision import DECISION_TOPIC, mission_decision_json
 try:
     from utils.mavlink_utilities import (
         call_set_mode,
@@ -803,6 +804,7 @@ class Task3DockingNode(Node):
         self.qr_sub = self.create_subscription(String, self.config.qr_topic, self.qr_callback, 10)
         self.active_task_pub = self.create_publisher(String, self.config.active_task_topic, 10)
         self.docking_state_pub = self.create_publisher(String, self.config.docking_state_topic, 10)
+        self.decision_pub = self.create_publisher(String, DECISION_TOPIC, 10)
 
         self.mission = Task3DockingMission(
             self,
@@ -859,6 +861,15 @@ class Task3DockingNode(Node):
         msg = String()
         msg.data = json.dumps(self.mission.status_payload(), ensure_ascii=False)
         self.docking_state_pub.publish(msg)
+
+        decision_msg = String()
+        decision_msg.data = mission_decision_json(
+            3,
+            self.mission.state,
+            current_target=self.mission.mode_index,
+            target_count=len(self.config.sequence),
+        )
+        self.decision_pub.publish(decision_msg)
 
     def prepare_vehicle(self) -> bool:
         if self.config.dry_run:

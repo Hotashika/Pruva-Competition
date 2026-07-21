@@ -15,6 +15,7 @@ from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from njord.core.mission_decision import DECISION_TOPIC, mission_decision_json
 from utils.mavlink_utilities import (
     call_set_mode,
     call_trigger_service,
@@ -540,6 +541,7 @@ class Task4Node(Node):
         self.active_task_pub = self.create_publisher(
             String, "/mission/active_task", 10
         )
+        self.decision_pub = self.create_publisher(String, DECISION_TOPIC, 10)
 
         waypoints = load_task4_waypoints()
         self.get_logger().info(
@@ -551,6 +553,7 @@ class Task4Node(Node):
 
         self.control_timer = self.create_timer(0.1, self.timer_callback)
         self.active_task_timer = self.create_timer(1.0, self.publish_active_task)
+        self.decision_timer = self.create_timer(0.5, self.publish_decision)
 
     def publish_active_task(self):
         if not self.mission_active:
@@ -558,6 +561,16 @@ class Task4Node(Node):
         message = String()
         message.data = ACTIVE_TASK_NAME
         self.active_task_pub.publish(message)
+
+    def publish_decision(self):
+        message = String()
+        message.data = mission_decision_json(
+            4,
+            self.task.state,
+            current_target=self.task.current_target_index,
+            target_count=len(self.task.waypoints),
+        )
+        self.decision_pub.publish(message)
 
     def vision_callback(self, message):
         try:

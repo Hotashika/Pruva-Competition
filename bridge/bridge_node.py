@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import math
 import os
 import sys
@@ -8,6 +9,10 @@ import time
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+# MAVLink TUNNEL has message id 385 and is only available in MAVLink 2.
+# This must be set before importing pymavlink's generated dialect.
+os.environ.setdefault("MAVLINK20", "1")
 
 import rclpy
 from rclpy.node import Node
@@ -25,7 +30,13 @@ from bridge.mavlink_connection import (
     DEFAULT_SOURCE_SYSTEM,
     connect_mavlink,
 )
-from utils.mavlink_utilities import create_bridge_topics, create_bridge_services
+from bridge.detection_protocol import DETECTION_PAYLOAD_TYPE, encode_detection_payload
+from bridge.decision_protocol import DECISION_PAYLOAD_TYPE, encode_decision_payload
+from utils.mavlink_utilities import (
+    calculate_gps_newpos,
+    create_bridge_services,
+    create_bridge_topics,
+)
 from utils.pixhawk_waypoints import mission_items_to_qgc
 from utils.waypoint_server import DEFAULT_WAYPOINT_DIRECTORY, overwrite_waypoint_file
 from utils.battery import battery_percentage_from_voltage
@@ -47,6 +58,17 @@ VALID_MISSION_COMMANDS = {
     MISSION_STOP,
     MISSION_EMERGENCY,
 }
+DETECTION_SEND_INTERVAL_SEC = 0.2
+DETECTION_MAX_PER_FRAME = 4
+DETECTION_DUPLICATE_IOU_THRESHOLD = 0.35
+DECISION_SEND_INTERVAL_SEC = 0.4
+try:
+    DETECTION_MIN_CONFIDENCE = max(
+        0.0,
+        min(float(os.environ.get("DETECTION_MIN_CONFIDENCE", "0.30")), 1.0),
+    )
+except ValueError:
+    DETECTION_MIN_CONFIDENCE = 0.30
 
 
 def euler_to_quaternion(roll, pitch, yaw):
@@ -198,6 +220,11 @@ class OrangeCubeBridgeNode(Node):
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
+        self.detection_sequence = 0
+        self.last_detection_send_time = 0.0
+        self.last_detection_frame_id = None
+        self.decision_sequence = 0
+        self.last_decision_send_time = 0.0
 
         self.boot_time = time.time()
         self.last_cmd_vel_time = 0.0
@@ -229,6 +256,18 @@ class OrangeCubeBridgeNode(Node):
             Int32,
             self.mission_start_ack_topic,
             self._mission_start_ack_callback,
+            10,
+        )
+        self.create_subscription(
+            String,
+            "/vision/detections",
+            self._detection_callback,
+            10,
+        )
+        self.create_subscription(
+            String,
+            "/mission/decision",
+            self._decision_callback,
             10,
         )
 
@@ -276,6 +315,223 @@ class OrangeCubeBridgeNode(Node):
             self.master.mav.statustext_send(severity, message)
         except Exception as exc:
             self.get_logger().warn(f"STATUSTEXT gonderilemedi: {exc}")
+
+    @staticmethod
+    def _detection_angle(detection):
+        for key, value in detection.items():
+            if key in ("angle", "angle_from_center", "bearing_angle") or key.endswith(" angle: "):
+                try:
+                    angle = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(angle):
+                    return angle
+        return None
+
+    @staticmethod
+    def _detection_confidence(detection):
+        if not isinstance(detection, dict):
+            return -1.0
+        try:
+            confidence = float(detection.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            return -1.0
+        return confidence if math.isfinite(confidence) else -1.0
+
+    @staticmethod
+    def _bbox_iou(first_bbox, second_bbox):
+        try:
+            first = [float(value) for value in first_bbox]
+            second = [float(value) for value in second_bbox]
+        except (TypeError, ValueError):
+            return 0.0
+        if len(first) != 4 or len(second) != 4:
+            return 0.0
+
+        first_x1, first_y1, first_x2, first_y2 = first
+        second_x1, second_y1, second_x2, second_y2 = second
+        first_area = max(0.0, first_x2 - first_x1) * max(0.0, first_y2 - first_y1)
+        second_area = max(0.0, second_x2 - second_x1) * max(0.0, second_y2 - second_y1)
+        if first_area <= 0.0 or second_area <= 0.0:
+            return 0.0
+
+        intersection_width = max(0.0, min(first_x2, second_x2) - max(first_x1, second_x1))
+        intersection_height = max(0.0, min(first_y2, second_y2) - max(first_y1, second_y1))
+        intersection = intersection_width * intersection_height
+        union = first_area + second_area - intersection
+        return intersection / union if union > 0.0 else 0.0
+
+    def _detection_callback(self, message):
+        if not self._has_valid_link() or not self._has_valid_gps() or self.heading_deg is None:
+            return
+
+        now = time.monotonic()
+        if now - self.last_detection_send_time < DETECTION_SEND_INTERVAL_SEC:
+            return
+
+        try:
+            data = json.loads(message.data)
+            detections = data.get("detections", [])
+            frame_id = int(data.get("frame_id", 0))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            self.get_logger().warn("Gecersiz /vision/detections mesaji yok sayildi.")
+            return
+
+        if not isinstance(detections, list):
+            return
+
+        # Process the strongest box first so overlap suppression always keeps
+        # the most reliable classification for a physical object.
+        detections = sorted(detections, key=self._detection_confidence, reverse=True)
+
+        # A latched/repeated ROS message must not create multiple copies of the
+        # same camera frame on the ground station. Frame id 0 is treated as
+        # unknown so legacy publishers without a real frame counter still work.
+        if frame_id > 0 and frame_id == self.last_detection_frame_id:
+            return
+        if frame_id > 0:
+            self.last_detection_frame_id = frame_id
+
+        sent = 0
+        seen_detections = set()
+        sent_bboxes = []
+        for detection in detections:
+            if not isinstance(detection, dict):
+                continue
+            try:
+                class_name = str(detection.get("class") or detection.get("class_name") or "unknown")
+                depth = float(detection.get("distance", detection.get("depth")))
+                confidence = float(detection.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                continue
+            angle = self._detection_angle(detection)
+            if (
+                    angle is None
+                    or not all(math.isfinite(value) for value in (depth, confidence))
+                    or depth <= 0.0
+                    or not 0.0 <= confidence <= 1.0
+                    or confidence < DETECTION_MIN_CONFIDENCE
+            ):
+                continue
+
+            detection_key = (class_name, round(depth, 2), round(angle, 2))
+            if detection_key in seen_detections:
+                continue
+            seen_detections.add(detection_key)
+
+            bbox = detection.get("bbox")
+            if any(
+                    self._bbox_iou(bbox, previous_bbox) >= DETECTION_DUPLICATE_IOU_THRESHOLD
+                    for previous_bbox in sent_bboxes
+            ):
+                continue
+
+            bearing = (float(self.heading_deg) + angle) % 360.0
+            detected_lat, detected_lon = calculate_gps_newpos(
+                float(self.gps_lat),
+                float(self.gps_lon),
+                bearing,
+                depth,
+            )
+            if self.send_detection(
+                    class_name,
+                    depth,
+                    angle,
+                    detected_lat,
+                    detected_lon,
+                    confidence=confidence,
+                    frame_id=frame_id,
+            ):
+                sent += 1
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    sent_bboxes.append(bbox)
+            if sent >= DETECTION_MAX_PER_FRAME:
+                break
+
+        if sent:
+            self.last_detection_send_time = now
+
+    def send_detection(
+            self,
+            class_name,
+            depth,
+            angle,
+            detected_lat,
+            detected_lon,
+            confidence=0.0,
+            frame_id=0,
+    ):
+        if not self._has_valid_link():
+            return False
+
+        payload = encode_detection_payload(
+            sequence=self.detection_sequence,
+            frame_id=frame_id,
+            confidence=confidence,
+            depth=depth,
+            angle=angle,
+            latitude=detected_lat,
+            longitude=detected_lon,
+            class_name=class_name,
+        )
+        try:
+            self.master.mav.tunnel_send(
+                0,
+                0,
+                DETECTION_PAYLOAD_TYPE,
+                len(payload),
+                payload.ljust(128, b"\x00"),
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"Detection MAVLink mesaji gonderilemedi: {exc}")
+            return False
+
+        self.detection_sequence = (self.detection_sequence + 1) & 0xFFFFFFFF
+        return True
+
+    def _decision_callback(self, message):
+        if not self._has_valid_link():
+            return
+        now = time.monotonic()
+        if now - self.last_decision_send_time < DECISION_SEND_INTERVAL_SEC:
+            return
+        try:
+            data = json.loads(message.data)
+            if not isinstance(data, dict):
+                raise ValueError("JSON root must be an object")
+            collision_risk = data.get("collision_risk")
+            if collision_risk not in (None, True, False):
+                raise ValueError("collision_risk must be true, false or null")
+            payload = encode_decision_payload(
+                sequence=self.decision_sequence,
+                active_mission=data.get("active_mission", ""),
+                stage=data.get("stage", "UNKNOWN"),
+                action=data.get("action", "Monitor mission"),
+                reason=data.get("reason", "Mission status update"),
+                colreg_rule=data.get("colreg_rule", ""),
+                collision_risk=collision_risk,
+                current_target=data.get("current_target", 0),
+                target_count=data.get("target_count", 0),
+                progress_percent=data.get("progress_percent", 0.0),
+            )
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn(f"Gecersiz /mission/decision mesaji yok sayildi: {exc}")
+            return
+
+        try:
+            self.master.mav.tunnel_send(
+                0,
+                0,
+                DECISION_PAYLOAD_TYPE,
+                len(payload),
+                payload.ljust(128, b"\x00"),
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"Decision MAVLink mesaji gonderilemedi: {exc}")
+            return
+
+        self.decision_sequence = (self.decision_sequence + 1) & 0xFFFFFFFF
+        self.last_decision_send_time = now
 
     def _mission_command_rx_watchdog(self):
         if self.master is None or not self.connected:

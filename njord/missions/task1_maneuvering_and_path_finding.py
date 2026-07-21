@@ -14,6 +14,7 @@ from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from njord.core.mission_decision import DECISION_TOPIC, mission_decision_json
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
     create_mission_topics,
@@ -892,6 +893,7 @@ class Task1Node(Node):
             '/mission/active_task',
             10
         )
+        self.decision_pub = self.create_publisher(String, DECISION_TOPIC, 10)
 
         # 3. Görev Sınıfını Başlat
         self.task = Task1Maneuvering(self, self.mission_topics, self.mission_clients)
@@ -909,6 +911,7 @@ class Task1Node(Node):
         # 4. Ana Kontrol Döngüsünü Başlat (Saniyede 10 kez çalışır: 0.1 sn)
         self.control_timer = self.create_timer(0.1, self.timer_callback)
         self.active_task_timer = self.create_timer(1.0, self.publish_active_task)
+        self.decision_timer = self.create_timer(0.5, self.publish_decision)
         self.publish_active_task()
 
     # Vision node'a aktif gorevin task1 oldugunu bildirir.
@@ -916,6 +919,25 @@ class Task1Node(Node):
         msg = String()
         msg.data = ACTIVE_TASK_NAME
         self.active_task_pub.publish(msg)
+
+    def publish_decision(self):
+        action = None
+        reason = None
+        if self.task.state == MissionState.AVOIDING:
+            side = "starboard" if self.task.avoid_turn_direction > 0 else "port"
+            action = f"Pass obstacle on {side}"
+            obstacle = self.task.avoiding_class or "course marker"
+            reason = f"{obstacle} detected on planned route"
+        msg = String()
+        msg.data = mission_decision_json(
+            1,
+            self.task.state,
+            current_target=self.task.current_target_index,
+            target_count=len(self.task.waypoints),
+            action=action,
+            reason=reason,
+        )
+        self.decision_pub.publish(msg)
 
     # Vision detection JSON mesajlarini saklar.
     def vision_callback(self, msg):
