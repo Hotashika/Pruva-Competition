@@ -82,6 +82,8 @@ TEST_DEFAULT_TARGET_COLOR = "red"
 VALID_TARGET_COLORS = ("orange", "red", "yellow", "black", "green")
 TEST_MODE = False  # Yalnızca ayrıntılı log içindir; sensör verisi üretmez
 SAFETY_STOP_DISTANCE = 1.0
+MIN_TARGET_CONFIDENCE = 0.65
+IMPACT_THRESHOLD_MPS2 = 4.0
 
 
 class MissionState(Enum):
@@ -97,7 +99,9 @@ class Task3KamikazeEngagement:
     """Görev yöneticisi sınıfı - 3 aşamayı (arama/yaklaşma/çarpma) koordine eder."""
 
     def __init__(self, node, mission_topics, mission_clients, target_class,
-                 test_mode=False, safety_stop_distance=None):
+                 test_mode=False, safety_stop_distance=None,
+                 min_target_confidence=MIN_TARGET_CONFIDENCE,
+                 impact_delta_threshold=IMPACT_THRESHOLD_MPS2):
         self.node = node
         self.is_armed = False
         self.logger = node.get_logger()
@@ -106,6 +110,8 @@ class Task3KamikazeEngagement:
         self.topics = mission_topics
         self.clients = mission_clients
         self.target_class = target_class
+        self.min_target_confidence = float(min_target_confidence)
+        self.impact_delta_threshold = float(impact_delta_threshold)
 
         self.current_lat = None
         self.current_lon = None
@@ -123,12 +129,21 @@ class Task3KamikazeEngagement:
         self.bridge_armed = None
         self.bridge_mode = None
 
-        self.arama = AramaGorevi(node, mission_topics, target_class, test_mode=test_mode)
+        self.arama = AramaGorevi(
+            node, mission_topics, target_class,
+            test_mode=test_mode,
+            min_target_confidence=self.min_target_confidence,
+        )
         self.yaklasma = YaklasmaGorevi(
             node, mission_topics, target_class,
             safe_stop_distance=safety_stop_distance,
+            min_target_confidence=self.min_target_confidence,
         )
-        self.carpma = CarpmaGorevi(node, mission_topics, target_class)
+        self.carpma = CarpmaGorevi(
+            node, mission_topics, target_class,
+            min_target_confidence=self.min_target_confidence,
+            impact_delta_threshold=self.impact_delta_threshold,
+        )
 
     # --------------------------------------------------------
     def update_gps(self, lat, lon):
@@ -404,11 +419,20 @@ class Task3Node(Node):
         self.declare_parameter('carpilacak_duba', TEST_DEFAULT_TARGET_COLOR)
         self.declare_parameter('test_mode', TEST_MODE)
         self.declare_parameter('safety_stop_distance', SAFETY_STOP_DISTANCE)
+        self.declare_parameter('min_target_confidence', MIN_TARGET_CONFIDENCE)
+        self.declare_parameter('impact_delta_threshold', IMPACT_THRESHOLD_MPS2)
 
         color = self.get_parameter('carpilacak_duba').get_parameter_value().string_value
         color = color.strip().lower()
         self.test_mode = self.get_parameter('test_mode').get_parameter_value().bool_value
         self.safety_stop_distance = self.get_parameter('safety_stop_distance').get_parameter_value().double_value
+        self.min_target_confidence = self.get_parameter('min_target_confidence').get_parameter_value().double_value
+        self.impact_delta_threshold = self.get_parameter('impact_delta_threshold').get_parameter_value().double_value
+
+        if not 0.0 < self.min_target_confidence <= 1.0:
+            raise ValueError("min_target_confidence 0 ile 1 arasında olmalıdır.")
+        if self.impact_delta_threshold <= 0.0:
+            raise ValueError("impact_delta_threshold pozitif olmalıdır.")
 
         if color not in VALID_TARGET_COLORS:
             self.get_logger().error(
@@ -422,6 +446,8 @@ class Task3Node(Node):
         self.get_logger().info(f"🎯 Çarpılacak duba: {self.target_class}")
         self.get_logger().info(f"🧪 Test modu: {self.test_mode}")
         self.get_logger().info(f"🛑 Durma mesafesi: {self.safety_stop_distance}m")
+        self.get_logger().info(f"📷 Minimum tespit güveni: {self.min_target_confidence:.2f}")
+        self.get_logger().info(f"💥 IMU temas eşiği: {self.impact_delta_threshold:.2f} m/s²")
 
         self.mission_clients = create_mission_clients(self)
         wait_for_mission_services(self, self.mission_clients)
@@ -475,6 +501,8 @@ class Task3Node(Node):
             target_class=self.target_class,
             test_mode=self.test_mode,
             safety_stop_distance=self.safety_stop_distance,
+            min_target_confidence=self.min_target_confidence,
+            impact_delta_threshold=self.impact_delta_threshold,
         )
 
         self.current_heading = None
@@ -527,6 +555,12 @@ class Task3Node(Node):
                 self._ack_mission_command(command)
         elif command in (90, 99):
             self.task.stop_mission("Pixhawk/bridge durdurma komutu")
+            if command == 99:
+                disarm_ok = call_trigger_service(
+                    self, self.mission_clients.disarm_client, "ACİL DISARM"
+                )
+                if disarm_ok is False:
+                    self.get_logger().error("[ACİL DURDURMA] DISARM doğrulanamadı.")
             self._ack_mission_command(command)
 
     # --------------------------------------------------------

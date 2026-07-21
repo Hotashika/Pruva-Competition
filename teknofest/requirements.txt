@@ -1,10 +1,13 @@
-# Python 3.12 is required for this project. Please ensure you have Python 3.12 installed before proceeding with the installation of the dependencies listed below.
+# Use the Python version supplied by the selected JetPack/ROS 2 installation.
+# On Jetson, create the venv with --system-site-packages so rclpy and PyZED
+# installed for the system Python remain visible.
 
 # ZED ROS Project Dependencies
 # ZED Camera SDK
-# Note: pyzed-5.1-cp312-cp312-linux_x86_64.whl has been provided separately
-# Install with: pip install pyzed-5.1-cp312-cp312-linux_x86_64.whl
-# python /usr/local/zed/get_python_api.py
+# Install the Jetson/aarch64 ZED SDK matching the exact JetPack/L4T release.
+# Never install an x86_64 PyZED wheel on Jetson.
+# The matching installer can install the Python API, or use:
+#   python3 /usr/local/zed/get_python_api.py
 
 # Core dependencies
 numpy>=1.24.0
@@ -14,9 +17,9 @@ opencv-python>=4.8.0
 Pillow>=9.5.0
 
 # YOLOv8 Object Detection
+# Install NVIDIA's JetPack-compatible torch/torchvision build BEFORE this file.
+# Do not replace it with an arbitrary desktop PyPI wheel on Jetson.
 ultralytics>=8.0.0
-torch>=2.0.0
-torchvision>=0.15.0
 
 # Additional utilities
 Werkzeug>=2.3.0

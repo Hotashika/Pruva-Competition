@@ -57,7 +57,10 @@ class CompetitionNode(Task1Node):
             self, self.mission_topics, self.mission_clients
         )
         self.task3 = Task3KamikazeEngagement(
-            self, self.mission_topics, self.mission_clients
+            self,
+            self.mission_topics,
+            self.mission_clients,
+            target_class="red_buoy",
         )
 
         routes = build_competition_routes(competition_points)
@@ -80,15 +83,14 @@ class CompetitionNode(Task1Node):
         if not hasattr(self, "task2") or not self.valid_gps_received:
             return
         self.task2.update_gps(msg.latitude, msg.longitude)
-        self.task3.update_gps(msg.latitude, msg.longitude, self.current_heading or 0.0)
+        self.task3.update_gps(msg.latitude, msg.longitude)
 
     def heading_callback(self, msg):
         super().heading_callback(msg)
         if not hasattr(self, "task2") or not self.valid_heading_received:
             return
         self.task2.update_heading(self.current_heading)
-        self.task3.current_heading = self.current_heading
-        self.task3.last_heading_time = self.task1.last_heading_time
+        self.task3.update_heading(self.current_heading)
 
     def state_callback(self, msg):
         super().state_callback(msg)
@@ -147,7 +149,17 @@ class CompetitionNode(Task1Node):
                     self._transition_to(CompetitionState.PARKUR_3, "task3")
 
             elif self.competition_state == CompetitionState.PARKUR_3:
-                self.task3.update(detections)
+                if not self.task3.mission_enabled:
+                    ok, reason = self.task3.start_mission()
+                    if not ok:
+                        self._enter_competition_failsafe(
+                            f"Task 3 başlatılamadı: {reason}"
+                        )
+                        return
+                self.task3.update(
+                    detections,
+                    frame_id=self.latest_detection_frame_id,
+                )
                 if self.task3.state == Task3State.FAILSAFE:
                     self._enter_competition_failsafe("Task 3 FAILSAFE.")
         except Exception as exc:  # noqa: BLE001

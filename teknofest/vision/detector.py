@@ -21,6 +21,12 @@ class BaseYOLODetector:
             project_root = Path(__file__).resolve().parent.parent
             model_p = project_root / model_path
 
+        if not model_p.is_file():
+            raise FileNotFoundError(
+                f"YOLO model dosyası bulunamadı: {model_p}. "
+                "Jetson'a teknofest/models/buoy/buoy.pt dosyasını yerleştirin."
+            )
+
         self.model = YOLO(str(model_p))
         self.device = device
         self.class_names = self.model.names

@@ -27,6 +27,7 @@ MAX_TRACK_ANGLE_JUMP_DEG = 30.0
 MAX_TRACK_DISTANCE_RATIO = 0.60
 MAX_APPROACH_SEGMENTS = 8
 APPROACH_TOTAL_TIMEOUT_SEC = 60.0
+DEFAULT_MIN_TARGET_CONFIDENCE = 0.65
 
 
 class ApproachState(Enum):
@@ -39,11 +40,13 @@ class ApproachState(Enum):
 
 
 class YaklasmaGorevi:
-    def __init__(self, node, mission_topics, target_class, safe_stop_distance=None):
+    def __init__(self, node, mission_topics, target_class, safe_stop_distance=None,
+                 min_target_confidence=DEFAULT_MIN_TARGET_CONFIDENCE):
         self.node = node
         self.logger = node.get_logger()
         self.topics = mission_topics
         self.target_class = target_class
+        self.min_target_confidence = float(min_target_confidence)
         self.impact_entry_distance = float(safe_stop_distance or IMPACT_ENTRY_DISTANCE_M)
         self.current_lat = self.current_lon = self.current_heading = None
         self.state = ApproachState.CONFIRMING_TARGET
@@ -84,6 +87,8 @@ class YaklasmaGorevi:
                 distance = float(det["distance"])
                 angle = float(det["Buoy angle: "])
                 confidence = float(det.get("confidence", 0.0))
+                if confidence < self.min_target_confidence:
+                    continue
                 if not (math.isfinite(distance) and distance > 0 and math.isfinite(angle)):
                     continue
                 if reference is not None:
@@ -219,7 +224,11 @@ class YaklasmaGorevi:
     def reset_approach(self):
         stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
         node, topics, target, distance = self.node, self.topics, self.target_class, self.impact_entry_distance
-        self.__init__(node, topics, target, safe_stop_distance=distance)
+        self.__init__(
+            node, topics, target,
+            safe_stop_distance=distance,
+            min_target_confidence=self.min_target_confidence,
+        )
 
 
     def get_status(self):

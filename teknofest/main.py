@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from multiprocessing import get_context
+from pathlib import Path
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
@@ -25,6 +26,24 @@ def launch_child_process(command):
         shell=True,
         executable="/bin/bash",
         start_new_session=True,
+    )
+
+
+def resolve_ros2_setup():
+    """Kurulu ROS 2 dağıtımını ortamdan veya /opt/ros altından bulur."""
+    requested = os.getenv("ROS_DISTRO", "").strip()
+    candidates = [requested] if requested else []
+    candidates.extend(["jazzy", "humble", "kilted", "foxy"])
+    seen = set()
+    for distro in candidates:
+        if not distro or distro in seen:
+            continue
+        seen.add(distro)
+        setup_path = Path("/opt/ros") / distro / "setup.bash"
+        if setup_path.is_file():
+            return f"source {shlex.quote(str(setup_path))}", distro
+    raise FileNotFoundError(
+        "ROS 2 setup.bash bulunamadı. ROS_DISTRO ayarını ve /opt/ros kurulumunu kontrol edin."
     )
 
 
@@ -149,10 +168,8 @@ if __name__ == "__main__":
         print("\n[SYSTEM] Vision and bridge node launch in ROS2...")
         time.sleep(1)
 
-        if os.path.isfile("/opt/ros/kilted/setup.bash"):
-            ros2_setup = "source /opt/ros/kilted/setup.bash"
-        else:
-            ros2_setup = "source /opt/ros/foxy/setup.bash"
+        ros2_setup, ros_distro = resolve_ros2_setup()
+        print(f"[SYSTEM] ROS 2 distribution: {ros_distro}")
 
         python_path_setup = (
             f"export PYTHONPATH={shlex.quote(PROJECT_ROOT)}:"

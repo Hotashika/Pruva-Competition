@@ -37,13 +37,18 @@ IMPACT_MAX_CAMERA_DISTANCE_M=2.0
 BASELINE_WINDOW=20
 CONF_DISTANCE_RATIO=0.30
 CONF_ANGLE_SPREAD_DEG=18.0
+DEFAULT_MIN_TARGET_CONFIDENCE=0.65
 
 class CarpmaState(Enum):
     CAMERA_CONFIRM=auto(); STRIKING=auto(); BACKING_OFF=auto(); COOLDOWN=auto(); COMPLETE=auto(); MISSED=auto()
 
 class CarpmaGorevi:
-    def __init__(self,node,mission_topics,target_class):
+    def __init__(self,node,mission_topics,target_class,
+                 min_target_confidence=DEFAULT_MIN_TARGET_CONFIDENCE,
+                 impact_delta_threshold=IMPACT_DELTA_THRESHOLD):
         self.node=node; self.logger=node.get_logger(); self.topics=mission_topics; self.target_class=target_class
+        self.min_target_confidence=float(min_target_confidence)
+        self.impact_delta_threshold=float(impact_delta_threshold)
         self.state=CarpmaState.CAMERA_CONFIRM; self.finished=False; self.success=False; self.hit_count=0
         self.current_lat=self.current_lon=self.current_heading=None
         self.latest_target=None; self.last_seen_time=None; self.last_processed_frame_id=None
@@ -66,8 +71,8 @@ class CarpmaGorevi:
             self.accel_baseline.append(mag); self.spike_count=0; return
         if len(self.accel_baseline)<max(5,BASELINE_WINDOW//2): self.accel_baseline.append(mag); return
         baseline=sum(self.accel_baseline)/len(self.accel_baseline); delta=abs(mag-baseline)
-        self.spike_count=self.spike_count+1 if delta>=IMPACT_DELTA_THRESHOLD else 0
-        if delta<IMPACT_DELTA_THRESHOLD: self.accel_baseline.append(mag)
+        self.spike_count=self.spike_count+1 if delta>=self.impact_delta_threshold else 0
+        if delta<self.impact_delta_threshold: self.accel_baseline.append(mag)
         if self.spike_count>=IMPACT_CONSECUTIVE_SAMPLES: self._register_hit(delta)
 
     def _select_target(self,detections):
@@ -76,6 +81,7 @@ class CarpmaGorevi:
             try:
                 if det.get('class')!=self.target_class: continue
                 d=float(det['distance']); a=float(det['Buoy angle: ']); c=float(det.get('confidence',0))
+                if c<self.min_target_confidence: continue
                 if math.isfinite(d) and d>0 and math.isfinite(a): valid.append((c,det))
             except (KeyError,TypeError,ValueError): continue
         return max(valid,key=lambda x:x[0])[1] if valid else None
@@ -174,5 +180,10 @@ class CarpmaGorevi:
     def should_retry_search(self): return self.state==CarpmaState.MISSED
     def reset_carpma(self):
         stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)
-        target=self.target_class; node=self.node; topics=self.topics; self.__init__(node,topics,target)
+        target=self.target_class; node=self.node; topics=self.topics
+        self.__init__(
+            node, topics, target,
+            min_target_confidence=self.min_target_confidence,
+            impact_delta_threshold=self.impact_delta_threshold,
+        )
     def get_status(self): return {'state':self.state.name,'finished':self.finished,'success':self.success,'hit_count':self.hit_count,'required_hits':REQUIRED_HITS}

@@ -437,6 +437,7 @@ class Task1Node(Node):
         self.valid_heading_received = False
 
         self.latest_detections = []
+        self.latest_detection_frame_id = None
         self.last_detection_message_time = None
 
         detection_qos = QoSProfile(
@@ -532,6 +533,10 @@ class Task1Node(Node):
             return
 
         self.latest_detections = detections
+        if isinstance(parsed, dict):
+            self.latest_detection_frame_id = parsed.get("frame_id", parsed.get("timestamp"))
+        else:
+            self.latest_detection_frame_id = None
         self.last_detection_message_time = time.monotonic()
 
     def _get_fresh_detections(self):

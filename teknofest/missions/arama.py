@@ -36,6 +36,7 @@ MAX_CONFIRM_ANGLE_SPREAD_DEG = 18.0
 MAX_CONFIRM_DISTANCE_RATIO = 0.45
 SEARCH_MAX_TRACK_ANGLE_JUMP_DEG = 30.0
 SEARCH_MAX_TRACK_DISTANCE_RATIO = 0.60
+DEFAULT_MIN_TARGET_CONFIDENCE = 0.65
 class SearchState(Enum):
     START_STEP = auto()
     TURNING = auto()
@@ -45,12 +46,14 @@ class SearchState(Enum):
 
 
 class AramaGorevi:
-    def __init__(self, node, mission_topics, target_class, test_mode=False):
+    def __init__(self, node, mission_topics, target_class, test_mode=False,
+                 min_target_confidence=DEFAULT_MIN_TARGET_CONFIDENCE):
         self.node = node
         self.logger = node.get_logger()
         self.topics = mission_topics
         self.target_class = target_class
         self.test_mode = test_mode
+        self.min_target_confidence = float(min_target_confidence)
         self.state = SearchState.START_STEP
         self.finished = False
         self.failed = False
@@ -89,6 +92,8 @@ class AramaGorevi:
                 distance = float(det["distance"])
                 angle = float(det["Buoy angle: "])
                 confidence = float(det.get("confidence", 0.0))
+                if confidence < self.min_target_confidence:
+                    continue
                 if not (math.isfinite(distance) and distance > 0 and math.isfinite(angle)):
                     continue
                 if reference is not None:
