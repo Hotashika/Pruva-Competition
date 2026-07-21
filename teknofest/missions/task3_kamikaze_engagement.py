@@ -304,7 +304,10 @@ class Task3KamikazeEngagement:
         """
 
         if not self.mission_enabled:
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            # Pasif durumda hareket komutu yayimlama. Gercek STOP komutu
+            # stop_mission() yolundan, kapanis ise node cleanup yolundan araci
+            # acikca durdurur. Boylece gorev baslamadan Bridge'e 10 Hz sifir
+            # hiz komutu gonderilmez.
             return
 
         gps_ok = self._check_watchdog()

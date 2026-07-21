@@ -267,7 +267,13 @@ if __name__ == "__main__":
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
-        data_writer.run(frame_lock, frame_ready_event, capture_stop_event)
+        data_writer.run(
+            frame_lock,
+            frame_ready_event,
+            capture_stop_event,
+            fx=fx,
+            cx=cx,
+        )
 
     except KeyboardInterrupt:
         print("\n[SYSTEM] Stopped by the user (Ctrl+C)...")

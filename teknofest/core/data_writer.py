@@ -221,7 +221,7 @@ def draw_frame_timestamp(frame, timestamp_ms, frame_index):
 
 
 # noinspection D
-def run(frame_lock=None, frame_ready_event=None, stop_event=None):
+def run(frame_lock=None, frame_ready_event=None, stop_event=None, fx=None, cx=None):
     setup_output_dirs()
 
     frame_index = 0
@@ -258,6 +258,8 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
     # Döngünün içinde oluşturulmaz; yoksa her frame'de model tekrar yüklenir.
     try:
         buoy_detector = BuoyDetector(
+            fx=fx,
+            cx=cx,
             use_tracking=ENABLE_TRACKING,
         )
     except Exception:
