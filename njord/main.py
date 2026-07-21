@@ -21,13 +21,6 @@ from njord.servers import data_server
 from njord.servers import video_server
 
 
-DATASET_OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "logs", "datasets")
-DATASET_TASK_NAME = (
-    os.getenv("NJORD_DATASET_TASK", "task2").strip().lower() or "task2"
-)
-DATASET_RECORD_FPS = float(os.getenv("NJORD_DATASET_RECORD_FPS", "5.0"))
-
-
 def launch_child_process(command):
     return subprocess.Popen(
         command,
@@ -111,7 +104,6 @@ def start_capture_process():
     frame_lock = mp_context.Lock()
     frame_ready_event = mp_context.Event()
     stop_event = mp_context.Event()
-    dataset_record_event = mp_context.Event()
     ready_queue = mp_context.Queue(maxsize=1)
 
     process = mp_context.Process(
@@ -121,10 +113,6 @@ def start_capture_process():
             "frame_ready_event": frame_ready_event,
             "stop_event": stop_event,
             "ready_queue": ready_queue,
-            "dataset_output_root": DATASET_OUTPUT_ROOT,
-            "dataset_task": DATASET_TASK_NAME,
-            "dataset_record_fps": DATASET_RECORD_FPS,
-            "dataset_record_event": dataset_record_event,
         },
         daemon=False,
     )
@@ -148,22 +136,11 @@ def start_capture_process():
     fx = ready_msg["fx"]
     cx = ready_msg["cx"]
     print(f"[SYSTEM] ZED calibration loaded: fx={fx:.2f}, cx={cx:.2f}")
-    if "dataset_run_dir" in ready_msg:
-        print(f"[SYSTEM] Dataset recording -> {ready_msg['dataset_run_dir']}")
-    if "dataset_waiting_for_task" in ready_msg:
-        print(
-            "[SYSTEM] Dataset recorder is waiting for active task -> "
-            f"{ready_msg['dataset_waiting_for_task']}"
-        )
-    if "dataset_error" in ready_msg:
-        print(f"[SYSTEM] Dataset recording disabled: {ready_msg['dataset_error']}")
-
     return (
         process,
         frame_lock,
         frame_ready_event,
         stop_event,
-        dataset_record_event,
         fx,
         cx,
     )
@@ -175,7 +152,6 @@ if __name__ == "__main__":
     bridge_only = False
     capture_process = None
     capture_stop_event = None
-    dataset_record_event = None
     frame_lock = None
     frame_ready_event = None
     p_bridge = None
@@ -192,7 +168,6 @@ if __name__ == "__main__":
                 frame_lock,
                 frame_ready_event,
                 capture_stop_event,
-                dataset_record_event,
                 fx,
                 cx,
             ) = start_capture_process()
@@ -266,8 +241,6 @@ if __name__ == "__main__":
                 frame_lock,
                 frame_ready_event,
                 capture_stop_event,
-                dataset_record_event=dataset_record_event,
-                dataset_task=DATASET_TASK_NAME,
             )
 
     except KeyboardInterrupt:
