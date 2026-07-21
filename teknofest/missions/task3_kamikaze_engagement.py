@@ -27,6 +27,7 @@ v5'ten devralınan tasarım:
 
 import json
 import math
+import os
 import sys
 import time
 from enum import Enum, auto
@@ -79,6 +80,16 @@ SAFETY_STOP_DISTANCE = 1.0
 MIN_TARGET_CONFIDENCE = 0.65
 IMPACT_THRESHOLD_MPS2 = 4.0
 USE_FORCE_ARM = False
+
+
+def _env_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+AUTO_START_DEFAULT = _env_flag("TASK3_AUTO_START", False)
 
 
 class MissionState(Enum):
@@ -420,6 +431,7 @@ class Task3Node(Node):
         self.declare_parameter('min_target_confidence', MIN_TARGET_CONFIDENCE)
         self.declare_parameter('impact_delta_threshold', IMPACT_THRESHOLD_MPS2)
         self.declare_parameter('use_force_arm', USE_FORCE_ARM)
+        self.declare_parameter('auto_start', AUTO_START_DEFAULT)
 
         color = self.get_parameter('carpilacak_duba').get_parameter_value().string_value
         color = color.strip().lower()
@@ -428,6 +440,7 @@ class Task3Node(Node):
         self.min_target_confidence = self.get_parameter('min_target_confidence').get_parameter_value().double_value
         self.impact_delta_threshold = self.get_parameter('impact_delta_threshold').get_parameter_value().double_value
         self.use_force_arm = self.get_parameter('use_force_arm').get_parameter_value().bool_value
+        self.auto_start = self.get_parameter('auto_start').get_parameter_value().bool_value
 
         if not 0.0 < self.min_target_confidence <= 1.0:
             raise ValueError("min_target_confidence 0 ile 1 arasında olmalıdır.")
@@ -449,6 +462,7 @@ class Task3Node(Node):
         self.get_logger().info(f"📷 Minimum tespit güveni: {self.min_target_confidence:.2f}")
         self.get_logger().info(f"💥 IMU temas eşiği: {self.impact_delta_threshold:.2f} m/s²")
         self.get_logger().info(f"🔐 ARM yöntemi: {'FORCE ARM' if self.use_force_arm else 'normal ARM'}")
+        self.get_logger().info(f"Otomatik başlangıç: {'AÇIK' if self.auto_start else 'KAPALI'}")
 
         self.mission_clients = create_mission_clients(self)
         wait_for_mission_services(self, self.mission_clients)
@@ -514,6 +528,15 @@ class Task3Node(Node):
 
         self.control_timer = self.create_timer(0.1, self.timer_callback)
 
+        self.auto_start_attempted = False
+        self.auto_start_timer = None
+        if self.auto_start:
+            self.auto_start_timer = self.create_timer(0.5, self._auto_start_callback)
+            self.get_logger().warning(
+                "[AUTO START] Etkin. Gerçek GPS, heading, kamera ve Bridge "
+                "hazır olunca bir kez GUIDED + normal ARM denenecek."
+            )
+
         if self.test_mode:
             self.status_timer = self.create_timer(5.0, self.status_callback)
 
@@ -533,6 +556,10 @@ class Task3Node(Node):
             return False, "GPS/heading bayat."
         if self.task.bridge_connected is False:
             return False, "Orange Cube bridge bağlı değil."
+        if self.task.last_vision_time is None:
+            return False, "Gerçek kamera/vision verisi henüz alınmadı."
+        if now - self.task.last_vision_time > VISION_TIMEOUT_SEC:
+            return False, "Gerçek kamera/vision verisi bayat."
         if call_set_mode(self, self.mission_clients.set_mode_client, DRIVE_MODE) is False:
             return False, f"{DRIVE_MODE} moduna geçilemedi."
         arm_client = (
@@ -544,6 +571,48 @@ class Task3Node(Node):
         if call_trigger_service(self, arm_client, arm_label) is False:
             return False, f"{arm_label} başarısız."
         return self.task.start_mission()
+
+    def _auto_start_callback(self):
+        """Gerçek sensörler hazır olduktan sonra yalnızca bir kez başlat."""
+        if self.auto_start_attempted or self.task.mission_enabled:
+            return
+
+        now = time.monotonic()
+        navigation_ready = (
+            self.task.last_gps_time is not None
+            and self.task.last_heading_time is not None
+            and now - self.task.last_gps_time <= GPS_TIMEOUT_SEC
+            and now - self.task.last_heading_time <= HEADING_TIMEOUT_SEC
+        )
+        vision_ready = (
+            self.task.last_vision_time is not None
+            and now - self.task.last_vision_time <= VISION_TIMEOUT_SEC
+        )
+        bridge_ready = self.task.bridge_connected is True
+
+        if not (navigation_ready and vision_ready and bridge_ready):
+            self.get_logger().info(
+                "[AUTO START] Gerçek veriler bekleniyor: "
+                f"gps_heading={navigation_ready}, vision={vision_ready}, "
+                f"bridge={bridge_ready}",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        # GUIDED/ARM aşamasına bir kez girilir. Başarısız ARM'ı otomatik
+        # tekrarlamak güvenli değildir; yeni deneme için süreç yeniden açılır.
+        self.auto_start_attempted = True
+        if self.auto_start_timer is not None:
+            self.auto_start_timer.cancel()
+
+        ok, message = self._arm_and_start()
+        if ok:
+            self.get_logger().info(f"[AUTO START] {message}")
+        else:
+            self.get_logger().error(
+                f"[AUTO START] Başlatılamadı: {message}. "
+                "Güvenlik için otomatik ARM tekrar denenmeyecek."
+            )
 
     def _ack_mission_command(self, command):
         ack = Int32()
