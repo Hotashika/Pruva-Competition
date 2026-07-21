@@ -10,6 +10,14 @@ import time
 from pymavlink import mavutil
 
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
+if COMPETITION_ROOT not in sys.path:
+    sys.path.insert(0, COMPETITION_ROOT)
+
+from njord.config.mission_config import MISSION_COMMANDS
+
+
 MISSION_PARAM_NAME = "SCR_USER1"
 MISSION_IDLE = 0
 MISSION_1 = 1
@@ -21,20 +29,14 @@ MISSION_EMERGENCY = 99
 
 VALID_MISSION_COMMANDS = {
     MISSION_IDLE,
-    MISSION_1,
-    MISSION_2,
-    MISSION_3,
-    MISSION_4,
+    *MISSION_COMMANDS,
     MISSION_STOP,
     MISSION_EMERGENCY,
 }
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MISSION_PATHS = {
-    MISSION_1: os.path.join(PROJECT_ROOT, "missions", "task1_maneuvering_and_path_finding.py"),
-    MISSION_2: os.path.join(PROJECT_ROOT, "missions", "task2_collision_avoidance.py"),
-    MISSION_3: os.path.join(PROJECT_ROOT, "missions", "task3_docking.py"),
-    MISSION_4: os.path.join(PROJECT_ROOT, "missions", "task4_surprise.py"),
+    command: os.path.join(PROJECT_ROOT, "missions", mission_filename)
+    for command, (_, _, mission_filename) in MISSION_COMMANDS.items()
 }
 
 

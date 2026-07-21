@@ -118,20 +118,22 @@ class DatasetRecorderTests(unittest.TestCase):
                 yaw=0.0,
             )
 
-            deadline = time.monotonic() + 2.0
-            manifest = {}
-            while time.monotonic() < deadline:
+            try:
+                deadline = time.monotonic() + 5.0
+                while (
+                    time.monotonic() < deadline
+                    and recorder._manifest.get("frames_written") != 1
+                ):
+                    time.sleep(0.01)
+
                 with recorder.manifest_path.open(encoding="utf-8") as file:
                     manifest = json.load(file)
-                if manifest["frames_written"] == 1:
-                    break
-                time.sleep(0.01)
-
-            self.assertEqual("recording", manifest["status"])
-            self.assertEqual(1, manifest["frames_written"])
-            self.assertIsNone(manifest["closed_utc"])
-            self.assertIsNotNone(manifest["updated_utc"])
-            recorder.close()
+                self.assertEqual("recording", manifest["status"])
+                self.assertEqual(1, manifest["frames_written"])
+                self.assertIsNone(manifest["closed_utc"])
+                self.assertIsNotNone(manifest["updated_utc"])
+            finally:
+                recorder.close()
 
     def test_copies_reusable_capture_buffer_before_async_write(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:

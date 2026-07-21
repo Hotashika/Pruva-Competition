@@ -1,5 +1,5 @@
 """
-    python3 tests/test_angle.py --device cuda
+    python3 tests/manual/angle_check.py --device cuda
 """
 import argparse
 import importlib
