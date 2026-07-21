@@ -29,6 +29,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from enum import Enum, auto
 from pathlib import Path
@@ -47,13 +48,13 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32, String
 from sensor_msgs.msg import Imu
+from mavros_msgs.srv import SetMode
+from std_srvs.srv import Trigger
 
 from utils.mavlink_utilities import (
     create_mission_topics,
     create_mission_clients,
     wait_for_mission_services,
-    call_set_mode,
-    call_trigger_service,
     stop_vehicle,
     calculate_gps_distance,
 )
@@ -526,6 +527,8 @@ class Task3Node(Node):
         self.vision_frame_sequence = 0
         self.last_detection_time = None
 
+        self.start_action_in_progress = False
+        self.start_cancel_requested = False
         self.control_timer = self.create_timer(0.1, self.timer_callback)
 
         self.auto_start_attempted = False
@@ -548,6 +551,37 @@ class Task3Node(Node):
         msg.data = "task3"
         self.active_task_pub.publish(msg)
 
+    def _wait_service_future(self, future, timeout_sec, label):
+        """ROS executor'ü başka thread'de yanıtı işlerken pasif olarak bekle."""
+        completed = threading.Event()
+        future.add_done_callback(lambda _future: completed.set())
+        if not completed.wait(timeout_sec):
+            self.get_logger().error(f"{label} servis zaman aşımı ({timeout_sec:.1f}s).")
+            return None
+        if future.exception() is not None:
+            self.get_logger().error(f"{label} servis hatası: {future.exception()!r}")
+            return None
+        return future.result()
+
+    def _set_mode_and_wait(self, mode_name, timeout_sec=5.0):
+        request = SetMode.Request()
+        request.base_mode = 0
+        request.custom_mode = str(mode_name)
+        self.get_logger().info(f"SET_MODE servis isteği: {mode_name}")
+        future = self.mission_clients.set_mode_client.call_async(request)
+        response = self._wait_service_future(future, timeout_sec, "SET_MODE")
+        return bool(response is not None and response.mode_sent)
+
+    def _trigger_and_wait(self, client, label, timeout_sec=5.0):
+        self.get_logger().info(f"{label} servis isteği gönderiliyor.")
+        future = client.call_async(Trigger.Request())
+        response = self._wait_service_future(future, timeout_sec, label)
+        if response is None:
+            return False
+        log = self.get_logger().info if response.success else self.get_logger().error
+        log(f"{label} sonucu: success={response.success}, message={response.message!r}")
+        return bool(response.success)
+
     def _arm_and_start(self):
         now = time.monotonic()
         if self.task.last_gps_time is None or self.task.last_heading_time is None:
@@ -560,17 +594,44 @@ class Task3Node(Node):
             return False, "Gerçek kamera/vision verisi henüz alınmadı."
         if now - self.task.last_vision_time > VISION_TIMEOUT_SEC:
             return False, "Gerçek kamera/vision verisi bayat."
-        if call_set_mode(self, self.mission_clients.set_mode_client, DRIVE_MODE) is False:
+        if self._set_mode_and_wait(DRIVE_MODE) is False:
             return False, f"{DRIVE_MODE} moduna geçilemedi."
+        if self.start_cancel_requested:
+            return False, "Başlatma STOP/ACİL STOP nedeniyle iptal edildi."
         arm_client = (
             self.mission_clients.force_arm_client
             if self.use_force_arm
             else self.mission_clients.arm_client
         )
         arm_label = "FORCE ARM" if self.use_force_arm else "ARM"
-        if call_trigger_service(self, arm_client, arm_label) is False:
+        if self._trigger_and_wait(arm_client, arm_label) is False:
             return False, f"{arm_label} başarısız."
+        if self.start_cancel_requested:
+            self._trigger_and_wait(self.mission_clients.disarm_client, "İPTAL DISARM")
+            return False, "Başlatma STOP/ACİL STOP nedeniyle iptal edildi."
         return self.task.start_mission()
+
+    def _start_mission_worker(self, source, ack_command=None):
+        try:
+            ok, message = self._arm_and_start()
+            logger = self.get_logger().info if ok else self.get_logger().error
+            logger(f"[{source}] {message}")
+            if ok and ack_command is not None:
+                self._ack_mission_command(ack_command)
+        finally:
+            self.start_action_in_progress = False
+
+    def _launch_start_worker(self, source, ack_command=None):
+        if self.start_action_in_progress or self.task.mission_enabled:
+            return False
+        self.start_cancel_requested = False
+        self.start_action_in_progress = True
+        threading.Thread(
+            target=self._start_mission_worker,
+            args=(source, ack_command),
+            daemon=True,
+        ).start()
+        return True
 
     def _auto_start_callback(self):
         """Gerçek sensörler hazır olduktan sonra yalnızca bir kez başlat."""
@@ -605,14 +666,7 @@ class Task3Node(Node):
         if self.auto_start_timer is not None:
             self.auto_start_timer.cancel()
 
-        ok, message = self._arm_and_start()
-        if ok:
-            self.get_logger().info(f"[AUTO START] {message}")
-        else:
-            self.get_logger().error(
-                f"[AUTO START] Başlatılamadı: {message}. "
-                "Güvenlik için otomatik ARM tekrar denenmeyecek."
-            )
+        self._launch_start_worker("AUTO START")
 
     def _ack_mission_command(self, command):
         ack = Int32()
@@ -625,19 +679,21 @@ class Task3Node(Node):
             if self.task.mission_enabled:
                 self._ack_mission_command(command)
                 return
-            ok, text = self._arm_and_start()
-            (self.get_logger().info if ok else self.get_logger().error)(f"[KOMUT SİSTEMİ] {text}")
-            if ok:
-                self._ack_mission_command(command)
+            if not self._launch_start_worker("KOMUT SİSTEMİ", ack_command=command):
+                self.get_logger().warning("Başlatma işlemi zaten devam ediyor.")
         elif command in (90, 99):
+            self.start_cancel_requested = True
             self.task.stop_mission("Pixhawk/bridge durdurma komutu")
             if command == 99:
-                disarm_ok = call_trigger_service(
-                    self, self.mission_clients.disarm_client, "ACİL DISARM"
-                )
-                if disarm_ok is False:
-                    self.get_logger().error("[ACİL DURDURMA] DISARM doğrulanamadı.")
+                threading.Thread(
+                    target=self._emergency_disarm_worker,
+                    daemon=True,
+                ).start()
             self._ack_mission_command(command)
+
+    def _emergency_disarm_worker(self):
+        if not self._trigger_and_wait(self.mission_clients.disarm_client, "ACİL DISARM"):
+            self.get_logger().error("[ACİL DURDURMA] DISARM doğrulanamadı.")
 
     # --------------------------------------------------------
     def gps_callback(self, msg):
