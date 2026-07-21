@@ -21,6 +21,7 @@ from collections import deque
 from enum import Enum, auto
 
 from utils.mavlink_utilities import (
+    calculate_bearing,
     calculate_gps_distance,
     publish_cmd_vel,
     stop_vehicle,
@@ -30,6 +31,7 @@ SEARCH_STEP_DEG = 20.0
 STEP_HOLD_SEC = 5.0
 TURN_TIMEOUT_SEC = 12.0
 HEADING_TOLERANCE_DEG = 3.0
+HOLD_MAX_HEADING_DRIFT_DEG = 3.0
 # Skid-steer mikserinde saat yönü steering ile birlikte küçük pozitif taban
 # itki, dıştaki (sol) motoru ileri sürüp içteki (sağ) motoru durdurmak içindir.
 # Saf thrust=0 komutu sahada iki ESC tarafından aynı yönde uygulanmıştı.
@@ -43,6 +45,7 @@ RELOCATION_DISTANCE_M = 2.0
 RELOCATION_THRUST = 0.20
 RELOCATION_TIMEOUT_SEC = 20.0
 RELOCATION_CONFIRM_GPS_SAMPLES = 3
+RELOCATION_MAX_LATERAL_M = 1.0
 SEARCH_CONFIRM_FRAMES = 5
 SEARCH_CONFIRM_WINDOW_SEC = 5.0
 MAX_CONFIRM_ANGLE_SPREAD_DEG = 18.0
@@ -76,6 +79,8 @@ class AramaGorevi:
         self.home_lat = self.home_lon = None
         self.step_target_heading = self.step_start_time = self.hold_until = None
         self.turn_start_heading_deg = None
+        self.turn_start_error_deg = None
+        self.scan_origin_heading_deg = None
         self.completed_steps = 0
         self.turn_retry_count = 0
         self.gps_update_sequence = 0
@@ -160,8 +165,19 @@ class AramaGorevi:
     def _start_turn(self, now):
         if self.current_heading_deg is None:
             return
-        self.step_target_heading = (self.current_heading_deg + SEARCH_STEP_DEG) % 360.0
+        # Hedefleri her seferinde mevcut heading uzerinden kurmak, 3 derecelik
+        # toleransi 18 adim boyunca biriktirip eksik bir "360 derece" taramaya
+        # yol acar. Tum adimlar ilk tarama basligina sabitlenir.
+        if self.scan_origin_heading_deg is None:
+            self.scan_origin_heading_deg = self.current_heading_deg
+        self.step_target_heading = (
+            self.scan_origin_heading_deg
+            + (self.completed_steps + 1) * SEARCH_STEP_DEG
+        ) % 360.0
         self.turn_start_heading_deg = self.current_heading_deg
+        self.turn_start_error_deg = abs(
+            self._angle_error(self.step_target_heading, self.current_heading_deg)
+        )
         self.step_start_time = now
         self.state = SearchState.TURNING
 
@@ -169,17 +185,19 @@ class AramaGorevi:
         error_deg = self._angle_error(self.step_target_heading, self.current_heading_deg)
         if abs(error_deg) <= HEADING_TOLERANCE_DEG:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            self.completed_steps += 1
             self.turn_retry_count = 0
             self.hold_until = now + STEP_HOLD_SEC
             self.state = SearchState.HOLDING
             self.confirmations.clear()
-            self.logger.info(f"[ARAMA] {self.completed_steps}/{FULL_SCAN_STEPS} adım tamamlandı; 5 sn tarama.")
+            self.logger.info(
+                f"[ARAMA] {self.completed_steps + 1}/{FULL_SCAN_STEPS} açıya ulaşıldı; "
+                "araç durdu ve 5 sn tarama başladı."
+            )
             return
         if now - self.step_start_time > TURN_TIMEOUT_SEC:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             self.turn_retry_count += 1
-            if self.turn_retry_count > TURN_MAX_RETRIES:
+            if self.turn_retry_count >= TURN_MAX_RETRIES:
                 self.failed = True
                 self.state = SearchState.FAILED
                 self.logger.error(
@@ -192,18 +210,18 @@ class AramaGorevi:
             )
             return
         if now - self.step_start_time >= TURN_PROGRESS_TIMEOUT_SEC:
-            clockwise_progress_deg = self._angle_error(
-                self.current_heading_deg,
-                self.turn_start_heading_deg,
+            remaining_error_deg = abs(
+                self._angle_error(self.step_target_heading, self.current_heading_deg)
             )
-            if clockwise_progress_deg < TURN_MIN_PROGRESS_DEG:
+            error_reduction_deg = self.turn_start_error_deg - remaining_error_deg
+            if error_reduction_deg < TURN_MIN_PROGRESS_DEG:
                 stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
                 self.failed = True
                 self.state = SearchState.FAILED
                 self.logger.error(
                     "[ARAMA] Dönüş komutuna rağmen heading 3 sn içinde "
-                    f"saat yönünde {TURN_MIN_PROGRESS_DEG:.1f}° değişmedi "
-                    f"(ölçülen={clockwise_progress_deg:.1f}°); motorlar durduruldu."
+                    f"hedefe doğru {TURN_MIN_PROGRESS_DEG:.1f}° ilerlemedi "
+                    f"(hata azalması={error_reduction_deg:.1f}°); motorlar durduruldu."
                 )
                 return
         yaw_offset = max(-MAX_YAW_OFFSET_RAD, min(MAX_YAW_OFFSET_RAD, math.radians(error_deg)))
@@ -240,11 +258,25 @@ class AramaGorevi:
             self.current_lat,
             self.current_lon,
         )
+        movement_bearing_deg = calculate_bearing(
+            self.relocation_start_lat,
+            self.relocation_start_lon,
+            self.current_lat,
+            self.current_lon,
+        )
+        movement_angle_rad = math.radians(
+            self._angle_error(movement_bearing_deg, self.relocation_heading_deg)
+        )
+        forward_progress_m = distance_m * math.cos(movement_angle_rad)
+        lateral_offset_m = abs(distance_m * math.sin(movement_angle_rad))
 
         # Kontrol döngüsü GPS'ten hızlıdır; aynı GPS örneğini üç kez sayma.
         if self.gps_update_sequence != self.relocation_last_checked_gps_sequence:
             self.relocation_last_checked_gps_sequence = self.gps_update_sequence
-            if distance_m >= RELOCATION_DISTANCE_M:
+            if (
+                forward_progress_m >= RELOCATION_DISTANCE_M
+                and lateral_offset_m <= RELOCATION_MAX_LATERAL_M
+            ):
                 self.relocation_confirm_count += 1
             else:
                 self.relocation_confirm_count = 0
@@ -256,7 +288,8 @@ class AramaGorevi:
             self.state = SearchState.START_STEP
             self.logger.info(
                 f"[ARAMA] Yeni konum {self.relocation_confirm_count} ardışık "
-                f"GPS örneğiyle doğrulandı ({distance_m:.2f} m); yeni 360° tarama başlıyor."
+                f"GPS örneğiyle doğrulandı (ileri={forward_progress_m:.2f} m, "
+                f"yanal={lateral_offset_m:.2f} m); yeni 360° tarama başlıyor."
             )
             return
 
@@ -279,11 +312,6 @@ class AramaGorevi:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return self.finished
         now = time.monotonic()
-        # Dönüş sırasındaki bulanık/değişken kareler hedef onayına
-        # katılmaz. Kamera yalnızca motor komutu sıfırken, 5 saniyelik
-        # sabit bakış penceresinde değerlendirilir.
-        if self.state == SearchState.HOLDING and self._process_camera_frame(detections, frame_id, now):
-            return True
         if None in (self.current_heading_deg, self.current_lat, self.current_lon):
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return False
@@ -298,7 +326,32 @@ class AramaGorevi:
             self._turn(now)
         elif self.state == SearchState.HOLDING:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            hold_error_deg = abs(
+                self._angle_error(self.step_target_heading, self.current_heading_deg)
+            )
+            if hold_error_deg > HOLD_MAX_HEADING_DRIFT_DEG:
+                # Dalga/atalet araci dondurmeye devam ederse hareketli kareleri
+                # tarama onayina katma. Ayni mutlak 20 derece hedefine geri don.
+                self.confirmations.clear()
+                self.turn_start_heading_deg = self.current_heading_deg
+                self.turn_start_error_deg = hold_error_deg
+                self.step_start_time = now
+                self.state = SearchState.TURNING
+                self.logger.warning(
+                    f"[ARAMA] 5 sn tarama sırasında heading {hold_error_deg:.1f}° "
+                    "saptı; görüntüler reddedildi ve aynı açı düzeltiliyor."
+                )
+                return False
+            # Dönüş sırasındaki bulanık/değişken kareler hedef onayına
+            # katılmaz. Kamera yalnız motor komutu sıfırken ve heading sabitken
+            # değerlendirilir.
+            if self._process_camera_frame(detections, frame_id, now):
+                return True
             if now >= self.hold_until:
+                # Adımı hedef açıya ilk varışta değil, ancak 5 saniyelik sabit
+                # görüş taraması bitince say. HOLD sapmasını düzeltmek böylece
+                # aynı açıyı ikinci kez tamamlanmış gibi saymaz.
+                self.completed_steps += 1
                 self.state = SearchState.START_STEP
         elif self.state == SearchState.RELOCATING:
             self._relocate(now)
@@ -312,6 +365,8 @@ class AramaGorevi:
         self.completed_steps = 0
         self.step_target_heading = self.step_start_time = self.hold_until = None
         self.turn_start_heading_deg = None
+        self.turn_start_error_deg = None
+        self.scan_origin_heading_deg = None
         self.turn_retry_count = 0
         self.relocation_start_lat = self.relocation_start_lon = None
         self.relocation_heading_deg = self.relocation_start_time = None

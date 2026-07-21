@@ -14,7 +14,12 @@ import math
 import time
 from collections import deque
 from enum import Enum, auto
-from utils.mavlink_utilities import calculate_gps_distance, publish_cmd_vel, stop_vehicle
+from utils.mavlink_utilities import (
+    calculate_bearing,
+    calculate_gps_distance,
+    publish_cmd_vel,
+    stop_vehicle,
+)
 
 REQUIRED_HITS=3
 CAMERA_CONFIRM_FRAMES=5
@@ -29,6 +34,7 @@ BACKOFF_SPEED=-0.18
 BACKOFF_TIMEOUT_SEC=5.0
 BACKOFF_REQUIRED_GPS_M=0.60
 BACKOFF_REQUIRED_CAMERA_INCREASE_M=0.40
+BACKOFF_MAX_HEADING_CORRECTION_RAD=0.18
 COOLDOWN_SEC=0.8
 IMPACT_DELTA_THRESHOLD=4.0
 IMPACT_CONSECUTIVE_SAMPLES=2
@@ -37,6 +43,9 @@ IMPACT_MAX_CAMERA_DISTANCE_M=2.0
 BASELINE_WINDOW=20
 CONF_DISTANCE_RATIO=0.30
 CONF_ANGLE_SPREAD_DEG=18.0
+MAX_TRACK_ANGLE_JUMP_DEG=30.0
+MAX_TRACK_DISTANCE_RATIO=0.60
+BACKOFF_MAX_LATERAL_M=1.0
 DEFAULT_MIN_TARGET_CONFIDENCE=0.65
 
 class CarpmaState(Enum):
@@ -56,6 +65,7 @@ class CarpmaGorevi:
         self.current_speed=0.0; self.accel_baseline=deque(maxlen=BASELINE_WINDOW); self.spike_count=0
         self.last_impact_time=None; self.strike_start_time=None; self.strike_start_lat=None; self.strike_start_lon=None
         self.backoff_start_time=None; self.backoff_start_lat=None; self.backoff_start_lon=None; self.backoff_start_distance=None
+        self.backoff_heading_deg=None
         self.cooldown_start_time=None
 
     def update_gps(self,lat,lon,heading=None):
@@ -76,13 +86,18 @@ class CarpmaGorevi:
         if self.spike_count>=IMPACT_CONSECUTIVE_SAMPLES: self._register_hit(delta)
 
     def _select_target(self,detections):
-        valid=[]
+        valid=[]; reference=self.latest_target
         for det in detections or []:
             try:
                 if det.get('class')!=self.target_class: continue
                 d=float(det['distance']); a=float(det['Buoy angle: ']); c=float(det.get('confidence',0))
                 if c<self.min_target_confidence: continue
-                if math.isfinite(d) and d>0 and math.isfinite(a): valid.append((c,det))
+                if not (math.isfinite(d) and d>0 and math.isfinite(a)): continue
+                if reference is not None:
+                    old_d=float(reference['distance']); old_a=float(reference['Buoy angle: '])
+                    if abs(a-old_a)>MAX_TRACK_ANGLE_JUMP_DEG: continue
+                    if abs(d-old_d)>max(0.8,old_d*MAX_TRACK_DISTANCE_RATIO): continue
+                valid.append((c,det))
             except (KeyError,TypeError,ValueError): continue
         return max(valid,key=lambda x:x[0])[1] if valid else None
 
@@ -125,6 +140,7 @@ class CarpmaGorevi:
         self.state=CarpmaState.BACKING_OFF; self.backoff_start_time=now
         self.backoff_start_lat,self.backoff_start_lon=self.current_lat,self.current_lon
         self.backoff_start_distance=None if self.latest_target is None else float(self.latest_target['distance'])
+        self.backoff_heading_deg=self.current_heading
 
     def _strike(self,now):
         if self.latest_target is None: stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); return
@@ -146,15 +162,32 @@ class CarpmaGorevi:
 
     def _backoff(self,now):
         gps_far=False; camera_far=False
-        if None not in (self.backoff_start_lat,self.backoff_start_lon,self.current_lat,self.current_lon):
-            gps_far=calculate_gps_distance(self.backoff_start_lat,self.backoff_start_lon,self.current_lat,self.current_lon)>=BACKOFF_REQUIRED_GPS_M
+        if None not in (self.backoff_start_lat,self.backoff_start_lon,self.current_lat,self.current_lon,self.backoff_heading_deg):
+            moved=calculate_gps_distance(self.backoff_start_lat,self.backoff_start_lon,self.current_lat,self.current_lon)
+            bearing=calculate_bearing(self.backoff_start_lat,self.backoff_start_lon,self.current_lat,self.current_lon)
+            angle=math.radians((bearing-self.backoff_heading_deg+180.0)%360.0-180.0)
+            backward_progress=-moved*math.cos(angle)
+            lateral=abs(moved*math.sin(angle))
+            gps_far=(backward_progress>=BACKOFF_REQUIRED_GPS_M and lateral<=BACKOFF_MAX_LATERAL_M)
         if self.backoff_start_distance is not None and self.latest_target is not None:
             camera_far=float(self.latest_target['distance'])-self.backoff_start_distance>=BACKOFF_REQUIRED_CAMERA_INCREASE_M
         if gps_far or camera_far:
             stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); self.current_speed=0.0
             self.state=CarpmaState.COOLDOWN; self.cooldown_start_time=now; return
         if now-self.backoff_start_time>BACKOFF_TIMEOUT_SEC: self._miss('temastan sonra gerçek uzaklaşma doğrulanamadı'); return
-        self.current_speed=BACKOFF_SPEED; publish_cmd_vel(self.topics.cmd_vel_pub,linear_x=BACKOFF_SPEED,angular_z=0.0)
+        heading_error=0.0
+        if self.current_heading is not None and self.backoff_heading_deg is not None:
+            heading_error=(self.backoff_heading_deg-self.current_heading+180.0)%360.0-180.0
+        heading_correction=max(
+            -BACKOFF_MAX_HEADING_CORRECTION_RAD,
+            min(BACKOFF_MAX_HEADING_CORRECTION_RAD,math.radians(heading_error)),
+        )
+        self.current_speed=BACKOFF_SPEED
+        publish_cmd_vel(
+            self.topics.cmd_vel_pub,
+            linear_x=BACKOFF_SPEED,
+            angular_z=heading_correction,
+        )
 
     def _miss(self,reason):
         stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); self.current_speed=0.0

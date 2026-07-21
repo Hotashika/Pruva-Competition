@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
 """
 Task-3 Kamikaze Angajman Görevi — Ana Modül
-GERÇEK HAYAT TESTİ İÇİN DÜZELTİLMİŞ VERSİYON (v6 — arama.py/yaklasma.py/carpma.py
-ile birlikte güncellendi)
 
-v6 NOTU: Bu dosyada FONKSİYONEL bir değişiklik YAPILMADI. arama.py, yaklasma.py
-ve carpma.py'ye eklenen düzeltmeler (yerinde dönüş, dönüş retry limiti, kare-kare
-süreklilik filtresi, saldırıda saf yaw düzeltmesi, yaklaşma fazı toplam süre/segment
-sınırı) hepsi ilgili modüllerin İÇİNDE, mevcut public arayüzlerini (update_gps,
-update_heading, update_imu, update, reset_*, get_*status) DEĞİŞTİRMEDEN yapıldı.
-Bu yüzden bu orkestrasyon dosyasının üç modülü çağırma şekli aynı kalabildi;
-dosya bütünlük için burada aynen tekrar veriliyor.
-
-v5'ten devralınan tasarım:
+Tasarım:
   - Task3KamikazeEngagement, AramaGorevi -> YaklasmaGorevi -> CarpmaGorevi
     sırasını bir state machine ile yönetir (INIT -> SEARCHING -> APPROACHING
     -> CARPMA -> DONE), herhangi bir aşamada hedef kaybolursa SEARCHING'e
@@ -68,13 +58,14 @@ from teknofest.missions.carpma import CarpmaGorevi
 GPS_TIMEOUT_SEC = 3.0
 HEADING_TIMEOUT_SEC = 2.0
 VISION_TIMEOUT_SEC = 1.0
+IMU_TIMEOUT_SEC = 1.0
 GEOFENCE_RADIUS_M = 150.0
 DRIVE_MODE = "GUIDED"
 
-# Yarışma denemesinde vurulacak tek renk. Sonradan renk değişecekse
-# yalnızca bu sabiti ve yeni modelin sınıf adını güncelleyin.
+# Varsayılan hedef kırmızıdır; Parkur-3'te komutla siyah veya yeşil de seçilebilir.
 ACTIVE_TARGET_COLOR = "red"
 ACTIVE_TARGET_CLASS = f"{ACTIVE_TARGET_COLOR}_buoy"
+SUPPORTED_TARGET_COLORS = {"red", "green", "black"}
 TEST_MODE = False  # Yalnızca ayrıntılı log içindir; sensör verisi üretmez
 SAFETY_STOP_DISTANCE = 1.0
 MIN_TARGET_CONFIDENCE = 0.65
@@ -118,6 +109,7 @@ class Task3KamikazeEngagement:
         self.last_gps_time = None
         self.last_heading_time = None
         self.last_vision_time = None
+        self.last_imu_time = None
         self.home_lat = None
         self.home_lon = None
 
@@ -154,14 +146,6 @@ class Task3KamikazeEngagement:
         if self.current_lat is None or self.current_lon is None or self.current_heading is None:
             return False
 
-        if self.home_lat is None:
-            self.home_lat = self.current_lat
-            self.home_lon = self.current_lon
-            self.logger.info(
-                f"[GERÇEK VERİ] Home: {self.home_lat:.7f}, {self.home_lon:.7f}, "
-                f"heading={self.current_heading:.2f}°"
-            )
-
         self.arama.update_gps(self.current_lat, self.current_lon, self.current_heading)
         self.yaklasma.update_gps(self.current_lat, self.current_lon, self.current_heading)
         self.carpma.update_gps(self.current_lat, self.current_lon, self.current_heading)
@@ -174,6 +158,16 @@ class Task3KamikazeEngagement:
         if self.current_lat is None or self.current_lon is None or self.current_heading is None:
             return False, "Gerçek GPS ve heading henüz hazır değil."
         self.reset_search()
+        # Geofence merkezi ilk GPS paketinde degil, gerçek START aninda
+        # sabitlenir. Arac karada acilip suya tasinirsa eski konum home kalmaz.
+        self.home_lat = self.current_lat
+        self.home_lon = self.current_lon
+        self.arama.home_lat = self.current_lat
+        self.arama.home_lon = self.current_lon
+        self.logger.info(
+            f"[GERÇEK VERİ] START home: {self.home_lat:.7f}, {self.home_lon:.7f}, "
+            f"heading={self.current_heading:.2f}°"
+        )
         self.mission_enabled = True
         self.state = MissionState.SEARCHING
         self.logger.info("[GÖREV] Komut sisteminden START alındı; Task 3 araması başladı.")
@@ -210,6 +204,7 @@ class Task3KamikazeEngagement:
         modüllerine ilgili IMU verilerini dağıtır (bkz. Task3Node.imu_callback)."""
         self.yaklasma.update_imu(gyro_z, accel_x, accel_y)
         self.carpma.update_imu(accel_x, accel_y, accel_z)
+        self.last_imu_time = time.monotonic()
 
     # --------------------------------------------------------
     def update_vision_timestamp(self):
@@ -233,6 +228,24 @@ class Task3KamikazeEngagement:
         if (now - self.last_heading_time) > HEADING_TIMEOUT_SEC:
             if self.state != MissionState.FAILSAFE:
                 self.logger.error(f"HEADING VERİSİ {HEADING_TIMEOUT_SEC} SANİYEDİR GELMİYOR! FAILSAFE.")
+            self.state = MissionState.FAILSAFE
+            return False
+
+        # Kamera akışının kesilmesi, kameranın canlı olup o karede duba
+        # görmemesinden farklıdır. Akış yokken kör arama/ilerleme yapılmaz.
+        if self.last_vision_time is None or (now - self.last_vision_time) > VISION_TIMEOUT_SEC:
+            if self.state != MissionState.FAILSAFE:
+                self.logger.error(
+                    f"KAMERA/VISION VERİSİ {VISION_TIMEOUT_SEC} SANİYEDİR GELMİYOR! FAILSAFE."
+                )
+            self.state = MissionState.FAILSAFE
+            return False
+
+        if self.last_imu_time is None or (now - self.last_imu_time) > IMU_TIMEOUT_SEC:
+            if self.state != MissionState.FAILSAFE:
+                self.logger.error(
+                    f"GEÇERLİ IMU VERİSİ {IMU_TIMEOUT_SEC} SANİYEDİR GELMİYOR! FAILSAFE."
+                )
             self.state = MissionState.FAILSAFE
             return False
 
@@ -320,20 +333,18 @@ class Task3KamikazeEngagement:
             return
 
         if self.bridge_mode is not None and self.bridge_mode != DRIVE_MODE:
-            self.logger.warn(
+            self.logger.error(
                 f"Bridge mode={self.bridge_mode}. Beklenen mode={DRIVE_MODE}; "
-                "görev komutu gönderilmiyor.",
-                throttle_duration_sec=2.0,
+                "görev FAILSAFE.",
             )
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            self.state = MissionState.FAILSAFE
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
             return
 
         if self.bridge_armed is False:
-            self.logger.warn(
-                "Araç arm değil; görev komutu gönderilmiyor.",
-                throttle_duration_sec=2.0,
-            )
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            self.logger.error("Araç beklenmedik şekilde DISARM; görev FAILSAFE.")
+            self.state = MissionState.FAILSAFE
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
             return
 
         if self.state == MissionState.FAILSAFE:
@@ -394,6 +405,7 @@ class Task3KamikazeEngagement:
 
             if carpma_done:
                 self.state = MissionState.DONE
+                self.mission_enabled = False
                 if self.carpma.success:
                     self.logger.info("[DURUM] 🎉 GÖREV BAŞARIYLA TAMAMLANDI (3 çarpma).")
                 else:
@@ -435,15 +447,14 @@ class Task3Node(Node):
         if self.impact_delta_threshold <= 0.0:
             raise ValueError("impact_delta_threshold pozitif olmalıdır.")
 
-        if color != ACTIVE_TARGET_COLOR:
+        if color not in SUPPORTED_TARGET_COLORS:
             self.get_logger().error(
-                f"Bu denemede yalnızca '{ACTIVE_TARGET_COLOR}' duba etkin "
-                f"(girilen: '{color}'). Hedefi değiştirmek için "
-                "ACTIVE_TARGET_COLOR sabitini ve YOLO model sınıfını birlikte güncelleyin."
+                f"Desteklenmeyen hedef rengi: '{color}'. "
+                f"Geçerli Parkur-3 renkleri: {sorted(SUPPORTED_TARGET_COLORS)}"
             )
             raise SystemExit(1)
 
-        self.target_class = ACTIVE_TARGET_CLASS
+        self.target_class = f"{color}_buoy"
         self.get_logger().info(f"🎯 Çarpılacak duba: {self.target_class}")
         self.get_logger().info(f"🧪 Test modu: {self.test_mode}")
         self.get_logger().info(f"🛑 Durma mesafesi: {self.safety_stop_distance}m")
@@ -516,6 +527,7 @@ class Task3Node(Node):
         self.start_action_in_progress = False
         self.start_cancel_requested = False
         self.failsafe_disarm_in_progress = False
+        self.completion_disarm_attempted = False
         self.control_timer = self.create_timer(0.1, self.timer_callback)
 
         if self.test_mode:
@@ -572,8 +584,15 @@ class Task3Node(Node):
             return False, "Gerçek kamera/vision verisi henüz alınmadı."
         if now - self.task.last_vision_time > VISION_TIMEOUT_SEC:
             return False, "Gerçek kamera/vision verisi bayat."
+        if self.task.last_imu_time is None:
+            return False, "Geçerli gerçek IMU verisi henüz alınmadı."
+        if now - self.task.last_imu_time > IMU_TIMEOUT_SEC:
+            return False, "Gerçek IMU verisi bayat."
         if self._set_mode_and_wait(DRIVE_MODE) is False:
             return False, f"{DRIVE_MODE} moduna geçilemedi."
+        # Servis cevabi bridge tarafinda heartbeat ile doğrulandi.
+        self.task.bridge_connected = True
+        self.task.bridge_mode = DRIVE_MODE
         if self.start_cancel_requested:
             return False, "Başlatma STOP/ACİL STOP nedeniyle iptal edildi."
         arm_client = (
@@ -584,6 +603,7 @@ class Task3Node(Node):
         arm_label = "FORCE ARM" if self.use_force_arm else "ARM"
         if self._trigger_and_wait(arm_client, arm_label) is False:
             return False, f"{arm_label} başarısız."
+        self.task.bridge_armed = True
         if self.start_cancel_requested:
             self._trigger_and_wait(self.mission_clients.disarm_client, "İPTAL DISARM")
             return False, "Başlatma STOP/ACİL STOP nedeniyle iptal edildi."
@@ -604,6 +624,7 @@ class Task3Node(Node):
             return False
         self.start_cancel_requested = False
         self.failsafe_disarm_in_progress = False
+        self.completion_disarm_attempted = False
         self.start_action_in_progress = True
         threading.Thread(
             target=self._start_mission_worker,
@@ -628,16 +649,40 @@ class Task3Node(Node):
         elif command in (90, 99):
             self.start_cancel_requested = True
             self.task.stop_mission("Pixhawk/bridge durdurma komutu")
-            if command == 99:
-                threading.Thread(
-                    target=self._emergency_disarm_worker,
-                    daemon=True,
-                ).start()
+            # Normal STOP da acil STOP da otonom hareketi sonlandirir ve
+            # DISARM doğrulaması ister. Yarışma sırasında tek izinli dış komut
+            # acil motor kesmedir; "sadece sifir thrust" yeterli değildir.
+            threading.Thread(
+                target=self._command_disarm_worker,
+                args=(command,),
+                daemon=True,
+            ).start()
             self._ack_mission_command(command)
 
-    def _emergency_disarm_worker(self):
-        if not self._trigger_and_wait(self.mission_clients.disarm_client, "ACİL DISARM"):
-            self.get_logger().error("[ACİL DURDURMA] DISARM doğrulanamadı.")
+    def _command_disarm_worker(self, command):
+        label = "ACİL DISARM" if int(command) == 99 else "STOP DISARM"
+        if not self._trigger_and_wait(self.mission_clients.disarm_client, label):
+            self.get_logger().error(f"[{label}] DISARM doğrulanamadı.")
+
+    def _launch_completion_disarm(self):
+        if self.completion_disarm_attempted:
+            return
+        self.completion_disarm_attempted = True
+        threading.Thread(
+            target=self._completion_disarm_worker,
+            daemon=True,
+        ).start()
+
+    def _completion_disarm_worker(self):
+        stop_vehicle(self.mission_topics.cmd_vel_pub, repeat_count=2)
+        if self._trigger_and_wait(self.mission_clients.disarm_client, "GÖREV SONU DISARM"):
+            self.task.bridge_armed = False
+            self.get_logger().info("[GÖREV] Task 3 tamamlandı ve araç DISARM edildi.")
+        else:
+            self.get_logger().error(
+                "[GÖREV] Task 3 tamamlandı fakat DISARM doğrulanamadı; "
+                "uzak güç kesmeyi uygulayın."
+            )
 
     def _launch_failsafe_disarm(self):
         """FAILSAFE'te sıfır itkiyle yetinmeyip bir kez DISARM doğrula."""
@@ -702,6 +747,19 @@ class Task3Node(Node):
         accel_x = msg.linear_acceleration.x
         accel_y = msg.linear_acceleration.y
         accel_z = msg.linear_acceleration.z
+        covariance = getattr(msg, "linear_acceleration_covariance", None)
+        if covariance is not None and len(covariance) > 0 and covariance[0] < 0.0:
+            self.get_logger().warn(
+                "Bridge geçerli ivme örneği olmadığını bildirdi; IMU paketi yok sayıldı.",
+                throttle_duration_sec=2.0,
+            )
+            return
+        if not all(math.isfinite(float(value)) for value in (gyro_z, accel_x, accel_y, accel_z)):
+            self.get_logger().warn(
+                "NaN/sonsuz IMU örneği yok sayıldı.",
+                throttle_duration_sec=2.0,
+            )
+            return
         self.task.update_imu(gyro_z, accel_x, accel_y, accel_z)
 
     # --------------------------------------------------------
@@ -744,6 +802,8 @@ class Task3Node(Node):
             )
             if self.task.state == MissionState.FAILSAFE:
                 self._launch_failsafe_disarm()
+            elif self.task.state == MissionState.DONE:
+                self._launch_completion_disarm()
         except Exception as exc:
             self.get_logger().error(f"Zamanlayıcı döngüsünde beklenmeyen hata: {exc}")
             try:
@@ -785,6 +845,28 @@ class Task3Node(Node):
             f"vuruş={carpma_status.get('hit_count', 0)}/{carpma_status.get('required_hits', 0)}"
         )
 
+    def shutdown_and_disarm(self, timeout_sec=5.0):
+        """Executor durduktan sonra dahi hareketi kesip DISARM sonucunu bekle."""
+        self.start_cancel_requested = True
+        self.task.stop_mission("Task 3 düğümü kapatılıyor")
+        try:
+            future = self.mission_clients.disarm_client.call_async(Trigger.Request())
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+            if not future.done():
+                self.get_logger().error("[KAPANIŞ] DISARM servis zaman aşımı.")
+                return False
+            response = future.result()
+            if response is None or not response.success:
+                message = "yanıt yok" if response is None else response.message
+                self.get_logger().error(f"[KAPANIŞ] DISARM başarısız: {message}")
+                return False
+            self.task.bridge_armed = False
+            self.get_logger().info("[KAPANIŞ] Araç DISARM edildi.")
+            return True
+        except Exception as exc:
+            self.get_logger().error(f"[KAPANIŞ] DISARM hatası: {exc}")
+            return False
+
 def main(args=None):
     """Node pasif başlar; yalnızca gerçek /mission_start=3 komutu ARM eder."""
     rclpy.init(args=args)
@@ -807,9 +889,9 @@ def main(args=None):
     finally:
         if node is not None:
             try:
-                node.task.stop_mission("Node kapatılıyor")
-            except Exception:
-                pass
+                node.shutdown_and_disarm()
+            except Exception as exc:
+                node.get_logger().error(f"Kapanış güvenliği uygulanamadı: {exc}")
 
             node.destroy_node()
 

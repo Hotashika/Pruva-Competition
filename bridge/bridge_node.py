@@ -188,6 +188,9 @@ class OrangeCubeBridgeNode(Node):
         self.gps_lon = None
         self.gps_alt = None
         self.relative_alt = None
+        self.last_gps_sample_time = 0.0
+        self.gps_fix_type = None
+        self.last_gps_fix_time = 0.0
         # GLOBAL_POSITION_INT.hdg hareket yonu/course bilgisidir ve arac
         # yerinde donerken degismeyebilir. Task 3'te 20 derecelik donusu
         # dogrulamak icin Pixhawk EKF attitude yaw degerini ayri tutuyoruz.
@@ -401,6 +404,9 @@ class OrangeCubeBridgeNode(Node):
         self.gps_lon = None
         self.gps_alt = None
         self.relative_alt = None
+        self.last_gps_sample_time = 0.0
+        self.gps_fix_type = None
+        self.last_gps_fix_time = 0.0
         self.heading_deg = None
         self.attitude_heading_deg = None
         self.last_attitude_time = 0.0
@@ -434,6 +440,15 @@ class OrangeCubeBridgeNode(Node):
 
     def _has_valid_gps(self):
         if self.gps_lat is None or self.gps_lon is None:
+            return False
+        if self.last_gps_sample_time <= 0.0 or time.time() - self.last_gps_sample_time > 1.0:
+            return False
+        # GLOBAL_POSITION_INT, EKF'in son konum tahminini GPS fix'i koptuktan
+        # sonra da bir süre taşıyabilir. Gerçek hareket için taze 3D GPS fix'i
+        # (GPS_RAW_INT.fix_type >= 3) ayrıca doğrulanmalıdır.
+        if self.gps_fix_type is None or self.gps_fix_type < 3:
+            return False
+        if self.last_gps_fix_time <= 0.0 or time.time() - self.last_gps_fix_time > 2.0:
             return False
         return abs(self.gps_lat) > 1e-6 or abs(self.gps_lon) > 1e-6
 
@@ -658,6 +673,7 @@ class OrangeCubeBridgeNode(Node):
             return
 
         requested_messages = (
+            (mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, 5),
             (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 5),
             (mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10),
             (mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU, 20),
@@ -780,8 +796,13 @@ class OrangeCubeBridgeNode(Node):
                     self.gps_lon = msg.lon / 1e7
                     self.gps_alt = msg.alt / 1000.0
                     self.relative_alt = msg.relative_alt / 1000.0
+                    self.last_gps_sample_time = time.time()
                     if hasattr(msg, "hdg") and msg.hdg != 65535:
                         self.heading_deg = msg.hdg / 100.0
+
+                elif msg_type == "GPS_RAW_INT":
+                    self.gps_fix_type = int(getattr(msg, "fix_type", 0))
+                    self.last_gps_fix_time = time.time()
 
                 elif msg_type == "VFR_HUD" and hasattr(msg, "heading"):
                     self.heading_deg = float(msg.heading)
