@@ -1,15 +1,10 @@
 """Kesintisiz yarış modu için GN waypoint dosyası sözleşmesi."""
 
-from pathlib import Path
-
+from teknofest.config.mission_config import WAYPOINT_DIRECTORY
 from utils.read_waypoints import parse_qgc_waypoints
 
 
-GN_WAYPOINT_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "waypoints"
-    / "teknofest.waypoints"
-)
+GN_WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest.waypoints"
 GN_NAMES = ("GN1", "GN2", "GN3", "GN4", "GN5")
 COMPETITION_ROUTE_NAMES = {
     "task1": ("GN1", "GN2", "GN3", "GN4"),

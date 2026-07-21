@@ -26,8 +26,12 @@ from bridge.mavlink_connection import (
     connect_mavlink,
 )
 from utils.mavlink_utilities import create_bridge_topics, create_bridge_services
+from utils.mission_waypoint_files import (
+    parse_mission_waypoint_files,
+    resolve_mission_waypoint_directory,
+)
 from utils.pixhawk_waypoints import mission_items_to_qgc
-from utils.waypoint_server import DEFAULT_WAYPOINT_DIRECTORY, overwrite_waypoint_file
+from utils.waypoint_server import overwrite_waypoint_file
 from utils.battery import battery_percentage_from_voltage
 
 MISSION_PARAM_NAME = "SCR_USER1"
@@ -47,8 +51,6 @@ VALID_MISSION_COMMANDS = {
     MISSION_STOP,
     MISSION_EMERGENCY,
 }
-
-
 def euler_to_quaternion(roll, pitch, yaw):
     cy = math.cos(yaw * 0.5)
     sy = math.sin(yaw * 0.5)
@@ -140,6 +142,14 @@ class OrangeCubeBridgeNode(Node):
             "mission_start_retry_sec",
             float(os.getenv("MAVLINK_MISSION_START_RETRY_SEC", "1.0")),
         )
+        self.declare_parameter(
+            "mission_waypoint_files",
+            os.getenv("MAVLINK_MISSION_WAYPOINT_FILES", ""),
+        )
+        self.declare_parameter(
+            "mission_waypoint_directory",
+            os.getenv("MAVLINK_MISSION_WAYPOINT_DIRECTORY", ""),
+        )
 
         self.connection_string = self.get_parameter("connection_string").value
         self.baud = int(self.get_parameter("baud").value)
@@ -159,6 +169,13 @@ class OrangeCubeBridgeNode(Node):
         self.mission_start_ack_topic = str(self.get_parameter("mission_start_ack_topic").value)
         self.mission_start_retry_sec = float(
             self.get_parameter("mission_start_retry_sec").value
+        )
+        self.mission_waypoint_files = parse_mission_waypoint_files(
+            self.get_parameter("mission_waypoint_files").value
+        )
+        self.mission_waypoint_directory = resolve_mission_waypoint_directory(
+            self.mission_waypoint_files,
+            self.get_parameter("mission_waypoint_directory").value,
         )
 
         self.master = None
@@ -250,6 +267,17 @@ class OrangeCubeBridgeNode(Node):
             f"{self.mission_start_topic} topic'ine Int32 olarak yayinlanacak; "
             f"{self.mission_start_ack_topic} ack geldikten sonra {MISSION_PARAM_NAME}=0 yapilacak."
         )
+        if self.mission_waypoint_files:
+            self.get_logger().info(
+                "Mission waypoint senkron hedefleri: "
+                f"directory={self.mission_waypoint_directory}, "
+                f"files={self.mission_waypoint_files}"
+            )
+        else:
+            self.get_logger().warn(
+                "Mission waypoint senkronizasyonu yapilandirilmadi; "
+                "gorev komutlari waypoint indirmeden yayinlanacak."
+            )
 
         self.get_logger().info("/cube topic ve servisleri aktif.")
 
@@ -919,8 +947,9 @@ class OrangeCubeBridgeNode(Node):
         mission_number = command
         mission_name = f"M{mission_number}"
 
-        if mission_number in (MISSION_1, MISSION_2, MISSION_4):
-            self._start_mission_download(mission_number)
+        if mission_number in self.mission_waypoint_files:
+            if not self._start_mission_download(mission_number):
+                return
             self._send_status_text(
                 f"{MISSION_PARAM_NAME} received: {mission_name}, downloading mission",
                 mavutil.mavlink.MAV_SEVERITY_INFO,
@@ -946,18 +975,28 @@ class OrangeCubeBridgeNode(Node):
         )
 
     def _start_mission_download(self, mission_number):
-        if self.master is None:
-            self.get_logger().warn("Waypoint senkronizasyonu baslatilamadi: MAVLink yok.")
-            return
-
         self.mission_download_task = int(mission_number)
         self.mission_download_count = None
         self.mission_download_items = {}
         self.mission_download_retry_count = 0
-        self._request_mission_list()
+        if self.master is None:
+            self._abort_mission_download(
+                "Waypoint senkronizasyonu baslatilamadi: MAVLink yok."
+            )
+            return False
+
+        try:
+            self._request_mission_list()
+        except Exception as exc:
+            self._abort_mission_download(
+                f"Pixhawk mission listesi istenemedi: {exc}"
+            )
+            return False
         self.get_logger().info(
-            f"Pixhawk mission listesi njord_task{mission_number}.waypoints icin isteniyor."
+            "Pixhawk mission listesi "
+            f"{self.mission_waypoint_files[mission_number]} icin isteniyor."
         )
+        return True
 
     def _request_mission_list(self):
         try:
@@ -995,8 +1034,9 @@ class OrangeCubeBridgeNode(Node):
         self.mission_download_count = int(msg.count)
         self.mission_download_retry_count = 0
         if self.mission_download_count <= 0:
-            self.get_logger().warn("Pixhawk mission listesi bos; waypoint dosyasi degistirilmedi.")
-            self._reset_mission_download()
+            self._abort_mission_download(
+                "Pixhawk mission listesi bos; waypoint dosyasi degistirilmedi."
+            )
             return
         self._request_mission_item(0)
 
@@ -1019,11 +1059,11 @@ class OrangeCubeBridgeNode(Node):
             return
 
         task_number = self.mission_download_task
-        filename = f"njord_task{task_number}.waypoints"
+        filename = self.mission_waypoint_files[task_number]
         try:
             content = mission_items_to_qgc(self.mission_download_items.values())
             destination = overwrite_waypoint_file(
-                DEFAULT_WAYPOINT_DIRECTORY, filename, content
+                self.mission_waypoint_directory, filename, content
             )
             save_text = (
                 f"Pixhawk mission dosyaya yazildi: path={destination.resolve()}, "
@@ -1046,9 +1086,11 @@ class OrangeCubeBridgeNode(Node):
                 )
             self._publish_downloaded_mission_start(task_number)
         except Exception as exc:
-            self.get_logger().error(f"Pixhawk waypoint dosyasi yazilamadi: {exc}")
-        finally:
-            self._reset_mission_download()
+            self._abort_mission_download(
+                f"Pixhawk waypoint dosyasi yazilamadi: {exc}"
+            )
+            return
+        self._reset_mission_download()
 
     def _mission_download_watchdog(self):
         if self.mission_download_task is None:
@@ -1057,19 +1099,39 @@ class OrangeCubeBridgeNode(Node):
             return
         self.mission_download_retry_count += 1
         if self.mission_download_retry_count > 4:
-            self.get_logger().error("Pixhawk mission indirme zaman asimina ugradi.")
-            self._reset_mission_download()
+            self._abort_mission_download(
+                "Pixhawk mission indirme zaman asimina ugradi."
+            )
             return
-        if self.mission_download_count is None:
-            self._request_mission_list()
-            return
-        missing = next(
-            (seq for seq in range(self.mission_download_count)
-             if seq not in self.mission_download_items),
-            None,
+        try:
+            if self.mission_download_count is None:
+                self._request_mission_list()
+                return
+            missing = next(
+                (seq for seq in range(self.mission_download_count)
+                 if seq not in self.mission_download_items),
+                None,
+            )
+            if missing is not None:
+                self._request_mission_item(missing)
+        except Exception as exc:
+            self._abort_mission_download(
+                f"Pixhawk mission indirme istegi gonderilemedi: {exc}"
+            )
+
+    def _abort_mission_download(self, reason):
+        task_number = self.mission_download_task
+        self.get_logger().error(reason)
+        self._publish_diagnostic(reason)
+        self._send_status_text(
+            f"mission download failed: M{task_number}",
+            mavutil.mavlink.MAV_SEVERITY_ERROR,
         )
-        if missing is not None:
-            self._request_mission_item(missing)
+        self._reset_mission_download()
+        if task_number is not None:
+            # Keep last_mission_parameter_value unchanged until PARAM_VALUE=0
+            # arrives, so a stale non-zero echo cannot immediately retrigger.
+            self._set_mission_parameter(MISSION_IDLE)
 
     def _reset_mission_download(self):
         self.mission_download_task = None

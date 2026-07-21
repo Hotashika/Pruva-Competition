@@ -14,6 +14,7 @@ from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from njord.config.mission_config import WAYPOINT_DIRECTORY
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
     create_mission_topics,
@@ -29,8 +30,7 @@ from utils.mavlink_utilities import (
 )
 from utils.read_waypoints import parse_qgc_waypoints
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "njord_task1.waypoints"
+WAYPOINT_PATH = WAYPOINT_DIRECTORY / "njord_task1.waypoints"
 ACTIVE_TASK_NAME = "task1"
 
 # ============================================================

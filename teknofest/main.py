@@ -17,21 +17,19 @@ if COMPETITION_ROOT not in sys.path:
 
 from teknofest.core import capture_proc
 from teknofest.core import data_writer
+from teknofest.config.mission_config import (
+    MAVLINK_BRIDGE_DEFAULTS,
+    MAVLINK_BRIDGE_OVERRIDES,
+    MISSION_SPECS,
+    WAYPOINT_DIRECTORY,
+)
 from teknofest.servers import data_server
 from utils import waypoint_server
 
 
-MISSION_SPECS = {
-    "competition": ("Full Competition", "competition_mission.py"),
-    "task1": ("Mission 1", "task1_point_tracking.py"),
-    "task2": ("Mission 2", "task2_point_tracking_task_in_an_environment_with_obstacle.py"),
-    "task3": ("Mission 3", "task3_kamikaze_engagement.py"),
-}
-
-
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Start the selected TEKNOFEST mission.")
-    task_group = parser.add_mutually_exclusive_group(required=True)
+    task_group = parser.add_mutually_exclusive_group()
     task_group.add_argument(
         "--competition",
         dest="task",
@@ -51,6 +49,10 @@ def parse_args(argv=None):
                 f"teknofest_task{task_number}.waypoints route where applicable."
             ),
         )
+    parser.epilog = (
+        "Bir gorev secenegi verilmezse arayuz modu acilir: "
+        "1=Competition, 2=task1, 3=task2, 4=task3."
+    )
     return parser.parse_args(argv)
 
 
@@ -109,6 +111,20 @@ def run_startup_cleanup():
     subprocess.run(["/bin/bash", cleanup_script], check=True)
 
 
+def configure_mavlink_bridge_environment():
+    for key, value in MAVLINK_BRIDGE_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+    os.environ.update(MAVLINK_BRIDGE_OVERRIDES)
+
+    print(
+        "[SYSTEM] TEKNOFEST mission interface: "
+        "1=Competition, 2=task1, 3=task2, 4=task3; "
+        f"topic={os.environ['MAVLINK_MISSION_START_TOPIC']}, "
+        f"waypoint_directory={os.environ['MAVLINK_MISSION_WAYPOINT_DIRECTORY']}, "
+        f"waypoints={os.environ['MAVLINK_MISSION_WAYPOINT_FILES']}"
+    )
+
+
 def start_capture_process():
     mp_context = get_context("spawn")
     frame_lock = mp_context.Lock()
@@ -152,7 +168,11 @@ def start_capture_process():
 
 if __name__ == "__main__":
     args = parse_args()
-    mission_name, mission_filename = MISSION_SPECS[args.task]
+    interface_mode = args.task is None
+    mission_name = None
+    mission_filename = None
+    if not interface_mode:
+        mission_name, mission_filename = MISSION_SPECS[args.task]
 
     fx = None
     cx = None
@@ -163,10 +183,15 @@ if __name__ == "__main__":
     p_bridge = None
     p_vision = None
     p_teknofest_mission = None
+    p_mission_manager = None
 
     try:
         run_startup_cleanup()
-        threading.Thread(target=waypoint_server.start, args=(8000,), daemon=True).start()
+        threading.Thread(
+            target=waypoint_server.start,
+            args=(8000, WAYPOINT_DIRECTORY),
+            daemon=True,
+        ).start()
         print("[SYSTEM] Waypoint upload -> http://0.0.0.0:8000/api/mission/upload_txt")
 
         (
@@ -186,6 +211,7 @@ if __name__ == "__main__":
 
         print("\n[SYSTEM] Vision and bridge node launch in ROS2...")
         time.sleep(1)
+        configure_mavlink_bridge_environment()
 
         if os.path.isfile("/opt/ros/kilted/setup.bash"):
             ros2_setup = "source /opt/ros/kilted/setup.bash"
@@ -199,10 +225,9 @@ if __name__ == "__main__":
 
         vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
+        mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
 
         vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
-
-        mission_path = os.path.join(PROJECT_ROOT, "missions", mission_filename)
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
@@ -210,10 +235,18 @@ if __name__ == "__main__":
         cmd_bridge = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
-        cmd_teknofest_mission = (
+        cmd_mission_manager = (
             f"{ros2_setup} && {python_path_setup} && "
-            f"{shlex.quote(sys.executable)} {shlex.quote(mission_path)}"
+            f"{shlex.quote(sys.executable)} {shlex.quote(mission_manager_path)}"
         )
+
+        cmd_teknofest_mission = None
+        if not interface_mode:
+            mission_path = os.path.join(PROJECT_ROOT, "missions", mission_filename)
+            cmd_teknofest_mission = (
+                f"{ros2_setup} && {python_path_setup} && "
+                f"{shlex.quote(sys.executable)} {shlex.quote(mission_path)}"
+            )
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
@@ -223,11 +256,16 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        p_teknofest_mission = launch_child_process(cmd_teknofest_mission)
-        print(
-            f" -> TEKNOFEST {mission_name} Node launched "
-            f"(PID: {p_teknofest_mission.pid})\n"
-        )
+        if interface_mode:
+            p_mission_manager = launch_child_process(cmd_mission_manager)
+            print(f" -> TEKNOFEST Mission Manager launched (PID: {p_mission_manager.pid})")
+            print(" -> Arayuz secimi bekleniyor: Competition / task1 / task2 / task3\n")
+        else:
+            p_teknofest_mission = launch_child_process(cmd_teknofest_mission)
+            print(
+                f" -> TEKNOFEST {mission_name} Node launched "
+                f"(PID: {p_teknofest_mission.pid})\n"
+            )
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
@@ -243,8 +281,14 @@ if __name__ == "__main__":
 
         # Mission once kapanir; SIGINT handler'i bridge hâlâ ayaktayken araci
         # durdurup DISARM eder. Ardindan vision, en son bridge kapatilir.
+        mission_process_name = (
+            "TEKNOFEST Mission Manager"
+            if interface_mode
+            else f"TEKNOFEST {mission_name} Node"
+        )
+        mission_process = p_mission_manager if interface_mode else p_teknofest_mission
         subprocesses = (
-            (f"TEKNOFEST {mission_name} Node", p_teknofest_mission, 7.0),
+            (mission_process_name, mission_process, 7.0),
             ("Vision Node", p_vision, 3.0),
             ("Bridge Node", p_bridge, 5.0),
         )

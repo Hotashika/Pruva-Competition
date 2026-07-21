@@ -15,6 +15,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
 
+from teknofest.config.mission_config import WAYPOINT_DIRECTORY
 # Yardımcı fonksiyonlar (Kendi yazdıklarımız ve mavlink_utilities içindekiler)
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
@@ -32,8 +33,7 @@ from utils.mavlink_utilities import (
 from utils.read_waypoints import parse_qgc_waypoints
 from teknofest.missions.utils.orange_boundary_guard import OrangeBoundaryGuard
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "teknofest_task1.waypoints"
+WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task1.waypoints"
 
 # ============================================================
 # SAFETY PARAMS

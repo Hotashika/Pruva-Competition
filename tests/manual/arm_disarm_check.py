@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+"""Manual ROS/MAVLink motor check; not part of the pytest suite."""
+
 import argparse
 from collections import deque
 import subprocess

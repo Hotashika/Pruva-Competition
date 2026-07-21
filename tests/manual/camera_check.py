@@ -1,3 +1,5 @@
+"""Manual ZED camera integration check; not part of the pytest suite."""
+
 import importlib
 import os
 import sys
