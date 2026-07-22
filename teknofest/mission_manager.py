@@ -30,6 +30,10 @@ MISSION_PATHS = {
     command: os.path.join(PROJECT_ROOT, "missions", mission_filename)
     for command, (_, _, mission_filename) in MISSION_COMMANDS.items()
 }
+MISSION_MODULES = {
+    command: f"teknofest.missions.{os.path.splitext(mission_filename)[0]}"
+    for command, (_, _, mission_filename) in MISSION_COMMANDS.items()
+}
 MISSION_NAMES = {
     command: display_name
     for command, (_, display_name, _) in MISSION_COMMANDS.items()
@@ -159,7 +163,8 @@ class MissionManager(Node):
         self._stop_active_mission()
         try:
             process = subprocess.Popen(
-                [sys.executable, mission_path],
+                [sys.executable, "-m", MISSION_MODULES[command]],
+                cwd=COMPETITION_ROOT,
                 start_new_session=True,
             )
         except Exception as exc:

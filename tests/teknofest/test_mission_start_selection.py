@@ -107,6 +107,40 @@ def test_interface_command_mapping_matches_requested_order(monkeypatch):
     }
 
 
+def test_manager_starts_competition_as_package_module(monkeypatch):
+    manager_module = _load_mission_manager(monkeypatch)
+    manager = manager_module.MissionManager.__new__(manager_module.MissionManager)
+    manager.active_command = None
+    manager.active_task_key = None
+    manager.active_mission_process = None
+    statuses = []
+    manager._publish_status = statuses.append
+    popen_calls = []
+
+    def fake_popen(arguments, **options):
+        popen_calls.append((arguments, options))
+        return _FakeProcess()
+
+    monkeypatch.setattr(manager_module.subprocess, "Popen", fake_popen)
+
+    assert manager._start_mission(1) is True
+    assert popen_calls == [
+        (
+            [
+                manager_module.sys.executable,
+                "-m",
+                "teknofest.missions.competition_mission",
+            ],
+            {
+                "cwd": manager_module.COMPETITION_ROOT,
+                "start_new_session": True,
+            },
+        )
+    ]
+    assert manager.active_command == 1
+    assert manager.active_task_key == "competition"
+
+
 def test_interface_waypoint_sync_uses_teknofest_files(monkeypatch):
     _load_teknofest_main(monkeypatch)
     from teknofest.config import mission_config
