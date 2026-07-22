@@ -131,6 +131,12 @@ fake_mavlink.create_mission_topics = lambda *args, **kwargs: types.SimpleNamespa
 
 
 class FakeFuture:
+    def add_done_callback(self, callback):
+        callback(self)
+
+    def exception(self):
+        return None
+
     def done(self):
         return True
 
@@ -141,6 +147,14 @@ class FakeFuture:
 class FakeClient:
     def call_async(self, request):
         return FakeFuture()
+
+
+class RecordingPublisher:
+    def __init__(self):
+        self.values = []
+
+    def publish(self, message):
+        self.values.append(message.data)
 
 
 fake_mavlink.create_mission_clients = lambda *args, **kwargs: types.SimpleNamespace(
@@ -178,6 +192,38 @@ class Task3ColorResolutionTests(unittest.TestCase):
     def test_shutdown_path_disarms(self):
         node = t3.Task3Node()
         self.assertTrue(node.shutdown_and_disarm())
+        self.assertIs(node.task.bridge_armed, False)
+
+    def test_stop_ack_is_sent_only_after_disarm_succeeds(self):
+        node = t3.Task3Node()
+        publisher = RecordingPublisher()
+        node.mission_start_ack_pub = publisher
+        node.command_disarm_in_progress = True
+
+        node._command_disarm_worker(99)
+
+        self.assertEqual(publisher.values, [99])
+        self.assertFalse(node.command_disarm_in_progress)
+
+        publisher.values.clear()
+        node.command_disarm_in_progress = True
+        node._disarm_with_retries = lambda label: False
+        node._command_disarm_worker(90)
+        self.assertEqual(publisher.values, [])
+        self.assertFalse(node.command_disarm_in_progress)
+
+    def test_disarm_is_retried_three_times_before_failure(self):
+        node = t3.Task3Node()
+        outcomes = iter((False, False, True))
+        calls = []
+
+        def fake_trigger(client, label):
+            calls.append(label)
+            return next(outcomes)
+
+        node._trigger_and_wait = fake_trigger
+        self.assertTrue(node._disarm_with_retries("TEST DISARM"))
+        self.assertEqual(len(calls), 3)
         self.assertIs(node.task.bridge_armed, False)
 
 

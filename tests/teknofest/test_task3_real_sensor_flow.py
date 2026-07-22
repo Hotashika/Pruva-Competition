@@ -223,6 +223,25 @@ class Task3RealSensorFlowTests(unittest.TestCase):
         self.assertEqual(manager.state, t3.MissionState.FAILSAFE)
         self.assertEqual(commands[-1], (0.0, 0.0))
 
+    def test_manager_failsafe_on_stale_gps_or_heading(self):
+        manager = self._ready_task_manager()
+        clock.advance(t3.GPS_TIMEOUT_SEC + 0.1)
+        manager.update_heading(0.0)
+        manager.update_imu(0.0, 0.0, 0.0, 9.81)
+        manager.update_vision_timestamp()
+        manager.update([], frame_id=1)
+        self.assertEqual(manager.state, t3.MissionState.FAILSAFE)
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
+        manager = self._ready_task_manager()
+        clock.advance(t3.HEADING_TIMEOUT_SEC + 0.1)
+        manager.update_gps(41.0, 29.0)
+        manager.update_imu(0.0, 0.0, 0.0, 9.81)
+        manager.update_vision_timestamp()
+        manager.update([], frame_id=1)
+        self.assertEqual(manager.state, t3.MissionState.FAILSAFE)
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
     def test_manager_failsafe_on_mode_or_arm_loss(self):
         manager = self._ready_task_manager()
         manager.update_bridge_state("connected=true,armed=true,mode=MANUAL")
@@ -276,6 +295,10 @@ class Task3RealSensorFlowTests(unittest.TestCase):
 
             # Temastan sonra kamerada mesafe artışı gerçek geri çıkışı
             # doğrular; cooldown bitmeden yeni vuruş sayılmaz.
+            manager.update_gps(
+                manager.current_lat - 0.70 / 111_320.0,
+                manager.current_lon,
+            )
             self._manager_step(manager, detection(1.6, 0.0), next_frame)
             next_frame += 1
             self.assertEqual(manager.carpma.state, carpma.CarpmaState.COOLDOWN)
@@ -373,6 +396,21 @@ class Task3RealSensorFlowTests(unittest.TestCase):
         # her adimda birikmemeli; yalnız son adimin toleransi kalabilir.
         final_error = abs(mission._angle_error(0.0, mission.current_heading_deg))
         self.assertLessEqual(final_error, arama.HEADING_TOLERANCE_DEG)
+
+    def test_search_turns_clockwise_across_zero_degree_boundary(self):
+        mission = arama.AramaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 350.0)
+
+        mission.update([], frame_id=1)
+        self.assertAlmostEqual(mission.step_target_heading, 10.0)
+        mission.update([], frame_id=1)
+        self.assertGreater(commands[-1][0], 0.0)
+        self.assertGreater(commands[-1][1], 0.0)
+
+        mission.update_heading(10.0)
+        clock.advance(0.1)
+        mission.update([], frame_id=2)
+        self.assertEqual(mission.state, arama.SearchState.HOLDING)
 
     def test_search_rejects_frames_if_heading_drifts_during_hold(self):
         mission = arama.AramaGorevi(Node(), Topics(), "red_buoy")
@@ -491,6 +529,52 @@ class Task3RealSensorFlowTests(unittest.TestCase):
         self.assertGreater(commands[-1][0], 0.0)
         self.assertLess(commands[-1][1], 0.0)
 
+    def test_approach_stops_immediately_on_a_fresh_missing_frame(self):
+        mission = yaklasma.YaklasmaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        for frame_id in range(1, 6):
+            clock.advance(0.1)
+            mission.update(detection(9.0, 0.0), frame_id=frame_id)
+        self.assertEqual(mission.state, yaklasma.ApproachState.MOVING_STRAIGHT)
+
+        clock.advance(0.1)
+        mission.update([], frame_id=6)
+
+        self.assertTrue(mission.should_return_to_search())
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
+    def test_approach_requires_camera_distance_to_confirm_gps_progress(self):
+        mission = yaklasma.YaklasmaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        for frame_id in range(1, 6):
+            clock.advance(0.1)
+            mission.update(detection(9.0, 0.0), frame_id=frame_id)
+
+        mission.update_gps(41.0 + 3.1 / 111_320.0, 29.0, 0.0)
+        clock.advance(0.1)
+        mission.update(detection(9.0, 0.0), frame_id=6)
+        self.assertEqual(mission.state, yaklasma.ApproachState.CONFIRMING_RESULT)
+        for frame_id in range(7, 12):
+            clock.advance(0.1)
+            mission.update(detection(9.0, 0.0), frame_id=frame_id)
+
+        self.assertTrue(mission.should_return_to_search())
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
+    def test_approach_stops_early_if_camera_reports_collision_distance(self):
+        mission = yaklasma.YaklasmaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        for frame_id in range(1, 6):
+            clock.advance(0.1)
+            mission.update(detection(3.0, 0.0), frame_id=frame_id)
+        self.assertEqual(mission.state, yaklasma.ApproachState.MOVING_STRAIGHT)
+
+        clock.advance(0.1)
+        mission.update(detection(1.4, 0.0), frame_id=6)
+
+        self.assertEqual(mission.state, yaklasma.ApproachState.CONFIRMING_RESULT)
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
     def test_approach_rejects_reused_frame_id(self):
         mission = yaklasma.YaklasmaGorevi(Node(), Topics(), "red_buoy")
         mission.update_gps(41.0, 29.0, 0.0)
@@ -584,6 +668,68 @@ class Task3RealSensorFlowTests(unittest.TestCase):
 
         self.assertLess(commands[-1][0], 0.0)
         self.assertLess(commands[-1][1], 0.0)
+
+    def test_collision_stops_immediately_if_target_disappears_during_strike(self):
+        mission = carpma.CarpmaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        for _ in range(carpma.BASELINE_WINDOW):
+            mission.update_imu(0.0, 0.0, 9.81)
+        for frame_id in range(1, 6):
+            clock.advance(0.1)
+            mission.update(detection(1.0, 0.0), frame_id=frame_id)
+        self.assertEqual(mission.state, carpma.CarpmaState.STRIKING)
+
+        clock.advance(0.1)
+        mission.update([], frame_id=6)
+
+        self.assertEqual(mission.state, carpma.CarpmaState.MISSED)
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
+    def test_collision_does_not_count_impact_with_stale_camera_target(self):
+        mission = carpma.CarpmaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        for _ in range(carpma.BASELINE_WINDOW):
+            mission.update_imu(0.0, 0.0, 9.81)
+        for frame_id in range(1, 6):
+            clock.advance(0.1)
+            mission.update(detection(1.0, 0.0), frame_id=frame_id)
+        self.assertEqual(mission.state, carpma.CarpmaState.STRIKING)
+
+        clock.advance(carpma.IMPACT_TARGET_FRESH_SEC + 0.1)
+        for _ in range(carpma.IMPACT_CONSECUTIVE_SAMPLES):
+            mission.update_imu(9.81 + 8.0, 0.0, 0.0)
+
+        self.assertEqual(mission.hit_count, 0)
+        self.assertEqual(mission.state, carpma.CarpmaState.STRIKING)
+
+    def test_collision_backoff_requires_both_gps_and_camera_confirmation(self):
+        mission = carpma.CarpmaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        mission.state = carpma.CarpmaState.BACKING_OFF
+        mission.backoff_start_time = clock.monotonic()
+        mission.backoff_start_lat = 41.0
+        mission.backoff_start_lon = 29.0
+        mission.backoff_heading_deg = 0.0
+        mission.backoff_start_distance = 1.0
+
+        mission.update(detection(1.6, 0.0), frame_id=1)
+        self.assertEqual(mission.state, carpma.CarpmaState.BACKING_OFF)
+
+        mission.update_gps(41.0 - 0.70 / 111_320.0, 29.0, 0.0)
+        clock.advance(0.1)
+        mission.update(detection(1.6, 0.0), frame_id=2)
+        self.assertEqual(mission.state, carpma.CarpmaState.COOLDOWN)
+
+    def test_manager_failsafe_when_total_mission_time_expires(self):
+        manager = self._ready_task_manager()
+        clock.advance(t3.MISSION_TOTAL_TIMEOUT_SEC + 0.1)
+        self._refresh_navigation_and_imu(manager)
+        manager.update_vision_timestamp()
+
+        manager.update([], frame_id=1)
+
+        self.assertEqual(manager.state, t3.MissionState.FAILSAFE)
+        self.assertEqual(commands[-1], (0.0, 0.0))
 
     def test_low_confidence_and_target_loss_are_rejected(self):
         search = arama.AramaGorevi(Node(), Topics(), "red_buoy")

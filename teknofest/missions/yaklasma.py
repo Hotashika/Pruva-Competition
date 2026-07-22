@@ -25,6 +25,7 @@ ALIGN_TOLERANCE_DEG = 4.0
 ANGLE_KP = 0.02
 MAX_ANGULAR_Z = 0.30
 MAX_STRAIGHT_HEADING_CORRECTION_RAD = 0.18
+MAX_MOVING_TARGET_ANGLE_DEG = 20.0
 APPROACH_SPEED = 0.30
 SEGMENT_TIMEOUT_SEC = 12.0
 STALL_TIMEOUT_SEC = 4.0
@@ -33,6 +34,8 @@ MIN_LATERAL_CORRIDOR_M = 0.75
 LATERAL_CORRIDOR_RATIO = 0.50
 MAX_TRACK_ANGLE_JUMP_DEG = 30.0
 MAX_TRACK_DISTANCE_RATIO = 0.60
+MIN_CAMERA_PROGRESS_M = 0.25
+MIN_CAMERA_PROGRESS_RATIO = 0.08
 MAX_APPROACH_SEGMENTS = 8
 APPROACH_TOTAL_TIMEOUT_SEC = 60.0
 DEFAULT_MIN_TARGET_CONFIDENCE = 0.65
@@ -123,20 +126,21 @@ class YaklasmaGorevi:
 
     def _process_frame(self, detections, frame_id, now):
         if frame_id is None or frame_id == self.last_processed_frame_id:
-            return
+            return None
         self.last_processed_frame_id = frame_id
         target = self._select_target(detections)
         if target is None:
             self._clear_confirmation()
-            return
+            return False
         self.latest_target = target
         self.last_seen_time = now
         if self.state not in (ApproachState.CONFIRMING_TARGET, ApproachState.CONFIRMING_RESULT):
-            return
+            return True
         self.confirmations.append((now, frame_id, float(target["distance"]), float(target["Buoy angle: "])))
         self.confirmations = [item for item in self.confirmations if now - item[0] <= CONFIRM_WINDOW_SEC]
         if len(self.confirmations) >= REQUIRED_DISTINCT_FRAMES:
             self._finish_confirmation(now)
+        return True
 
     def _finish_confirmation(self, now):
         samples = self.confirmations[-REQUIRED_DISTINCT_FRAMES:]
@@ -159,6 +163,18 @@ class YaklasmaGorevi:
             self.finished = True
             self.logger.info("[YAKLAŞMA] 5 farklı kare ile çarpma mesafesi doğrulandı.")
             return
+        if self.state == ApproachState.CONFIRMING_RESULT and self.confirmed_distance is not None:
+            camera_progress_m = self.confirmed_distance - mean_distance
+            required_progress_m = max(
+                MIN_CAMERA_PROGRESS_M,
+                self.confirmed_distance * MIN_CAMERA_PROGRESS_RATIO,
+            )
+            if camera_progress_m < required_progress_m:
+                self._lose_target(
+                    "GPS ilerledi ancak kamera mesafesi yaklaşmayı doğrulamadı "
+                    f"(azalma={camera_progress_m:.2f}m, gerekli={required_progress_m:.2f}m)"
+                )
+                return
         if self.segment_count >= MAX_APPROACH_SEGMENTS:
             self._lose_target("azami yaklaşma segmentine ulaşıldı")
             return
@@ -257,12 +273,18 @@ class YaklasmaGorevi:
         now = time.monotonic()
         if self.approach_start_time is None:
             self.approach_start_time = now
-        self._process_frame(detections, frame_id, now)
+        frame_status = self._process_frame(detections, frame_id, now)
         if self.state in (ApproachState.DONE, ApproachState.LOST):
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             return self.state == ApproachState.DONE
         if now - self.approach_start_time > APPROACH_TOTAL_TIMEOUT_SEC:
             self._lose_target("yaklaşma toplam süre sınırını aştı")
+            return False
+        if (
+            frame_status is False
+            and self.state in (ApproachState.ALIGNING, ApproachState.MOVING_STRAIGHT)
+        ):
+            self._lose_target("hareket sırasında hedef yeni kamera karesinde kayboldu")
             return False
         if self.last_seen_time is None or now - self.last_seen_time > TARGET_LOST_TIMEOUT_SEC:
             self._lose_target("hedef kamerada kayboldu")
@@ -270,6 +292,20 @@ class YaklasmaGorevi:
         if self.state == ApproachState.ALIGNING:
             self._align(now)
         elif self.state == ApproachState.MOVING_STRAIGHT:
+            target_distance = float(self.latest_target["distance"])
+            target_angle = float(self.latest_target["Buoy angle: "])
+            if target_distance <= self.impact_entry_distance:
+                # Tek bir yakın mesafe karesiyle çarpma moduna geçme. Önce
+                # ileri hareketi kesip beş yeni kareyle sonucu doğrula.
+                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+                self.state = ApproachState.CONFIRMING_RESULT
+                self._clear_confirmation()
+                return False
+            if abs(target_angle) > MAX_MOVING_TARGET_ANGLE_DEG:
+                self._lose_target(
+                    f"düz hareket sırasında hedef açısı {target_angle:.1f}° oldu"
+                )
+                return False
             self._move_straight(now)
         else:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)

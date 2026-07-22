@@ -40,6 +40,7 @@ IMPACT_DELTA_THRESHOLD=4.0
 IMPACT_CONSECUTIVE_SAMPLES=2
 IMPACT_MIN_FORWARD_SPEED=0.10
 IMPACT_MAX_CAMERA_DISTANCE_M=2.0
+IMPACT_TARGET_FRESH_SEC=0.60
 BASELINE_WINDOW=20
 CONF_DISTANCE_RATIO=0.30
 CONF_ANGLE_SPREAD_DEG=18.0
@@ -77,8 +78,18 @@ class CarpmaGorevi:
         mag=math.sqrt(ax*ax+ay*ay+az*az)
         if self.state!=CarpmaState.STRIKING or self.current_speed<IMPACT_MIN_FORWARD_SPEED:
             self.accel_baseline.append(mag); self.spike_count=0; return
-        if self.latest_target is None or float(self.latest_target.get('distance',999))>IMPACT_MAX_CAMERA_DISTANCE_M:
-            self.accel_baseline.append(mag); self.spike_count=0; return
+        target_is_fresh=(
+            self.last_seen_time is not None
+            and time.monotonic()-self.last_seen_time<=IMPACT_TARGET_FRESH_SEC
+        )
+        if (
+            self.latest_target is None
+            or float(self.latest_target.get('distance',999))>IMPACT_MAX_CAMERA_DISTANCE_M
+            or not target_is_fresh
+        ):
+            # Saldırı başlamışken bayat/uzak hedef bağlamında gelen sıçramayı
+            # ne temas say ne de sakin-su baseline'ını kirlet.
+            self.spike_count=0; return
         if len(self.accel_baseline)<max(5,BASELINE_WINDOW//2): self.accel_baseline.append(mag); return
         baseline=sum(self.accel_baseline)/len(self.accel_baseline); delta=abs(mag-baseline)
         self.spike_count=self.spike_count+1 if delta>=self.impact_delta_threshold else 0
@@ -102,18 +113,19 @@ class CarpmaGorevi:
         return max(valid,key=lambda x:x[0])[1] if valid else None
 
     def _process_frame(self,detections,frame_id,now):
-        if frame_id is None or frame_id==self.last_processed_frame_id: return
+        if frame_id is None or frame_id==self.last_processed_frame_id: return None
         self.last_processed_frame_id=frame_id; target=self._select_target(detections)
         if target is None:
             # Onay kareleri arka arkaya olmalı; aradaki gerçek bir kaçırma
             # önceki aday dizisini geçersiz kılar.
             if self.state==CarpmaState.CAMERA_CONFIRM:
                 self.confirm_frame_ids.clear(); self.confirm_distances.clear(); self.confirm_angles.clear()
-            return
+            return False
         self.latest_target=target; self.last_seen_time=now
         if self.state==CarpmaState.CAMERA_CONFIRM:
             self.confirm_frame_ids.add(frame_id); self.confirm_distances.append(float(target['distance'])); self.confirm_angles.append(float(target['Buoy angle: ']))
             if len(self.confirm_frame_ids)>=CAMERA_CONFIRM_FRAMES: self._finish_camera_confirmation(now)
+        return True
 
     def _finish_camera_confirmation(self,now):
         ds=self.confirm_distances[-CAMERA_CONFIRM_FRAMES:]; ang=self.confirm_angles[-CAMERA_CONFIRM_FRAMES:]
@@ -171,7 +183,9 @@ class CarpmaGorevi:
             gps_far=(backward_progress>=BACKOFF_REQUIRED_GPS_M and lateral<=BACKOFF_MAX_LATERAL_M)
         if self.backoff_start_distance is not None and self.latest_target is not None:
             camera_far=float(self.latest_target['distance'])-self.backoff_start_distance>=BACKOFF_REQUIRED_CAMERA_INCREASE_M
-        if gps_far or camera_far:
+        # İkinci vuruşu gerçekten ayrı bir fiziksel temas sayabilmek için hem
+        # Pixhawk GPS'i geri hareketi hem de kamera mesafesi artışı doğrulasın.
+        if gps_far and camera_far:
             stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); self.current_speed=0.0
             self.state=CarpmaState.COOLDOWN; self.cooldown_start_time=now; return
         if now-self.backoff_start_time>BACKOFF_TIMEOUT_SEC: self._miss('temastan sonra gerçek uzaklaşma doğrulanamadı'); return
@@ -196,9 +210,11 @@ class CarpmaGorevi:
 
 
     def update(self,detections,frame_id=None):
-        now=time.monotonic(); self._process_frame(detections,frame_id,now)
+        now=time.monotonic(); frame_status=self._process_frame(detections,frame_id,now)
         if self.state in (CarpmaState.COMPLETE,CarpmaState.MISSED):
             stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); return True
+        if self.state==CarpmaState.STRIKING and frame_status is False:
+            self._miss('fiziksel temas sürüşünde hedef yeni kamera karesinde kayboldu'); return True
         if self.state in (CarpmaState.CAMERA_CONFIRM,CarpmaState.STRIKING) and (self.last_seen_time is None or now-self.last_seen_time>TARGET_LOST_TIMEOUT_SEC):
             self._miss('hedef kamerada kayboldu'); return True
         if self.state==CarpmaState.CAMERA_CONFIRM: stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)

@@ -55,10 +55,11 @@ from teknofest.missions.carpma import CarpmaGorevi
 # ============================================================
 # GÜVENLİK PARAMETRELERİ
 # ============================================================
-GPS_TIMEOUT_SEC = 3.0
-HEADING_TIMEOUT_SEC = 2.0
+GPS_TIMEOUT_SEC = 1.0
+HEADING_TIMEOUT_SEC = 1.0
 VISION_TIMEOUT_SEC = 1.0
 IMU_TIMEOUT_SEC = 1.0
+MISSION_TOTAL_TIMEOUT_SEC = 20.0 * 60.0
 GEOFENCE_RADIUS_M = 150.0
 DRIVE_MODE = "GUIDED"
 
@@ -110,6 +111,7 @@ class Task3KamikazeEngagement:
         self.last_heading_time = None
         self.last_vision_time = None
         self.last_imu_time = None
+        self.mission_start_time = None
         self.home_lat = None
         self.home_lon = None
 
@@ -169,6 +171,7 @@ class Task3KamikazeEngagement:
             f"heading={self.current_heading:.2f}°"
         )
         self.mission_enabled = True
+        self.mission_start_time = time.monotonic()
         self.state = MissionState.SEARCHING
         self.logger.info("[GÖREV] Komut sisteminden START alındı; Task 3 araması başladı.")
         return True, "Task 3 başlatıldı."
@@ -176,6 +179,7 @@ class Task3KamikazeEngagement:
     def stop_mission(self, reason="Komut sisteminden STOP komutu"):
         stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
         self.mission_enabled = False
+        self.mission_start_time = None
         self.state = MissionState.INIT
         self.arama.reset_search()
         self.yaklasma.reset_approach()
@@ -214,6 +218,18 @@ class Task3KamikazeEngagement:
     def _check_watchdog(self):
         """GPS + heading watchdog kontrolü."""
         now = time.monotonic()
+
+        if (
+            self.mission_start_time is not None
+            and now - self.mission_start_time > MISSION_TOTAL_TIMEOUT_SEC
+        ):
+            if self.state != MissionState.FAILSAFE:
+                self.logger.error(
+                    f"Task 3 toplam {MISSION_TOTAL_TIMEOUT_SEC / 60.0:.0f} dakika "
+                    "sınırını aştı; FAILSAFE."
+                )
+            self.state = MissionState.FAILSAFE
+            return False
 
         if self.last_gps_time is None:
             return False
@@ -527,6 +543,7 @@ class Task3Node(Node):
         self.start_action_in_progress = False
         self.start_cancel_requested = False
         self.failsafe_disarm_in_progress = False
+        self.command_disarm_in_progress = False
         self.completion_disarm_attempted = False
         self.control_timer = self.create_timer(0.1, self.timer_callback)
 
@@ -652,17 +669,43 @@ class Task3Node(Node):
             # Normal STOP da acil STOP da otonom hareketi sonlandirir ve
             # DISARM doğrulaması ister. Yarışma sırasında tek izinli dış komut
             # acil motor kesmedir; "sadece sifir thrust" yeterli değildir.
-            threading.Thread(
-                target=self._command_disarm_worker,
-                args=(command,),
-                daemon=True,
-            ).start()
-            self._ack_mission_command(command)
+            if not self.command_disarm_in_progress:
+                self.command_disarm_in_progress = True
+                threading.Thread(
+                    target=self._command_disarm_worker,
+                    args=(command,),
+                    daemon=True,
+                ).start()
+            else:
+                self.get_logger().warning(
+                    "Bir STOP/DISARM işlemi zaten devam ediyor; ACK için sonucu bekliyoruz."
+                )
+
+    def _disarm_with_retries(self, label, attempts=3):
+        for attempt in range(1, attempts + 1):
+            if self._trigger_and_wait(
+                self.mission_clients.disarm_client,
+                f"{label} ({attempt}/{attempts})",
+            ):
+                self.task.bridge_armed = False
+                return True
+            stop_vehicle(self.mission_topics.cmd_vel_pub, repeat_count=2)
+        return False
 
     def _command_disarm_worker(self, command):
         label = "ACİL DISARM" if int(command) == 99 else "STOP DISARM"
-        if not self._trigger_and_wait(self.mission_clients.disarm_client, label):
-            self.get_logger().error(f"[{label}] DISARM doğrulanamadı.")
+        try:
+            if self._disarm_with_retries(label):
+                # Bridge SCR_USER1 parametresini ancak gerçek DISARM başarısı
+                # sonrasında sıfırlasın. Başarısızlıkta ACK göndermemek komutun
+                # bridge tarafından yeniden denenmesini sağlar.
+                self._ack_mission_command(command)
+            else:
+                self.get_logger().error(
+                    f"[{label}] DISARM üç denemede doğrulanamadı; ACK gönderilmedi."
+                )
+        finally:
+            self.command_disarm_in_progress = False
 
     def _launch_completion_disarm(self):
         if self.completion_disarm_attempted:
@@ -675,8 +718,7 @@ class Task3Node(Node):
 
     def _completion_disarm_worker(self):
         stop_vehicle(self.mission_topics.cmd_vel_pub, repeat_count=2)
-        if self._trigger_and_wait(self.mission_clients.disarm_client, "GÖREV SONU DISARM"):
-            self.task.bridge_armed = False
+        if self._disarm_with_retries("GÖREV SONU DISARM"):
             self.get_logger().info("[GÖREV] Task 3 tamamlandı ve araç DISARM edildi.")
         else:
             self.get_logger().error(
@@ -700,10 +742,7 @@ class Task3Node(Node):
             # ayarlarında sıfır thrust tek başına motoru kesin durdurmadığı için
             # ardından Pixhawk DISARM servisini heartbeat ile doğruluyoruz.
             self.task.stop_mission("FAILSAFE")
-            if not self._trigger_and_wait(
-                self.mission_clients.disarm_client,
-                "FAILSAFE DISARM",
-            ):
+            if not self._disarm_with_retries("FAILSAFE DISARM"):
                 self.get_logger().error(
                     "[FAILSAFE] DISARM doğrulanamadı; Mission Planner'dan "
                     "hemen DISARM uygulayın."

@@ -130,7 +130,7 @@ class BaseYOLODetector:
                 distance = get_distance_from_bbox(
                     depth_array,
                     bbox,
-                    method="median",
+                    method="central_median",
                 )
             except Exception:
                 distance = float("nan")
@@ -143,11 +143,12 @@ class BaseYOLODetector:
             # görüyor ama bulmuyor" belirtisinin bir diğer olası kaynağı
             # budur — derinlik kamerası menzil dışı/gürültülüyse bu satır
             # tetiklenir.
-            if not np.isfinite(distance):
+            if not np.isfinite(distance) or distance <= 0.0:
                 _logger.debug(
-                    f"{class_name} tespiti için mesafe NaN/sonsuz geldi "
-                    f"(bbox={bbox}); bu tespit arama filtresinde elenecek."
+                    f"{class_name} tespiti için geçerli ZED mesafesi alınamadı "
+                    f"(bbox={bbox}); tespit görev düğümüne gönderilmeyecek."
                 )
+                continue
 
             track_id = None
 
@@ -250,7 +251,7 @@ class BaseYOLODetector:
 
 
 class BuoyDetector(BaseYOLODetector):
-    REQUIRED_CLASSES = {"red_buoy"}
+    REQUIRED_CLASSES = {"red_buoy", "green_buoy", "black_buoy"}
 
     def __init__(
             self,
@@ -288,14 +289,11 @@ class BuoyDetector(BaseYOLODetector):
         # elemesine yol açar — YOLO dubayı doğru tespit etse bile arama
         # hiçbir aday bulamaz. Bu, sahada en sık karşılaşılan "arama
         # gerekli bilgiyi almıyor" nedenlerinden biridir.
-        if self.fx is None:
-            _logger.warning(
-                "BuoyDetector fx=None ile başlatıldı! 'Buoy angle: ' alanı "
-                "HER ZAMAN None dönecek ve arama/task3 tarafındaki "
-                "d.get('Buoy angle: ') is not None filtresi TÜM tespitleri "
-                "eleyecek. vision_node'u --fx <kameranin_piksel_odak_uzakligi> "
-                "ile başlatın (--cx opsiyonel, verilmezse CAMERA_WIDTH/2 "
-                "kullanılıyor)."
+        if self.fx is None or not np.isfinite(float(self.fx)) or float(self.fx) <= 0.0:
+            raise ValueError(
+                "BuoyDetector geçerli bir fx kamera odak değeri olmadan "
+                "çalıştırılamaz. vision_node'u gerçek ZED kalibrasyonundan "
+                "alınan --fx değeriyle başlatın."
             )
 
     def detect(self, bgr_image, depth_array):
