@@ -206,6 +206,49 @@ class Task3RealSensorFlowTests(unittest.TestCase):
         self.assertEqual(manager.home_lat, 41.0002)
         self.assertEqual(manager.home_lon, 29.0003)
 
+    def test_heading_updates_do_not_recount_the_last_gps_sample(self):
+        manager = t3.Task3KamikazeEngagement(
+            Node(), Topics(), object(), "red_buoy",
+        )
+        manager.update_gps(41.0, 29.0)
+        gps_sequence = manager.arama.gps_update_sequence
+
+        manager.update_heading(10.0)
+        manager.update_heading(11.0)
+        manager.update_heading(12.0)
+
+        self.assertEqual(manager.arama.gps_update_sequence, gps_sequence)
+        manager.update_gps(41.00001, 29.0)
+        self.assertEqual(manager.arama.gps_update_sequence, gps_sequence + 1)
+
+    def test_state_transitions_do_not_reuse_the_previous_camera_frame(self):
+        manager = self._ready_task_manager()
+        manager.arama.finished = True
+        manager.arama.state = arama.SearchState.TARGET_FOUND
+        manager.arama.last_processed_frame_id = 50
+
+        manager.update(detection(4.0, 0.0), frame_id=50)
+
+        self.assertEqual(manager.state, t3.MissionState.APPROACHING)
+        self.assertEqual(len(manager.yaklasma.confirmations), 0)
+        self.assertFalse(manager.yaklasma.target_lost)
+
+        manager.update(detection(4.0, 0.0), frame_id=51)
+        self.assertEqual(len(manager.yaklasma.confirmations), 1)
+
+        manager.yaklasma.finished = True
+        manager.yaklasma.state = yaklasma.ApproachState.DONE
+        manager.yaklasma.last_processed_frame_id = 60
+        manager.update(detection(1.0, 0.0), frame_id=60)
+
+        self.assertEqual(manager.state, t3.MissionState.CARPMA)
+        manager.update(detection(1.0, 0.0), frame_id=60)
+        self.assertEqual(len(manager.carpma.confirm_frame_ids), 0)
+        self.assertEqual(manager.carpma.state, carpma.CarpmaState.CAMERA_CONFIRM)
+
+        manager.update(detection(1.0, 0.0), frame_id=61)
+        self.assertEqual(len(manager.carpma.confirm_frame_ids), 1)
+
     def test_manager_failsafe_on_stale_camera_or_imu(self):
         manager = self._ready_task_manager()
         clock.advance(t3.VISION_TIMEOUT_SEC + 0.1)
@@ -477,12 +520,7 @@ class Task3RealSensorFlowTests(unittest.TestCase):
         self.assertEqual(mission.state, arama.SearchState.START_STEP)
 
     def test_search_stops_if_clockwise_heading_does_not_progress(self):
-        mission = arama.AramaGorevi(
-            Node(),
-            Topics(),
-            "red_buoy",
-            continue_without_turn_feedback=False,
-        )
+        mission = arama.AramaGorevi(Node(), Topics(), "red_buoy")
         mission.update_gps(41.0, 29.0, 0.0)
         mission.update([], frame_id=1)
         self.assertEqual(mission.state, arama.SearchState.TURNING)
@@ -495,30 +533,6 @@ class Task3RealSensorFlowTests(unittest.TestCase):
         self.assertTrue(mission.failed)
         self.assertEqual(mission.state, arama.SearchState.FAILED)
         self.assertEqual(commands[-1], (0.0, 0.0))
-
-    def test_search_scans_and_finds_red_when_turn_feedback_does_not_progress(self):
-        mission = arama.AramaGorevi(Node(), Topics(), "red_buoy")
-        mission.update_gps(41.0, 29.0, 0.0)
-        mission.update([], frame_id=1)
-        mission.update([], frame_id=2)
-        self.assertEqual(mission.state, arama.SearchState.TURNING)
-        self.assertGreater(commands[-1][0], 0.0)
-
-        clock.advance(arama.TURN_PROGRESS_TIMEOUT_SEC + 0.1)
-        mission.update([], frame_id=3)
-
-        self.assertFalse(mission.failed)
-        self.assertEqual(mission.state, arama.SearchState.HOLDING)
-        self.assertFalse(mission.hold_turn_verified)
-        self.assertEqual(commands[-1], (0.0, 0.0))
-
-        for frame_id in range(4, 9):
-            clock.advance(0.1)
-            mission.update(detection(4.0, 0.0), frame_id=frame_id)
-
-        self.assertTrue(mission.finished)
-        self.assertEqual(mission.state, arama.SearchState.TARGET_FOUND)
-        self.assertEqual(mission.found_target["class"], "red_buoy")
 
     def test_approach_averages_five_frames_then_moves_one_third_straight(self):
         mission = yaklasma.YaklasmaGorevi(Node(), Topics(), "red_buoy")

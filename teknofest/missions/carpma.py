@@ -63,6 +63,7 @@ class CarpmaGorevi:
         self.current_lat=self.current_lon=self.current_heading=None
         self.latest_target=None; self.last_seen_time=None; self.last_processed_frame_id=None
         self.confirm_frame_ids=set(); self.confirm_distances=[]; self.confirm_angles=[]
+        self.camera_confirm_start_time=None
         self.current_speed=0.0; self.accel_baseline=deque(maxlen=BASELINE_WINDOW); self.spike_count=0
         self.last_impact_time=None; self.strike_start_time=None; self.strike_start_lat=None; self.strike_start_lon=None
         self.backoff_start_time=None; self.backoff_start_lat=None; self.backoff_start_lon=None; self.backoff_start_distance=None
@@ -210,20 +211,34 @@ class CarpmaGorevi:
 
 
     def update(self,detections,frame_id=None):
-        now=time.monotonic(); frame_status=self._process_frame(detections,frame_id,now)
+        now=time.monotonic()
+        if self.state==CarpmaState.CAMERA_CONFIRM and self.camera_confirm_start_time is None:
+            self.camera_confirm_start_time=now
+        frame_status=self._process_frame(detections,frame_id,now)
         if self.state in (CarpmaState.COMPLETE,CarpmaState.MISSED):
             stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1); return True
         if self.state==CarpmaState.STRIKING and frame_status is False:
             self._miss('fiziksel temas sürüşünde hedef yeni kamera karesinde kayboldu'); return True
-        if self.state in (CarpmaState.CAMERA_CONFIRM,CarpmaState.STRIKING) and (self.last_seen_time is None or now-self.last_seen_time>TARGET_LOST_TIMEOUT_SEC):
-            self._miss('hedef kamerada kayboldu'); return True
+        if self.state in (CarpmaState.CAMERA_CONFIRM,CarpmaState.STRIKING):
+            if self.last_seen_time is None:
+                # Yaklaşmanın son karesini çarpma onayında tekrar kullanma;
+                # ilk yeni gerçek kamera karesini kısa süre bekle.
+                if (
+                    self.state==CarpmaState.CAMERA_CONFIRM
+                    and now-self.camera_confirm_start_time<=TARGET_LOST_TIMEOUT_SEC
+                ):
+                    stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)
+                    return False
+                self._miss('hedef kamerada kayboldu'); return True
+            if now-self.last_seen_time>TARGET_LOST_TIMEOUT_SEC:
+                self._miss('hedef kamerada kayboldu'); return True
         if self.state==CarpmaState.CAMERA_CONFIRM: stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)
         elif self.state==CarpmaState.STRIKING: self._strike(now)
         elif self.state==CarpmaState.BACKING_OFF: self._backoff(now)
         elif self.state==CarpmaState.COOLDOWN:
             stop_vehicle(self.topics.cmd_vel_pub,repeat_count=1)
             if now-self.cooldown_start_time>=COOLDOWN_SEC:
-                self.state=CarpmaState.CAMERA_CONFIRM; self.confirm_frame_ids.clear(); self.confirm_distances.clear(); self.confirm_angles.clear(); self.last_processed_frame_id=None; self.last_seen_time=None
+                self.state=CarpmaState.CAMERA_CONFIRM; self.confirm_frame_ids.clear(); self.confirm_distances.clear(); self.confirm_angles.clear(); self.last_seen_time=None; self.camera_confirm_start_time=now
         return self.state==CarpmaState.COMPLETE
 
     def should_retry_search(self): return self.state==CarpmaState.MISSED

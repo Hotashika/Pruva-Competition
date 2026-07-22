@@ -286,7 +286,16 @@ class YaklasmaGorevi:
         ):
             self._lose_target("hareket sırasında hedef yeni kamera karesinde kayboldu")
             return False
-        if self.last_seen_time is None or now - self.last_seen_time > TARGET_LOST_TIMEOUT_SEC:
+        if self.last_seen_time is None:
+            # Aramadan geçişte kullanılan son frame yaklaşmada yeniden
+            # sayılmaz. Kontrol timer'ı kameradan hızlıysa ilk yeni kare için
+            # kısa süre bekle; aynı frame'i kullanma veya anında LOST olma.
+            if now - self.approach_start_time <= TARGET_LOST_TIMEOUT_SEC:
+                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+                return False
+            self._lose_target("hedef kamerada kayboldu")
+            return False
+        if now - self.last_seen_time > TARGET_LOST_TIMEOUT_SEC:
             self._lose_target("hedef kamerada kayboldu")
             return False
         if self.state == ApproachState.ALIGNING:

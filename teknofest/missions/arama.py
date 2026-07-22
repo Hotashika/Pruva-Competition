@@ -53,9 +53,6 @@ MAX_CONFIRM_DISTANCE_RATIO = 0.45
 SEARCH_MAX_TRACK_ANGLE_JUMP_DEG = 30.0
 SEARCH_MAX_TRACK_DISTANCE_RATIO = 0.60
 DEFAULT_MIN_TARGET_CONFIDENCE = 0.65
-CONTINUE_WITHOUT_TURN_FEEDBACK = True
-
-
 class SearchState(Enum):
     START_STEP = auto()
     TURNING = auto()
@@ -67,15 +64,13 @@ class SearchState(Enum):
 
 class AramaGorevi:
     def __init__(self, node, mission_topics, target_class, test_mode=False,
-                 min_target_confidence=DEFAULT_MIN_TARGET_CONFIDENCE,
-                 continue_without_turn_feedback=CONTINUE_WITHOUT_TURN_FEEDBACK):
+                 min_target_confidence=DEFAULT_MIN_TARGET_CONFIDENCE):
         self.node = node
         self.logger = node.get_logger()
         self.topics = mission_topics
         self.target_class = target_class
         self.test_mode = test_mode
         self.min_target_confidence = float(min_target_confidence)
-        self.continue_without_turn_feedback = bool(continue_without_turn_feedback)
         self.state = SearchState.START_STEP
         self.finished = False
         self.failed = False
@@ -85,8 +80,6 @@ class AramaGorevi:
         self.step_target_heading = self.step_start_time = self.hold_until = None
         self.turn_start_heading_deg = None
         self.turn_start_error_deg = None
-        self.hold_reference_heading_deg = None
-        self.hold_turn_verified = False
         self.scan_origin_heading_deg = None
         self.completed_steps = 0
         self.turn_retry_count = 0
@@ -188,46 +181,21 @@ class AramaGorevi:
         self.step_start_time = now
         self.state = SearchState.TURNING
 
-    def _start_hold(self, now, turn_verified, warning=None):
-        """Motoru durdur ve kameranın o anda gördüğü bölgeyi 5 sn tara.
-
-        Heading ilerlemesi doğrulanamadığında hedef açıya ulaşılmış gibi
-        davranılmaz. Yalnızca o andaki gerçek ve sabit kamera görüşü taranır;
-        ardından sıradaki 20 derece dönüş denemesine geçilir.
-        """
-        stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
-        self.turn_retry_count = 0
-        self.hold_reference_heading_deg = self.current_heading_deg
-        self.hold_turn_verified = bool(turn_verified)
-        self.hold_until = now + STEP_HOLD_SEC
-        self.state = SearchState.HOLDING
-        self.confirmations.clear()
-        if warning:
-            self.logger.warning(warning)
-        elif turn_verified:
+    def _turn(self, now):
+        error_deg = self._angle_error(self.step_target_heading, self.current_heading_deg)
+        if abs(error_deg) <= HEADING_TOLERANCE_DEG:
+            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
+            self.turn_retry_count = 0
+            self.hold_until = now + STEP_HOLD_SEC
+            self.state = SearchState.HOLDING
+            self.confirmations.clear()
             self.logger.info(
                 f"[ARAMA] {self.completed_steps + 1}/{FULL_SCAN_STEPS} açıya ulaşıldı; "
                 "araç durdu ve 5 sn tarama başladı."
             )
-
-    def _turn(self, now):
-        error_deg = self._angle_error(self.step_target_heading, self.current_heading_deg)
-        if abs(error_deg) <= HEADING_TOLERANCE_DEG:
-            self._start_hold(now, turn_verified=True)
             return
         if now - self.step_start_time > TURN_TIMEOUT_SEC:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            if self.continue_without_turn_feedback:
-                self._start_hold(
-                    now,
-                    turn_verified=False,
-                    warning=(
-                        "[ARAMA][TEST] 20° dönüş zaman aşımında doğrulanamadı; "
-                        "görev kapatılmadı. Motor durduruldu, mevcut gerçek "
-                        "kamera görüşü 5 sn taranacak."
-                    ),
-                )
-                return
             self.turn_retry_count += 1
             if self.turn_retry_count >= TURN_MAX_RETRIES:
                 self.failed = True
@@ -247,19 +215,6 @@ class AramaGorevi:
             )
             error_reduction_deg = self.turn_start_error_deg - remaining_error_deg
             if error_reduction_deg < TURN_MIN_PROGRESS_DEG:
-                if self.continue_without_turn_feedback:
-                    self._start_hold(
-                        now,
-                        turn_verified=False,
-                        warning=(
-                            "[ARAMA][TEST] Heading 3 sn içinde hedefe doğru "
-                            f"{TURN_MIN_PROGRESS_DEG:.1f}° ilerlemedi "
-                            f"(hata azalması={error_reduction_deg:.1f}°). "
-                            "Görev kapatılmadı; motor durduruldu ve mevcut "
-                            "gerçek kamera görüşü 5 sn taranacak."
-                        ),
-                    )
-                    return
                 stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
                 self.failed = True
                 self.state = SearchState.FAILED
@@ -371,21 +326,15 @@ class AramaGorevi:
             self._turn(now)
         elif self.state == SearchState.HOLDING:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            if self.hold_reference_heading_deg is None:
-                # Geriye uyumlu/manual state kurulumlarında referansı ilk gerçek
-                # heading örneğinden al; sentetik bir yön değeri üretme.
-                self.hold_reference_heading_deg = self.current_heading_deg
             hold_error_deg = abs(
-                self._angle_error(self.hold_reference_heading_deg, self.current_heading_deg)
+                self._angle_error(self.step_target_heading, self.current_heading_deg)
             )
             if hold_error_deg > HOLD_MAX_HEADING_DRIFT_DEG:
                 # Dalga/atalet araci dondurmeye devam ederse hareketli kareleri
                 # tarama onayina katma. Ayni mutlak 20 derece hedefine geri don.
                 self.confirmations.clear()
                 self.turn_start_heading_deg = self.current_heading_deg
-                self.turn_start_error_deg = abs(
-                    self._angle_error(self.step_target_heading, self.current_heading_deg)
-                )
+                self.turn_start_error_deg = hold_error_deg
                 self.step_start_time = now
                 self.state = SearchState.TURNING
                 self.logger.warning(
@@ -417,8 +366,6 @@ class AramaGorevi:
         self.step_target_heading = self.step_start_time = self.hold_until = None
         self.turn_start_heading_deg = None
         self.turn_start_error_deg = None
-        self.hold_reference_heading_deg = None
-        self.hold_turn_verified = False
         self.scan_origin_heading_deg = None
         self.turn_retry_count = 0
         self.relocation_start_lat = self.relocation_start_lon = None
@@ -439,8 +386,6 @@ class AramaGorevi:
             "failed": self.failed,
             "completed_steps": self.completed_steps,
             "turn_retry_count": self.turn_retry_count,
-            "hold_turn_verified": self.hold_turn_verified,
-            "continue_without_turn_feedback": self.continue_without_turn_feedback,
             "relocation_distance_m": RELOCATION_DISTANCE_M,
             "relocation_confirm_count": self.relocation_confirm_count,
         }

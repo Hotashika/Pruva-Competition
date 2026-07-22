@@ -48,10 +48,7 @@ from utils.mavlink_utilities import (
     calculate_gps_distance,
 )
 
-from teknofest.missions.arama import (
-    AramaGorevi,
-    CONTINUE_WITHOUT_TURN_FEEDBACK,
-)
+from teknofest.missions.arama import AramaGorevi
 from teknofest.missions.yaklasma import YaklasmaGorevi
 from teknofest.missions.carpma import CarpmaGorevi
 
@@ -92,8 +89,7 @@ class Task3KamikazeEngagement:
     def __init__(self, node, mission_topics, mission_clients, target_class,
                  test_mode=False, safety_stop_distance=None,
                  min_target_confidence=MIN_TARGET_CONFIDENCE,
-                 impact_delta_threshold=IMPACT_THRESHOLD_MPS2,
-                 continue_without_turn_feedback=CONTINUE_WITHOUT_TURN_FEEDBACK):
+                 impact_delta_threshold=IMPACT_THRESHOLD_MPS2):
         self.node = node
         self.is_armed = False
         self.logger = node.get_logger()
@@ -127,7 +123,6 @@ class Task3KamikazeEngagement:
             node, mission_topics, target_class,
             test_mode=test_mode,
             min_target_confidence=self.min_target_confidence,
-            continue_without_turn_feedback=continue_without_turn_feedback,
         )
         self.yaklasma = YaklasmaGorevi(
             node, mission_topics, target_class,
@@ -146,19 +141,22 @@ class Task3KamikazeEngagement:
         self.current_lat = float(lat)
         self.current_lon = float(lon)
         self.last_gps_time = time.monotonic()
-        self._activate_with_real_pose_if_ready()
+        # Yalnız gerçek /cube/gps callback'i yeni GPS örneği sayılır. Heading
+        # callback'inde son koordinatı yeniden iletmek, relocation sırasında
+        # tek GPS paketini birden fazla bağımsız örnekmiş gibi saydırıyordu.
+        self.arama.update_gps(self.current_lat, self.current_lon)
+        self.yaklasma.update_gps(self.current_lat, self.current_lon)
+        self.carpma.update_gps(self.current_lat, self.current_lon)
+        return self._activate_with_real_pose_if_ready()
 
     def _activate_with_real_pose_if_ready(self):
         """Gerçek GPS ve gerçek heading birlikte gelmeden görevi başlatmaz."""
-        if self.current_lat is None or self.current_lon is None or self.current_heading is None:
-            return False
-
-        self.arama.update_gps(self.current_lat, self.current_lon, self.current_heading)
-        self.yaklasma.update_gps(self.current_lat, self.current_lon, self.current_heading)
-        self.carpma.update_gps(self.current_lat, self.current_lon, self.current_heading)
-
         # Sensörler hazır olsa bile komut sistemi START göndermeden görev başlamaz.
-        return True
+        return None not in (
+            self.current_lat,
+            self.current_lon,
+            self.current_heading,
+        )
 
     def start_mission(self):
         """Komut sistemi tarafından çağrılır; sensör ölçümü üretmez."""
@@ -205,7 +203,7 @@ class Task3KamikazeEngagement:
         self.arama.update_heading(heading)
         self.yaklasma.update_heading(heading)
         self.carpma.update_heading(heading)
-        self._activate_with_real_pose_if_ready()
+        return self._activate_with_real_pose_if_ready()
 
     # --------------------------------------------------------
     def update_imu(self, gyro_z, accel_x, accel_y, accel_z):
@@ -399,6 +397,10 @@ class Task3KamikazeEngagement:
                     stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
                 return
             self.state = MissionState.APPROACHING
+            # Aramada beşinci onay olarak kullanılan son kamera karesini
+            # yaklaşmada tekrar birinci kare sayma. Yeni frame gelene kadar
+            # yaklaşma güvenli biçimde sıfır komutta bekler.
+            self.yaklasma.last_processed_frame_id = self.arama.last_processed_frame_id
             self.logger.info("[DURUM] Arama tamamlandı, yaklaşma aşamasına geçiliyor.")
 
         # ---------------- APPROACHING ----------------
@@ -412,6 +414,10 @@ class Task3KamikazeEngagement:
 
             if approach_done:
                 self.state = MissionState.CARPMA
+                # Yaklaşmanın son doğrulama karesi çarpma kamera onayında
+                # yeniden kullanılamaz; çarpma beş yeni gerçek kare bekler.
+                self.carpma.last_processed_frame_id = self.yaklasma.last_processed_frame_id
+                self.carpma.camera_confirm_start_time = None
                 self.logger.info("[DURUM] Yaklaşma+emin olma tamamlandı, çarpma aşamasına geçiliyor.")
             return
 
@@ -454,10 +460,6 @@ class Task3Node(Node):
         self.declare_parameter('min_target_confidence', MIN_TARGET_CONFIDENCE)
         self.declare_parameter('impact_delta_threshold', IMPACT_THRESHOLD_MPS2)
         self.declare_parameter('use_force_arm', USE_FORCE_ARM)
-        self.declare_parameter(
-            'continue_without_turn_feedback',
-            CONTINUE_WITHOUT_TURN_FEEDBACK,
-        )
 
         color = self.get_parameter('carpilacak_duba').get_parameter_value().string_value
         color = color.strip().lower()
@@ -466,9 +468,6 @@ class Task3Node(Node):
         self.min_target_confidence = self.get_parameter('min_target_confidence').get_parameter_value().double_value
         self.impact_delta_threshold = self.get_parameter('impact_delta_threshold').get_parameter_value().double_value
         self.use_force_arm = self.get_parameter('use_force_arm').get_parameter_value().bool_value
-        self.continue_without_turn_feedback = self.get_parameter(
-            'continue_without_turn_feedback'
-        ).get_parameter_value().bool_value
 
         if not 0.0 < self.min_target_confidence <= 1.0:
             raise ValueError("min_target_confidence 0 ile 1 arasında olmalıdır.")
@@ -489,10 +488,6 @@ class Task3Node(Node):
         self.get_logger().info(f"📷 Minimum tespit güveni: {self.min_target_confidence:.2f}")
         self.get_logger().info(f"💥 IMU temas eşiği: {self.impact_delta_threshold:.2f} m/s²")
         self.get_logger().info(f"🔐 ARM yöntemi: {'FORCE ARM' if self.use_force_arm else 'normal ARM'}")
-        self.get_logger().info(
-            "🧭 Heading dönüş doğrulanamazsa aramaya devam: "
-            f"{self.continue_without_turn_feedback}"
-        )
 
         self.mission_clients = create_mission_clients(self)
         wait_for_mission_services(self, self.mission_clients)
@@ -548,7 +543,6 @@ class Task3Node(Node):
             safety_stop_distance=self.safety_stop_distance,
             min_target_confidence=self.min_target_confidence,
             impact_delta_threshold=self.impact_delta_threshold,
-            continue_without_turn_feedback=self.continue_without_turn_feedback,
         )
 
         self.current_heading = None

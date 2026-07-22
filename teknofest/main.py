@@ -163,6 +163,7 @@ if __name__ == "__main__":
     p_teknofest_task1 = None
     p_teknofest_task2 = None
     p_teknofest_task3 = None
+    child_monitor_stop_event = None
 
     try:
         run_startup_cleanup()
@@ -251,6 +252,7 @@ if __name__ == "__main__":
 
         p_teknofest_task3 = launch_child_process(cmd_teknofest_task3)
         print(f" -> TEKNOFEST Mission 3 Node launched (PID: {p_teknofest_task3.pid})\n")
+        child_monitor_stop_event = threading.Event()
         threading.Thread(
             target=monitor_child_processes,
             args=(
@@ -259,7 +261,7 @@ if __name__ == "__main__":
                     ("Vision Node", p_vision),
                     ("TEKNOFEST Mission 3 Node", p_teknofest_task3),
                 ),
-                capture_stop_event,
+                child_monitor_stop_event,
             ),
             daemon=True,
         ).start()
@@ -282,6 +284,12 @@ if __name__ == "__main__":
         raise
     finally:
         print("[SYSTEM] Cleaning process was started...")
+
+        # Kontrollü Ctrl+C/kapanış sırasında mission prosesinin exit=0 ile
+        # bitmesi çökme değildir. Monitörü önce durdur; gerçek çalışma
+        # sırasında beklenmedik kapanmaları izlemeye devam eder.
+        if child_monitor_stop_event is not None:
+            child_monitor_stop_event.set()
 
         # Mission once kapanir; SIGINT handler'i bridge hâlâ ayaktayken araci
         # durdurup DISARM eder. Ardindan vision, en son bridge kapatilir.
