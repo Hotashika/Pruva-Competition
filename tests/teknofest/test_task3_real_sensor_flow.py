@@ -477,7 +477,12 @@ class Task3RealSensorFlowTests(unittest.TestCase):
         self.assertEqual(mission.state, arama.SearchState.START_STEP)
 
     def test_search_stops_if_clockwise_heading_does_not_progress(self):
-        mission = arama.AramaGorevi(Node(), Topics(), "red_buoy")
+        mission = arama.AramaGorevi(
+            Node(),
+            Topics(),
+            "red_buoy",
+            continue_without_turn_feedback=False,
+        )
         mission.update_gps(41.0, 29.0, 0.0)
         mission.update([], frame_id=1)
         self.assertEqual(mission.state, arama.SearchState.TURNING)
@@ -490,6 +495,30 @@ class Task3RealSensorFlowTests(unittest.TestCase):
         self.assertTrue(mission.failed)
         self.assertEqual(mission.state, arama.SearchState.FAILED)
         self.assertEqual(commands[-1], (0.0, 0.0))
+
+    def test_search_scans_and_finds_red_when_turn_feedback_does_not_progress(self):
+        mission = arama.AramaGorevi(Node(), Topics(), "red_buoy")
+        mission.update_gps(41.0, 29.0, 0.0)
+        mission.update([], frame_id=1)
+        mission.update([], frame_id=2)
+        self.assertEqual(mission.state, arama.SearchState.TURNING)
+        self.assertGreater(commands[-1][0], 0.0)
+
+        clock.advance(arama.TURN_PROGRESS_TIMEOUT_SEC + 0.1)
+        mission.update([], frame_id=3)
+
+        self.assertFalse(mission.failed)
+        self.assertEqual(mission.state, arama.SearchState.HOLDING)
+        self.assertFalse(mission.hold_turn_verified)
+        self.assertEqual(commands[-1], (0.0, 0.0))
+
+        for frame_id in range(4, 9):
+            clock.advance(0.1)
+            mission.update(detection(4.0, 0.0), frame_id=frame_id)
+
+        self.assertTrue(mission.finished)
+        self.assertEqual(mission.state, arama.SearchState.TARGET_FOUND)
+        self.assertEqual(mission.found_target["class"], "red_buoy")
 
     def test_approach_averages_five_frames_then_moves_one_third_straight(self):
         mission = yaklasma.YaklasmaGorevi(Node(), Topics(), "red_buoy")
