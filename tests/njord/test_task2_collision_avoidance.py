@@ -292,15 +292,14 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
 
     def test_current_buoy_model_classes_are_collision_targets(self):
         expected_classes = {
-            "green_buoys",
-            "red_buoys",
-            "north_buoys",
-            "east_buoys",
-            "south_buoys",
-            "west_buoys",
+            "red_buoy",
+            "green_buoy",
+            "black_buoy",
+            "orange_buoy",
+            "yellow_buoy",
         }
 
-        self.assertEqual(expected_classes, task2.BUOY_MODEL_TYPES)
+        self.assertTrue(expected_classes.issubset(task2.BUOY_MODEL_TYPES))
         for model_class in expected_classes:
             with self.subTest(model_class=model_class):
                 self.assertTrue(

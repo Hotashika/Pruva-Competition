@@ -87,6 +87,42 @@ def test_cli_selection_and_interface_default(monkeypatch, argv, expected_task):
     assert main.parse_args(argv).task == expected_task
 
 
+@pytest.mark.parametrize(
+    ("mission_filename", "expected_module"),
+    [
+        ("competition_mission.py", "teknofest.missions.competition_mission"),
+        ("task1_point_tracking.py", "teknofest.missions.task1_point_tracking"),
+        (
+            "task2_point_tracking_task_in_an_environment_with_obstacle.py",
+            "teknofest.missions.task2_point_tracking_task_in_an_environment_with_obstacle",
+        ),
+        (
+            "task3_kamikaze_engagement.py",
+            "teknofest.missions.task3_kamikaze_engagement",
+        ),
+    ],
+)
+def test_direct_cli_missions_launch_as_package_modules(
+    monkeypatch,
+    mission_filename,
+    expected_module,
+):
+    main = _load_teknofest_main(monkeypatch)
+
+    command = main.build_mission_launch_command(
+        "source /opt/ros/kilted/setup.bash",
+        "export PYTHONPATH=/home/pruva/final",
+        "/usr/bin/python3",
+        mission_filename,
+    )
+
+    assert command == (
+        "source /opt/ros/kilted/setup.bash && "
+        "export PYTHONPATH=/home/pruva/final && "
+        f"/usr/bin/python3 -m {expected_module}"
+    )
+
+
 def test_interface_command_mapping_matches_requested_order(monkeypatch):
     manager = _load_mission_manager(monkeypatch)
 

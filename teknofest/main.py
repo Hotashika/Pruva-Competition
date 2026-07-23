@@ -56,6 +56,22 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def build_mission_launch_command(
+        ros2_setup,
+        python_path_setup,
+        python_executable,
+        mission_filename,
+):
+    """Build a package-module launch command for a TEKNOFEST mission."""
+    mission_module = (
+        f"teknofest.missions.{os.path.splitext(mission_filename)[0]}"
+    )
+    return (
+        f"{ros2_setup} && {python_path_setup} && "
+        f"{shlex.quote(python_executable)} -m {shlex.quote(mission_module)}"
+    )
+
+
 def launch_child_process(command):
     return subprocess.Popen(
         command,
@@ -242,10 +258,11 @@ if __name__ == "__main__":
 
         cmd_teknofest_mission = None
         if not interface_mode:
-            mission_path = os.path.join(PROJECT_ROOT, "missions", mission_filename)
-            cmd_teknofest_mission = (
-                f"{ros2_setup} && {python_path_setup} && "
-                f"{shlex.quote(sys.executable)} {shlex.quote(mission_path)}"
+            cmd_teknofest_mission = build_mission_launch_command(
+                ros2_setup,
+                python_path_setup,
+                sys.executable,
+                mission_filename,
             )
 
         p_bridge = launch_child_process(cmd_bridge)

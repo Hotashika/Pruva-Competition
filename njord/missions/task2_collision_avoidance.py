@@ -20,7 +20,6 @@ from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from njord.config.mission_config import WAYPOINT_DIRECTORY
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
     calculate_gps_distance,
@@ -37,7 +36,8 @@ from utils.mavlink_utilities import (
 from utils.read_waypoints import parse_qgc_waypoints
 
 
-WAYPOINT_PATH = WAYPOINT_DIRECTORY / "njord_task2.waypoints"
+BASE_DIR = Path(__file__).resolve().parent.parent
+WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "njord_task2.waypoints"
 ACTIVE_TASK_NAME = "task2"
 HOLD_MODE_NAME = "HOLD"
 
@@ -77,6 +77,13 @@ VISION_DETECTION_TIMEOUT_SEC = 1.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
 BUOY_MODEL_TYPES = {
+    # Class names embedded in the current buoy.pt model.
+    "red_buoy",
+    "green_buoy",
+    "black_buoy",
+    "orange_buoy",
+    "yellow_buoy",
+    # Legacy aliases kept for older datasets and recorded detections.
     "green_buoys",
     "red_buoys",
     "north_buoys",
