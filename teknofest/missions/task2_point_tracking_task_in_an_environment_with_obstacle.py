@@ -42,6 +42,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
 
+from teknofest.config.mission_config import WAYPOINT_DIRECTORY
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
     calculate_bearing,
@@ -62,8 +63,7 @@ from teknofest.missions.utils.yellow_buoy_course_keeper import (
     YellowBuoyCourseKeeper,
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "teknofest_task2.waypoints"
+WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task2.waypoints"
 
 # ============================================================
 # ROS / VISION PARAMETRELERİ
@@ -107,7 +107,7 @@ AVOID_ENTER_DIST_M = 3.0
 AVOID_EXIT_DIST_M = 4.0
 
 # Kacinma GPS hedefini sari dubanin sagina/soluna bu kadar metre aciklikla koy.
-AVOID_PASS_CLEARANCE_M = 2.0
+AVOID_PASS_CLEARANCE_M = 2.5
 
 # Vision gurultusunu elemek icin GPS hedefini ancak bu kadar kayarsa yenile.
 AVOID_TARGET_REFRESH_MIN_SHIFT_M = 0.25
@@ -203,6 +203,14 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.state = MissionState.FAILSAFE
         stop_vehicle(self.topics.cmd_vel_pub)
         self._request_hold_mode()
+
+    def reset_geofence_origin(self, lat, lon):
+        self.home_lat = float(lat)
+        self.home_lon = float(lon)
+        self.logger.info(
+            f"Task 2 geofence merkezi yenilendi: "
+            f"{self.home_lat:.7f}, {self.home_lon:.7f}"
+        )
 
     # ========================================================
     # VERİ GÜNCELLEME

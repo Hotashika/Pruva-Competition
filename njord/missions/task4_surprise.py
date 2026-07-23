@@ -15,6 +15,7 @@ from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from njord.config.mission_config import WAYPOINT_DIRECTORY
 from utils.mavlink_utilities import (
     call_set_mode,
     call_trigger_service,
@@ -28,11 +29,10 @@ from utils.mavlink_utilities import (
 from utils.read_waypoints import parse_qgc_waypoints
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 WAYPOINT_PATH = Path(
     os.getenv(
         "NJORD_TASK4_WAYPOINT_PATH",
-        BASE_DIR.parent / "waypoints" / "njord_task4.waypoints",
+        WAYPOINT_DIRECTORY / "njord_task4.waypoints",
     )
 )
 ACTIVE_TASK_NAME = "task4"

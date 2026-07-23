@@ -4,10 +4,11 @@
 
 This repository contains two parallel competition applications:
 
-- `njord/`: Njord competition runtime, missions, vision, camera, servers, config, waypoints, scripts, and models.
+- `njord/`: Njord competition runtime, missions, vision, camera, servers, config, scripts, and models.
 - `teknofest/`: TEKNOFEST competition runtime with the same package layout.
 - `bridge/`: ROS 2 and MAVLink bridge code.
 - `utils/`: Shared MAVLink, waypoint, battery, task selection, and JSON helpers.
+- `waypoints/`: Competition-specific mission files under `njord/` and `teknofest/`.
 - `tests/`: Pytest suite grouped by `common/`, `njord/`, and `teknofest/`.
 
 Keep competition-specific logic inside its own package. Move code to `utils/` or `bridge/` only when it is genuinely shared.
@@ -58,7 +59,8 @@ python njord/main.py --task-1
 python teknofest/main.py --task-2
 ```
 
-Hardware-dependent tests under `tests/common/` should be run explicitly and only with the required devices connected.
+Hardware-dependent checks under `tests/manual/` should be run explicitly and only with the required devices connected.
+Interactive GUI, angle, ROS, camera, and CUDA checks there are scripts and are not collected by pytest.
 
 ## Code Style
 

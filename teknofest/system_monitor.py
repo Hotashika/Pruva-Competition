@@ -15,5 +15,5 @@ if __name__ == "__main__":
     run_monitor(
         title="PRUVA TEKNOFEST",
         node_name="teknofest_system_monitor",
-        subscribe_mission_status=False,
+        subscribe_mission_status=True,
     )

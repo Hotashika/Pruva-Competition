@@ -1,3 +1,5 @@
+"""Manual GUI video stream check; not part of the pytest suite."""
+
 import sys
 
 import cv2

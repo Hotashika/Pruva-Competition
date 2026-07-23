@@ -119,6 +119,7 @@ class HardwareConfig:
     confirmation_frames: int = 3
     qr_timeout_sec: float = 1.0
     bridge_state_timeout_sec: float = 2.0
+    vehicle_ready_timeout_sec: float = 5.0
     camera_ready_timeout_sec: float = 25.0
     vision_ready_timeout_sec: float = 45.0
     bridge_ready_timeout_sec: float = 30.0
@@ -140,6 +141,8 @@ def _validate_config(config: HardwareConfig) -> None:
         raise ValueError("qr_timeout_sec must be positive")
     if not 0.0 <= config.min_confidence <= 1.0:
         raise ValueError("min_confidence must be in [0, 1]")
+    if config.vehicle_ready_timeout_sec <= 0.0:
+        raise ValueError("vehicle_ready_timeout_sec must be positive")
 
 
 def _start_capture(config: HardwareConfig):
@@ -208,7 +211,7 @@ def _start_bridge_if_needed(node) -> Optional[subprocess.Popen]:
     process. ``bridge_node.py`` imports its ``connect_mavlink`` function and
     owns both the initial MAVLink connection and automatic reconnect attempts.
     """
-    if node.clients.set_mode_client.wait_for_service(timeout_sec=0.5):
+    if node.mission_clients.set_mode_client.wait_for_service(timeout_sec=0.5):
         node.get_logger().info(
             "Running bridge found. Its MAVLink connection/reconnect loop will be used."
         )
@@ -292,7 +295,10 @@ def _run_hardware_test(config: HardwareConfig) -> None:
     class ArTagQrNavigationNode(Node):
         def __init__(self):
             super().__init__("njord_ar_tag_qr_navigation_test")
-            self.clients = create_mission_clients(self)
+            # ``rclpy.node.Node`` exposes ``clients`` as a read-only property in
+            # some ROS 2 releases.  Keep our grouped mission service clients in
+            # a distinct attribute so node construction works across releases.
+            self.mission_clients = create_mission_clients(self)
             self.cmd_vel_pub = self.create_publisher(Twist, "/cube/cmd_vel", 10)
             self.active_task_pub = self.create_publisher(
                 String, "/mission/active_task", 10
@@ -477,10 +483,10 @@ def _run_hardware_test(config: HardwareConfig) -> None:
 
         def wait_for_bridge(self, process: Optional[subprocess.Popen]) -> None:
             clients = (
-                self.clients.set_mode_client,
-                self.clients.arm_client,
-                self.clients.force_arm_client,
-                self.clients.disarm_client,
+                self.mission_clients.set_mode_client,
+                self.mission_clients.arm_client,
+                self.mission_clients.force_arm_client,
+                self.mission_clients.disarm_client,
             )
             deadline = time.monotonic() + config.bridge_ready_timeout_sec
             while rclpy.ok() and time.monotonic() < deadline:
@@ -504,6 +510,39 @@ def _run_hardware_test(config: HardwareConfig) -> None:
                     self.last_wait_log = now
                 rclpy.spin_once(self, timeout_sec=0.1)
             raise TimeoutError("MAVLink bridge did not become connected in time")
+
+        def wait_for_motion_ready(self) -> None:
+            """Wait until this node receives the post-ARM bridge state.
+
+            The bridge confirms mode/ARM inside its service callbacks, but the
+            subscription callback on this node may still contain the state from
+            before those service calls.  Enabling the control loop before the
+            next ``/cube/state`` message creates a false failsafe.
+            """
+            deadline = time.monotonic() + config.vehicle_ready_timeout_sec
+            while rclpy.ok() and time.monotonic() < deadline:
+                self.publish_active_task()
+                rclpy.spin_once(self, timeout_sec=0.1)
+                state = parse_bridge_state(self.last_bridge_state)
+                state_is_fresh = (
+                    self.last_bridge_state_time is not None
+                    and time.monotonic() - self.last_bridge_state_time
+                    <= config.bridge_state_timeout_sec
+                )
+                if (
+                    state_is_fresh
+                    and state.get("connected") is True
+                    and state.get("armed") is True
+                    and str(state.get("mode", "")).upper() == "GUIDED"
+                ):
+                    self.get_logger().info(
+                        f"Vehicle motion state confirmed: {self.last_bridge_state}"
+                    )
+                    return
+            raise TimeoutError(
+                "Vehicle did not publish a fresh motion-ready state after ARM; "
+                f"last_state={self.last_bridge_state!r}"
+            )
 
         def safe_stop(self) -> None:
             self.motion_enabled = False
@@ -556,22 +595,25 @@ def _run_hardware_test(config: HardwareConfig) -> None:
             )
             node.safe_stop()
             if not call_trigger_service(
-                node, node.clients.disarm_client, "PRE-TEST DISARM"
+                node, node.mission_clients.disarm_client, "PRE-TEST DISARM"
             ):
                 raise RuntimeError("Pre-test DISARM failed")
 
         required_mode = "GUIDED"
         node.get_logger().info(f"Setting required mode: {required_mode}")
-        if not call_set_mode(node, node.clients.set_mode_client, required_mode):
+        if not call_set_mode(node, node.mission_clients.set_mode_client, required_mode):
             raise RuntimeError(f"Could not switch vehicle to {required_mode}")
 
         arm_client = (
-            node.clients.force_arm_client if config.force_arm else node.clients.arm_client
+            node.mission_clients.force_arm_client
+            if config.force_arm
+            else node.mission_clients.arm_client
         )
         arm_name = "FORCE ARM" if config.force_arm else "ARM"
         if not call_trigger_service(node, arm_client, arm_name):
             raise RuntimeError(f"{arm_name} failed")
 
+        node.wait_for_motion_ready()
         node.reset_detection()
         node.motion_enabled = True
         node.get_logger().warn(
@@ -597,7 +639,7 @@ def _run_hardware_test(config: HardwareConfig) -> None:
                 try:
                     call_set_mode(
                         node,
-                        node.clients.set_mode_client,
+                        node.mission_clients.set_mode_client,
                         "HOLD",
                         timeout_sec=2.0,
                     )
@@ -606,7 +648,7 @@ def _run_hardware_test(config: HardwareConfig) -> None:
                 try:
                     if not call_trigger_service(
                         node,
-                        node.clients.disarm_client,
+                        node.mission_clients.disarm_client,
                         "DISARM",
                         timeout_sec=4.0,
                     ):

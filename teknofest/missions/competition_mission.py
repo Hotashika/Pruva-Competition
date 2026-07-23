@@ -66,7 +66,7 @@ class CompetitionNode(Task1Node):
         self.competition_state = CompetitionState.PARKUR_1
 
         self.get_logger().info(
-            "Competition mode hazır: PARKUR_1 GN1->GN4, "
+            "Competition mode hazır: PARKUR_1 GN1->GN2->GN3->GN4, "
             "PARKUR_2 GN4->GN5, PARKUR_3 GN5 sonrası."
         )
 
@@ -103,12 +103,22 @@ class CompetitionNode(Task1Node):
 
     def _transition_to(self, state, task_name):
         stop_vehicle(self.mission_topics.cmd_vel_pub)
+
+        if task_name == "task2":
+            if self.current_lat is None or self.current_lon is None:
+                self._enter_competition_failsafe(
+                    "Task 2 geçişinde geçerli GPS yok."
+                )
+                return
+
+            self.task2.reset_geofence_origin(
+                self.current_lat,
+                self.current_lon,
+            )
+
         self.competition_state = state
         self.active_task_name = task_name
         self._publish_active_task()
-        self.get_logger().info(
-            f"Parkur geçişi tamamlandı; aktif algoritma={task_name}."
-        )
 
     def _enter_competition_failsafe(self, reason):
         self.get_logger().error(reason)

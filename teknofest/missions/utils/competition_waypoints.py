@@ -1,29 +1,24 @@
 """Kesintisiz yarış modu için GN waypoint dosyası sözleşmesi."""
 
-from pathlib import Path
-
+from teknofest.config.mission_config import WAYPOINT_DIRECTORY
 from utils.read_waypoints import parse_qgc_waypoints
 
 
-GN_WAYPOINT_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "waypoints"
-    / "teknofest.waypoints"
-)
-GN_NAMES = ("GN1", "GN4", "GN5")
+GN_WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest.waypoints"
+GN_NAMES = ("GN1", "GN2", "GN3", "GN4", "GN5")
 COMPETITION_ROUTE_NAMES = {
-    "task1": ("GN1", "GN4"),
+    "task1": ("GN1", "GN2", "GN3", "GN4"),
     "task2": ("GN4", "GN5"),
 }
 
 
 def load_competition_points(path=GN_WAYPOINT_PATH):
-    """HOME satırından sonra sırasıyla GN1, GN4 ve GN5'i yükler."""
+    """HOME satırından sonra sırasıyla GN1-GN5 noktalarını yükler."""
     points = parse_qgc_waypoints(path)
     if len(points) != len(GN_NAMES):
         raise ValueError(
-            f"{path} HOME satırından sonra tam 3 nokta içermeli: "
-            f"GN1, GN4, GN5; bulunan={len(points)}"
+            f"{path} HOME satırından sonra tam 5 nokta içermeli: "
+            f"GN1, GN2, GN3, GN4, GN5; bulunan={len(points)}"
         )
     return {
         name: {**point, "name": name}

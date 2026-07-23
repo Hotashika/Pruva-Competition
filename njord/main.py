@@ -13,8 +13,12 @@ COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
 if COMPETITION_ROOT not in sys.path:
     sys.path.insert(0, COMPETITION_ROOT)
 
-from utils.task_selection_state import default_task_selection_file
 from utils import waypoint_server
+from njord.config.mission_config import (
+    MAVLINK_BRIDGE_DEFAULTS,
+    MAVLINK_BRIDGE_OVERRIDES,
+    WAYPOINT_DIRECTORY,
+)
 from njord.core import capture_proc
 from njord.core import data_writer
 from njord.servers import data_server
@@ -77,16 +81,9 @@ def run_startup_cleanup():
 
 
 def configure_mavlink_bridge_environment():
-    defaults = {
-        "MAVLINK_CONNECTION_STRING": "/dev/ttyACM0",
-        "MAVLINK_BAUD": "921600",
-        "MAVLINK_SOURCE_SYSTEM": "1",
-        "MAVLINK_SOURCE_COMPONENT": "191",
-        "MAVLINK_MISSION_START_TOPIC": "/mission_start",
-        "MISSION_SELECTION_FILE": default_task_selection_file(),
-    }
-    for key, value in defaults.items():
+    for key, value in MAVLINK_BRIDGE_DEFAULTS.items():
         os.environ.setdefault(key, value)
+    os.environ.update(MAVLINK_BRIDGE_OVERRIDES)
 
     print(
         "[SYSTEM] MAVLink bridge env: "
@@ -95,6 +92,7 @@ def configure_mavlink_bridge_environment():
         f"source={os.environ.get('MAVLINK_SOURCE_SYSTEM')}:"
         f"{os.environ.get('MAVLINK_SOURCE_COMPONENT')}, "
         f"mission_start_topic={os.environ.get('MAVLINK_MISSION_START_TOPIC')}, "
+        f"waypoint_directory={os.environ.get('MAVLINK_MISSION_WAYPOINT_DIRECTORY')}, "
         f"mission_selection_file={os.environ.get('MISSION_SELECTION_FILE')}"
     )
 
@@ -160,7 +158,11 @@ if __name__ == "__main__":
 
     try:
         run_startup_cleanup()
-        threading.Thread(target=waypoint_server.start, args=(8000,), daemon=True).start()
+        threading.Thread(
+            target=waypoint_server.start,
+            args=(8000, WAYPOINT_DIRECTORY),
+            daemon=True,
+        ).start()
         print("[SYSTEM] Waypoint upload -> http://0.0.0.0:8000/api/mission/upload_txt")
         try:
             (
