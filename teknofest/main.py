@@ -22,6 +22,7 @@ from utils import waypoint_server
 
 
 MISSION_SPECS = {
+    "mission-planner": ("Mission Planner", None),
     "competition": ("Full Competition", "competition_mission.py"),
     "task1": ("Mission 1", "task1_point_tracking.py"),
     "task2": ("Mission 2", "task2_point_tracking_task_in_an_environment_with_obstacle.py"),
@@ -31,7 +32,14 @@ MISSION_SPECS = {
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Start the selected TEKNOFEST mission.")
-    task_group = parser.add_mutually_exclusive_group(required=True)
+    task_group = parser.add_mutually_exclusive_group()
+    task_group.add_argument(
+        "--mission-planner",
+        dest="task",
+        action="store_const",
+        const="mission-planner",
+        help="Wait for SCR_USER2=1, then run Task 1 -> Task 2 -> Task 3.",
+    )
     task_group.add_argument(
         "--competition",
         dest="task",
@@ -51,7 +59,28 @@ def parse_args(argv=None):
                 f"teknofest_task{task_number}.waypoints route where applicable."
             ),
         )
+    parser.set_defaults(task="mission-planner")
     return parser.parse_args(argv)
+
+
+def configure_mavlink_bridge_environment(mission_planner_mode=False):
+    defaults = {
+        "MAVLINK20": "1",
+        "MAVLINK_CONNECTION_STRING": "/dev/ttyACM0",
+        "MAVLINK_BAUD": "921600",
+        "MAVLINK_SOURCE_SYSTEM": "1",
+        "MAVLINK_SOURCE_COMPONENT": "191",
+        "MAVLINK_MISSION_START_TOPIC": "/mission_start",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+    if mission_planner_mode:
+        # These select the competition-specific control contract and must not
+        # inherit Njord values from a parent shell.
+        os.environ["MAVLINK_MISSION_PARAM_NAME"] = "SCR_USER2"
+        # Competition GN points are managed by the TEKNOFEST waypoint file.
+        os.environ["MAVLINK_MISSION_DOWNLOAD_COMMANDS"] = ""
 
 
 def launch_child_process(command):
@@ -186,6 +215,9 @@ if __name__ == "__main__":
 
         print("\n[SYSTEM] Vision and bridge node launch in ROS2...")
         time.sleep(1)
+        configure_mavlink_bridge_environment(
+            mission_planner_mode=args.task == "mission-planner"
+        )
 
         if os.path.isfile("/opt/ros/kilted/setup.bash"):
             ros2_setup = "source /opt/ros/kilted/setup.bash"
@@ -202,7 +234,12 @@ if __name__ == "__main__":
 
         vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
 
-        mission_path = os.path.join(PROJECT_ROOT, "missions", mission_filename)
+        mission_path = (
+            None
+            if mission_filename is None
+            else os.path.join(PROJECT_ROOT, "missions", mission_filename)
+        )
+        mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
@@ -210,9 +247,12 @@ if __name__ == "__main__":
         cmd_bridge = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
+        selected_mission_path = (
+            mission_manager_path if args.task == "mission-planner" else mission_path
+        )
         cmd_teknofest_mission = (
             f"{ros2_setup} && {python_path_setup} && "
-            f"{shlex.quote(sys.executable)} {shlex.quote(mission_path)}"
+            f"{shlex.quote(sys.executable)} {shlex.quote(selected_mission_path)}"
         )
 
         p_bridge = launch_child_process(cmd_bridge)
@@ -230,6 +270,11 @@ if __name__ == "__main__":
         )
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
+        if args.task == "mission-planner":
+            print(
+                "[SYSTEM] Mission Planner: set SCR_USER2=1 to start "
+                "Task 1 -> Task 2 -> Task 3."
+            )
 
         data_writer.run(frame_lock, frame_ready_event, capture_stop_event)
 

@@ -41,7 +41,7 @@ from utils.pixhawk_waypoints import mission_items_to_qgc
 from utils.waypoint_server import DEFAULT_WAYPOINT_DIRECTORY, overwrite_waypoint_file
 from utils.battery import battery_percentage_from_voltage
 
-MISSION_PARAM_NAME = "SCR_USER1"
+MISSION_PARAM_NAME = os.getenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER1").strip() or "SCR_USER1"
 MISSION_IDLE = 0
 MISSION_1 = 1
 MISSION_2 = 2
@@ -57,6 +57,11 @@ VALID_MISSION_COMMANDS = {
     MISSION_4,
     MISSION_STOP,
     MISSION_EMERGENCY,
+}
+MISSION_DOWNLOAD_COMMANDS = {
+    int(value)
+    for value in os.getenv("MAVLINK_MISSION_DOWNLOAD_COMMANDS", "1,2,4").split(",")
+    if value.strip()
 }
 DETECTION_SEND_INTERVAL_SEC = 0.2
 DETECTION_MAX_PER_FRAME = 4
@@ -1175,7 +1180,7 @@ class OrangeCubeBridgeNode(Node):
         mission_number = command
         mission_name = f"M{mission_number}"
 
-        if mission_number in (MISSION_1, MISSION_2, MISSION_4):
+        if mission_number in MISSION_DOWNLOAD_COMMANDS:
             self._start_mission_download(mission_number)
             self._send_status_text(
                 f"{MISSION_PARAM_NAME} received: {mission_name}, downloading mission",
