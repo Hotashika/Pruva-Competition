@@ -127,10 +127,10 @@ def test_interface_command_mapping_matches_requested_order(monkeypatch):
     manager = _load_mission_manager(monkeypatch)
 
     assert manager.MISSION_NAMES == {
-        1: "Competition",
-        2: "task1",
-        3: "task2",
-        4: "task3",
+        1: "task1->task2->task3",
+        2: "task1 (standalone)",
+        3: "task2 (standalone)",
+        4: "task3 (standalone)",
     }
     assert {
         command: Path(path).name
@@ -202,17 +202,25 @@ def test_teknofest_config_owns_cli_and_interface_mission_specs():
     from teknofest.config.mission_config import MISSION_COMMANDS, MISSION_SPECS
 
     assert MISSION_COMMANDS == {
-        1: ("competition", "Competition", "competition_mission.py"),
-        2: ("task1", "task1", "task1_point_tracking.py"),
+        1: (
+            "competition",
+            "task1->task2->task3",
+            "competition_mission.py",
+        ),
+        2: ("task1", "task1 (standalone)", "task1_point_tracking.py"),
         3: (
             "task2",
-            "task2",
+            "task2 (standalone)",
             "task2_point_tracking_task_in_an_environment_with_obstacle.py",
         ),
-        4: ("task3", "task3", "task3_kamikaze_engagement.py"),
+        4: (
+            "task3",
+            "task3 (standalone)",
+            "task3_kamikaze_engagement.py",
+        ),
     }
     assert MISSION_SPECS["competition"] == (
-        "Competition",
+        "task1->task2->task3",
         "competition_mission.py",
     )
 

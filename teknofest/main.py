@@ -12,8 +12,9 @@ from multiprocessing import get_context
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
-if COMPETITION_ROOT not in sys.path:
-    sys.path.insert(0, COMPETITION_ROOT)
+while COMPETITION_ROOT in sys.path:
+    sys.path.remove(COMPETITION_ROOT)
+sys.path.insert(0, COMPETITION_ROOT)
 
 from teknofest.core import capture_proc
 from teknofest.core import data_writer
@@ -51,7 +52,8 @@ def parse_args(argv=None):
         )
     parser.epilog = (
         "Bir gorev secenegi verilmezse arayuz modu acilir: "
-        "1=Competition, 2=task1, 3=task2, 4=task3."
+        "1=task1->task2->task3, "
+        "2=yalniz task1, 3=yalniz task2, 4=yalniz task3."
     )
     return parser.parse_args(argv)
 
@@ -134,7 +136,8 @@ def configure_mavlink_bridge_environment():
 
     print(
         "[SYSTEM] TEKNOFEST mission interface: "
-        "1=Competition, 2=task1, 3=task2, 4=task3; "
+        "1=task1->task2->task3, "
+        "2=yalniz task1, 3=yalniz task2, 4=yalniz task3; "
         f"topic={os.environ['MAVLINK_MISSION_START_TOPIC']}, "
         f"waypoint_directory={os.environ['MAVLINK_MISSION_WAYPOINT_DIRECTORY']}, "
         f"waypoints={os.environ['MAVLINK_MISSION_WAYPOINT_FILES']}"
@@ -235,8 +238,8 @@ if __name__ == "__main__":
             ros2_setup = "source /opt/ros/foxy/setup.bash"
 
         python_path_setup = (
-            f"export PYTHONPATH={shlex.quote(PROJECT_ROOT)}:"
-            f"{shlex.quote(COMPETITION_ROOT)}:${{PYTHONPATH:-}}"
+            f"export PYTHONPATH={shlex.quote(COMPETITION_ROOT)}:"
+            "${PYTHONPATH:-}"
         )
 
         vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
@@ -276,7 +279,10 @@ if __name__ == "__main__":
         if interface_mode:
             p_mission_manager = launch_child_process(cmd_mission_manager)
             print(f" -> TEKNOFEST Mission Manager launched (PID: {p_mission_manager.pid})")
-            print(" -> Arayuz secimi bekleniyor: Competition / task1 / task2 / task3\n")
+            print(
+                " -> Mission Planner secimi bekleniyor: "
+                "1=task1->task2->task3; 2/3/4=tek gorev\n"
+            )
         else:
             p_teknofest_mission = launch_child_process(cmd_teknofest_mission)
             print(
