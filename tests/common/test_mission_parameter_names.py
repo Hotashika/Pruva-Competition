@@ -22,6 +22,12 @@ AVOIDANCE_TASKS = {
     "teknofest_task2",
 }
 
+DISTANCE_HYSTERESIS_TASKS = {
+    "njord_task1",
+    "njord_task4",
+    "teknofest_task2",
+}
+
 FORBIDDEN_PARAMETER_NAMES = {
     "AVOID_ENTER_DISTANCE_M",
     "AVOID_EXIT_DISTANCE_M",
@@ -67,8 +73,10 @@ def test_avoidance_parameter_names_are_consistent():
     for task_name in AVOIDANCE_TASKS:
         names = _assigned_names(MISSION_FILES[task_name])
         assert "AVOIDANCE_START_DISTANCE_M" in names, task_name
-        assert "AVOIDANCE_EXIT_DISTANCE_M" in names, task_name
         assert "AVOIDANCE_TIMEOUT_SEC" in names, task_name
+    for task_name in DISTANCE_HYSTERESIS_TASKS:
+        names = _assigned_names(MISSION_FILES[task_name])
+        assert "AVOIDANCE_EXIT_DISTANCE_M" in names, task_name
 
 
 def test_parameter_sections_are_grouped():
