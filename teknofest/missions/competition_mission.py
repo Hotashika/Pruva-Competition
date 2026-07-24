@@ -6,8 +6,11 @@ from enum import Enum, auto
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_TEXT = str(REPO_ROOT)
+# Dosya-yolu ile başlatmada missions/utils, ortak utils paketini gölgelemesin.
+while REPO_ROOT_TEXT in sys.path:
+    sys.path.remove(REPO_ROOT_TEXT)
+sys.path.insert(0, REPO_ROOT_TEXT)
 
 import rclpy
 from std_msgs.msg import String
@@ -102,6 +105,7 @@ class CompetitionNode(Task1Node):
         self.task3.update_bridge_state(msg.data)
 
     def _transition_to(self, state, task_name):
+        completed_task_name = self.active_task_name
         stop_vehicle(self.mission_topics.cmd_vel_pub)
 
         if task_name == "task2":
@@ -119,6 +123,9 @@ class CompetitionNode(Task1Node):
         self.competition_state = state
         self.active_task_name = task_name
         self._publish_active_task()
+        self.get_logger().info(
+            f"{completed_task_name} tamamlandı; {task_name} otomatik başlatıldı."
+        )
 
     def _enter_competition_failsafe(self, reason):
         self.get_logger().error(reason)
@@ -193,7 +200,9 @@ def main(args=None):
             return
 
         node.mission_active = True
-        node.get_logger().info("Kesintisiz competition görev döngüsü başladı.")
+        node.get_logger().info(
+            "Mission Planner Görev 1 zinciri başladı: task1 -> task2 -> task3."
+        )
         while (
                 rclpy.ok()
                 and node.competition_state != CompetitionState.FAILSAFE
