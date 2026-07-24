@@ -9,8 +9,9 @@ import sys
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
-if COMPETITION_ROOT not in sys.path:
-    sys.path.insert(0, COMPETITION_ROOT)
+while COMPETITION_ROOT in sys.path:
+    sys.path.remove(COMPETITION_ROOT)
+sys.path.insert(0, COMPETITION_ROOT)
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
