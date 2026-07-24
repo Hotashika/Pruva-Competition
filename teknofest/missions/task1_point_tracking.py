@@ -399,6 +399,8 @@ class Task1Node(Node):
         self.task = Task1Maneuvering(self, self.mission_topics, self.mission_clients)
 
         # Anlık Yönelim Değişkeni (GPS Callback'e aktarmak için)
+        self.current_lat = None
+        self.current_lon = None
         self.current_heading = None
         self.bridge_connected = False
         self.bridge_armed = False
@@ -441,10 +443,13 @@ class Task1Node(Node):
                 "Gecersiz GPS (0,0) yok sayiliyor.",
                 throttle_duration_sec=2.0
             )
-            return
+            return False
 
+        self.current_lat = float(msg.latitude)
+        self.current_lon = float(msg.longitude)
         self.valid_gps_received = True
-        self.task.update_gps(msg.latitude, msg.longitude)
+        self.task.update_gps(self.current_lat, self.current_lon)
+        return True
 
     def heading_callback(self, msg):
         """Araçtan gelen Float32 yön verisini dinler."""

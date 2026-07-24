@@ -99,6 +99,7 @@ def test_njord_config_owns_interface_mission_specs():
 
 def test_njord_profile_replaces_stale_teknofest_waypoint_mapping(monkeypatch):
     main = _load_njord_main(monkeypatch)
+    monkeypatch.setenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER2")
     monkeypatch.setenv(
         "MAVLINK_MISSION_WAYPOINT_FILES",
         "1:teknofest.waypoints,2:teknofest_task1.waypoints",
@@ -110,6 +111,7 @@ def test_njord_profile_replaces_stale_teknofest_waypoint_mapping(monkeypatch):
 
     main.configure_mavlink_bridge_environment()
 
+    assert main.os.environ["MAVLINK_MISSION_PARAM_NAME"] == "SCR_USER1"
     assert main.os.environ["MAVLINK_MISSION_WAYPOINT_FILES"] == (
         "1:njord_task1.waypoints,"
         "2:njord_task2.waypoints,"

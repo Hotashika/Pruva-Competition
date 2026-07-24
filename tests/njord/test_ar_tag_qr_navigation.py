@@ -38,7 +38,7 @@ if str(REPO_ROOT) not in sys.path:
 
 BRIDGE_SCRIPT = REPO_ROOT / "bridge" / "bridge_node.py"
 MAVLINK_CONNECTION_MODULE = REPO_ROOT / "bridge" / "mavlink_connection.py"
-VISION_SCRIPT = REPO_ROOT / "njord" / "vision" / "vision_node.py"
+VISION_SCRIPT = REPO_ROOT / "vision" / "vision_node.py"
 
 LEFT = "left"
 RIGHT = "right"
@@ -580,7 +580,15 @@ def _run_hardware_test(config: HardwareConfig) -> None:
         node.get_logger().info(
             f"Starting VisionNode with AR model {ar_tag_model}..."
         )
-        vision_process = _start_child(VISION_SCRIPT, "--fx", fx, "--cx", cx)
+        vision_process = _start_child(
+            VISION_SCRIPT,
+            "--competition",
+            "njord",
+            "--fx",
+            fx,
+            "--cx",
+            cx,
+        )
 
         # Confirm camera -> shared memory -> model -> QR topic is functional
         # before allowing the vehicle to arm.

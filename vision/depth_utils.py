@@ -3,13 +3,11 @@ import numpy as np
 
 def get_distance_from_bbox(depth_array, bbox, method="median"):
     """
-    Input:
-        depth_array (np.ndarray): ZED'den gelen 2 boyutlu derinlik matrisi (H, W).
-        bbox (list or tuple): [x1, y1, x2, y2] formatında bounding box koordinatları.
-        method (str): "median" (varsayılan) veya "mean" (ortalama) hesaplama yöntemi.
+    Return the representative depth inside an ``xyxy`` bounding box.
 
-    Output:
-        float: Hesaplanmış mesafe (metre cinsinden). Geçersiz/hatalı durumlarda -1.0 döner.
+    NaN, infinite, zero, and negative depth samples are excluded from the
+    calculation. Invalid inputs and regions without a valid sample return
+    ``-1.0``.
     """
     if depth_array is None or bbox is None:
         return -1.0
@@ -24,13 +22,16 @@ def get_distance_from_bbox(depth_array, bbox, method="median"):
         return -1.0
 
     roi_depth = depth_array[y1_c:y2_c, x1_c:x2_c]
+    valid_depth = roi_depth[
+        np.isfinite(roi_depth) & (roi_depth > 0.0)
+    ]
+    if valid_depth.size == 0:
+        return -1.0
 
-    if method == "median":
-        distance = float(np.nanmedian(roi_depth))
-    elif method == "mean":
-        distance = float(np.nanmean(roi_depth))
+    if method == "mean":
+        distance = float(np.mean(valid_depth))
     else:
-        distance = float(np.nanmedian(roi_depth))  # Fallback
+        distance = float(np.median(valid_depth))
 
     if not np.isfinite(distance):
         return -1.0

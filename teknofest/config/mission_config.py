@@ -10,7 +10,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WAYPOINT_DIRECTORY = REPOSITORY_ROOT / "waypoints" / "teknofest"
 
 
-# Mission Planner'da SCR_USER1=1 seçildiğinde ayrı Task 1 süreci yerine
+# Mission Planner'da SCR_USER2=1 seçildiğinde ayrı Task 1 süreci yerine
 # Task 1 -> Task 2 -> Task 3 zincirini tek ARM/GUIDED oturumunda çalıştır.
 # Diğer komutlar görevleri bakım/test amacıyla tek başına başlatır.
 #
@@ -49,6 +49,7 @@ MAVLINK_BRIDGE_DEFAULTS = {
 
 # Profil sahibi bu değerleri eski shell environment değerlerinin üzerine yazar.
 MAVLINK_BRIDGE_OVERRIDES = {
+    "MAVLINK_MISSION_PARAM_NAME": "SCR_USER2",
     "MAVLINK_MISSION_WAYPOINT_DIRECTORY": str(WAYPOINT_DIRECTORY),
     "MAVLINK_MISSION_WAYPOINT_FILES": format_mission_waypoint_files(
         MISSION_WAYPOINT_FILES

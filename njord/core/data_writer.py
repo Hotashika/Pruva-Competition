@@ -15,7 +15,7 @@ from std_msgs.msg import String
 from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
 from njord.core import shared_state
 from njord.core.shared_memory_utils import attach_existing_shared_memory
-from njord.vision.detector import BaseYOLODetector
+from vision.detector import BaseYOLODetector
 
 OUTPUT_DIR = "logs"
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")

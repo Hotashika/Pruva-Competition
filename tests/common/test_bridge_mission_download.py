@@ -84,6 +84,14 @@ def _load_bridge(monkeypatch):
     return importlib.import_module("bridge.bridge_node")
 
 
+def test_bridge_reads_profile_mission_parameter_name(monkeypatch):
+    monkeypatch.setenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER2")
+
+    bridge_module = _load_bridge(monkeypatch)
+
+    assert bridge_module.MISSION_PARAM_NAME == "SCR_USER2"
+
+
 class _Logger:
     def __init__(self):
         self.errors = []
