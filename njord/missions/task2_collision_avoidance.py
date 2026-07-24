@@ -20,6 +20,7 @@ from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from njord.config.mission_config import WAYPOINT_DIRECTORY
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
     calculate_gps_distance,
@@ -35,16 +36,13 @@ from utils.mavlink_utilities import (
 )
 from utils.read_waypoints import parse_qgc_waypoints
 
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "njord_task2.waypoints"
+WAYPOINT_PATH = WAYPOINT_DIRECTORY / "njord_task2.waypoints"
 ACTIVE_TASK_NAME = "task2"
 HOLD_MODE_NAME = "HOLD"
 
-# Existing movement commands are intentionally preserved. In this project,
-# negative angular_z means starboard/right.
+# Bridge movement contract: positive angular_z turns starboard/right.
 AVOID_LINEAR_X = 0.5
-AVOID_TURN_Z = -0.6
+AVOID_TURN_Z = 0.6
 
 WAYPOINT_TOLERANCE_M = 1.0
 WAYPOINT_SETTLE_SEC = 0.75

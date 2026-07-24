@@ -92,6 +92,7 @@ def configure_mavlink_bridge_environment():
         f"baud={os.environ.get('MAVLINK_BAUD')}, "
         f"source={os.environ.get('MAVLINK_SOURCE_SYSTEM')}:"
         f"{os.environ.get('MAVLINK_SOURCE_COMPONENT')}, "
+        f"mission_param={os.environ.get('MAVLINK_MISSION_PARAM_NAME')}, "
         f"mission_start_topic={os.environ.get('MAVLINK_MISSION_START_TOPIC')}, "
         f"waypoint_directory={os.environ.get('MAVLINK_MISSION_WAYPOINT_DIRECTORY')}, "
         f"mission_selection_file={os.environ.get('MISSION_SELECTION_FILE')}"
@@ -233,7 +234,10 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        print(" -> Bridge publishes SCR_USER1 commands to /mission_start.")
+        print(
+            " -> Bridge publishes "
+            f"{os.environ['MAVLINK_MISSION_PARAM_NAME']} commands to /mission_start."
+        )
         print(" -> Mission Manager starts the selected task process after waypoint sync.")
         print(" -> Mission selection and process state are written to JSON.\n")
 

@@ -139,6 +139,7 @@ def configure_mavlink_bridge_environment():
         "[SYSTEM] TEKNOFEST mission interface: "
         "1=task1->task2->task3, "
         "2=yalniz task1, 3=yalniz task2, 4=yalniz task3; "
+        f"mission_param={os.environ['MAVLINK_MISSION_PARAM_NAME']}, "
         f"topic={os.environ['MAVLINK_MISSION_START_TOPIC']}, "
         f"waypoint_directory={os.environ['MAVLINK_MISSION_WAYPOINT_DIRECTORY']}, "
         f"waypoints={os.environ['MAVLINK_MISSION_WAYPOINT_FILES']}"

@@ -34,7 +34,9 @@ from utils.pixhawk_waypoints import mission_items_to_qgc
 from utils.waypoint_server import overwrite_waypoint_file
 from utils.battery import battery_percentage_from_voltage
 
-MISSION_PARAM_NAME = "SCR_USER1"
+MISSION_PARAM_NAME = (
+    os.getenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER1").strip() or "SCR_USER1"
+)
 MISSION_IDLE = 0
 MISSION_1 = 1
 MISSION_2 = 2
