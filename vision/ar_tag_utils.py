@@ -1,4 +1,4 @@
-"""Dependency-light helpers for Task 3 QR localization and tracking."""
+"""Dependency-light helpers for AR-tag QR localization and tracking."""
 
 import cv2
 import numpy as np

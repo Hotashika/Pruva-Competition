@@ -202,11 +202,14 @@ if __name__ == "__main__":
             f"{shlex.quote(COMPETITION_ROOT)}:${{PYTHONPATH:-}}"
         )
 
-        vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
+        vision_path = os.path.join(COMPETITION_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
         mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
 
-        vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        vision_args_setup = (
+            f"--competition njord "
+            f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        )
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
