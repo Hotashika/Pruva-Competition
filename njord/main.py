@@ -24,6 +24,7 @@ from njord.core import data_writer
 from njord.servers import data_server
 from njord.servers import video_server
 
+os.environ.setdefault("YOLO_OFFLINE", "true")
 
 def launch_child_process(command):
     return subprocess.Popen(
@@ -91,6 +92,7 @@ def configure_mavlink_bridge_environment():
         f"baud={os.environ.get('MAVLINK_BAUD')}, "
         f"source={os.environ.get('MAVLINK_SOURCE_SYSTEM')}:"
         f"{os.environ.get('MAVLINK_SOURCE_COMPONENT')}, "
+        f"mission_param={os.environ.get('MAVLINK_MISSION_PARAM_NAME')}, "
         f"mission_start_topic={os.environ.get('MAVLINK_MISSION_START_TOPIC')}, "
         f"waypoint_directory={os.environ.get('MAVLINK_MISSION_WAYPOINT_DIRECTORY')}, "
         f"mission_selection_file={os.environ.get('MISSION_SELECTION_FILE')}"
@@ -201,11 +203,14 @@ if __name__ == "__main__":
             f"{shlex.quote(COMPETITION_ROOT)}:${{PYTHONPATH:-}}"
         )
 
-        vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
+        vision_path = os.path.join(COMPETITION_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
         mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
 
-        vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        vision_args_setup = (
+            f"--competition njord "
+            f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        )
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
@@ -229,7 +234,10 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        print(" -> Bridge publishes SCR_USER1 commands to /mission_start.")
+        print(
+            " -> Bridge publishes "
+            f"{os.environ['MAVLINK_MISSION_PARAM_NAME']} commands to /mission_start."
+        )
         print(" -> Mission Manager starts the selected task process after waypoint sync.")
         print(" -> Mission selection and process state are written to JSON.\n")
 

@@ -96,21 +96,19 @@ class CompetitionNode(Task1Node):
         self.active_task_pub.publish(msg)
 
     def gps_callback(self, msg):
-        super().gps_callback(msg)
-        if not hasattr(self, "task2") or not self.valid_gps_received:
+        if not super().gps_callback(msg):
             return
-        self.current_lat = float(msg.latitude)
-        self.current_lon = float(msg.longitude)
-        self.task2.update_gps(msg.latitude, msg.longitude)
-        self.task3.update_gps(msg.latitude, msg.longitude, self.current_heading or 0.0)
+        if not hasattr(self, "task2"):
+            return
+        self.task2.update_gps(self.current_lat, self.current_lon)
+        self.task3.update_gps(self.current_lat, self.current_lon)
 
     def heading_callback(self, msg):
         super().heading_callback(msg)
         if not hasattr(self, "task2") or not self.valid_heading_received:
             return
         self.task2.update_heading(self.current_heading)
-        self.task3.current_heading = self.current_heading
-        self.task3.last_heading_time = self.task1.last_heading_time
+        self.task3.update_heading(self.current_heading)
 
     def state_callback(self, msg):
         super().state_callback(msg)
@@ -245,6 +243,21 @@ class CompetitionNode(Task1Node):
                 self.current_lat,
                 self.current_lon,
             )
+        elif task_name == "task3":
+            if (
+                    self.current_lat is None
+                    or self.current_lon is None
+                    or self.current_heading is None
+            ):
+                self._enter_competition_failsafe(
+                    "Task 3 geçişinde geçerli GPS/heading yok."
+                )
+                return
+            self.task3.reset_for_entry(
+                self.current_lat,
+                self.current_lon,
+                self.current_heading,
+            )
 
         self.competition_state = state
         self.active_task_name = task_name
@@ -280,7 +293,20 @@ class CompetitionNode(Task1Node):
             if self.last_detection_message_time is None
             else time.monotonic() - self.last_detection_message_time
         )
-        if vision_age is None or vision_age > DETECTION_STALE_SEC:
+        vision_stale_limit = DETECTION_STALE_SEC
+        if self.competition_state == CompetitionState.PARKUR_3:
+            task3_config = getattr(self.task3, "config", None)
+            vision_stale_limit = min(
+                DETECTION_STALE_SEC,
+                float(
+                    getattr(
+                        task3_config,
+                        "vision_stale_sec",
+                        DETECTION_STALE_SEC,
+                    )
+                ),
+            )
+        if vision_age is None or vision_age > vision_stale_limit:
             self._enter_competition_failsafe("Vision heartbeat kaybı. FAILSAFE + HOLD.")
             return
 
@@ -303,7 +329,7 @@ class CompetitionNode(Task1Node):
                 self.task3.update(detections)
                 if self.task3.state == Task3State.FAILSAFE:
                     self._enter_competition_failsafe("Task 3 FAILSAFE.")
-                elif getattr(self.task3, "finished", False):
+                elif self.task3.finished:
                     self._finish_competition()
         except Exception as exc:  # noqa: BLE001
             self._enter_competition_failsafe(f"Competition timer hatası: {exc}")
@@ -349,12 +375,17 @@ def main(args=None):
         )
         while (
                 rclpy.ok()
-                and node.competition_state not in (
-                    CompetitionState.FAILSAFE,
+                and node.competition_state
+                not in (
                     CompetitionState.FINISHED,
+                    CompetitionState.FAILSAFE,
                 )
         ):
             rclpy.spin_once(node, timeout_sec=0.1)
+        if node.competition_state == CompetitionState.FINISHED:
+            node.get_logger().info(
+                "Competition tamamlandı: task1 -> task2 -> task3."
+            )
     except KeyboardInterrupt:
         node.get_logger().info("Competition görevi kullanıcı tarafından durduruldu.")
     finally:

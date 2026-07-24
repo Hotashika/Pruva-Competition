@@ -129,6 +129,7 @@ def _timer_node(competition, state):
     )
     node.task3 = types.SimpleNamespace(
         state="running",
+        finished=False,
         update=lambda detections: updates.append(("task3", detections)),
     )
     return node, updates, transitions
@@ -160,6 +161,83 @@ def test_finished_task2_starts_task3_automatically(monkeypatch):
 
     assert updates == [("task2", ["detection"])]
     assert transitions == [(competition.CompetitionState.PARKUR_3, "task3")]
+
+
+def test_task3_transition_resets_entry_pose(monkeypatch):
+    competition = _load_competition_module(monkeypatch)
+    node = competition.CompetitionNode.__new__(competition.CompetitionNode)
+    node.active_task_name = "task2"
+    node.current_lat = 37.95141
+    node.current_lon = 32.50097
+    node.current_heading = 127.5
+    node.mission_topics = types.SimpleNamespace(cmd_vel_pub="cmd_vel")
+    node.task3 = types.SimpleNamespace(
+        reset_for_entry=lambda lat, lon, heading:
+        setattr(node, "task3_entry", (lat, lon, heading))
+    )
+    node._publish_active_task = lambda: None
+    node._enter_competition_failsafe = lambda reason: (_ for _ in ()).throw(
+        AssertionError(reason)
+    )
+    node.get_logger = lambda: types.SimpleNamespace(
+        info=lambda *args, **kwargs: None
+    )
+
+    node._transition_to(competition.CompetitionState.PARKUR_3, "task3")
+
+    assert node.task3_entry == (37.95141, 32.50097, 127.5)
+    assert node.competition_state is competition.CompetitionState.PARKUR_3
+    assert node.active_task_name == "task3"
+
+
+def test_finished_task3_finishes_competition(monkeypatch):
+    competition = _load_competition_module(monkeypatch)
+    stopped = []
+    monkeypatch.setattr(competition, "stop_vehicle", stopped.append)
+    node, updates, _ = _timer_node(
+        competition,
+        competition.CompetitionState.PARKUR_3,
+    )
+    node.mission_topics = types.SimpleNamespace(cmd_vel_pub="cmd_vel")
+    node.active_task_name = "task3"
+    node.task3.finished = True
+    active_task_updates = []
+    node._publish_active_task = lambda: active_task_updates.append(
+        node.active_task_name
+    )
+    telemetry_stops = []
+    node.stop_telemetry_recording = lambda: telemetry_stops.append(True)
+    logs = []
+    node.get_logger = lambda: types.SimpleNamespace(info=logs.append)
+
+    node.timer_callback()
+
+    assert updates == [("task3", ["detection"])]
+    assert stopped == ["cmd_vel"]
+    assert node.competition_state is competition.CompetitionState.FINISHED
+    assert node.active_task_name == "finished"
+    assert active_task_updates == ["finished"]
+    assert telemetry_stops == [True]
+    assert logs == [
+        "Task 3 tamamlandı; yarışma zinciri ve telemetri kaydı sonlandırıldı."
+    ]
+
+
+def test_task3_uses_tighter_vision_stale_limit(monkeypatch):
+    competition = _load_competition_module(monkeypatch)
+    node, updates, _ = _timer_node(
+        competition,
+        competition.CompetitionState.PARKUR_3,
+    )
+    node.last_detection_message_time = competition.time.monotonic() - 1.5
+    node.task3.config = types.SimpleNamespace(vision_stale_sec=1.0)
+    failures = []
+    node._enter_competition_failsafe = failures.append
+
+    node.timer_callback()
+
+    assert updates == []
+    assert failures == ["Vision heartbeat kaybı. FAILSAFE + HOLD."]
 
 
 def test_competition_file_launch_promotes_repository_utils(monkeypatch):

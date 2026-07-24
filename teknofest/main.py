@@ -27,6 +27,7 @@ from teknofest.config.mission_config import (
 from teknofest.servers import data_server
 from utils import waypoint_server
 
+os.environ.setdefault("YOLO_OFFLINE", "true")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Start the selected TEKNOFEST mission.")
@@ -138,6 +139,7 @@ def configure_mavlink_bridge_environment():
         "[SYSTEM] TEKNOFEST mission interface: "
         "1=task1->task2->task3, "
         "2=yalniz task1, 3=yalniz task2, 4=yalniz task3; "
+        f"mission_param={os.environ['MAVLINK_MISSION_PARAM_NAME']}, "
         f"topic={os.environ['MAVLINK_MISSION_START_TOPIC']}, "
         f"waypoint_directory={os.environ['MAVLINK_MISSION_WAYPOINT_DIRECTORY']}, "
         f"waypoints={os.environ['MAVLINK_MISSION_WAYPOINT_FILES']}"
@@ -242,11 +244,14 @@ if __name__ == "__main__":
             "${PYTHONPATH:-}"
         )
 
-        vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
+        vision_path = os.path.join(COMPETITION_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
         mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
 
-        vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        vision_args_setup = (
+            f"--competition teknofest "
+            f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        )
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"

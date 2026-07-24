@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from njord.vision.ar_tag_utils import (
+from vision.ar_tag_utils import (
     bbox_to_qr_detection,
     expanded_bbox,
     normalize_qr_payload,

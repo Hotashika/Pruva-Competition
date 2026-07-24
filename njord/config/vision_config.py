@@ -2,12 +2,12 @@ from pathlib import Path
 
 import torch
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 # Active Njord object detectors. Vessel detection is intentionally not used;
 # every mission consumes detections from the buoy and AR-tag models.
-BUOY_MODEL_PATH = str(BASE_DIR / "models" / "buoy" / "buoy.pt")
-AR_TAG_MODEL_PATH = str(BASE_DIR / "models" / "ar_tag" / "ar_tag.pt")
+BUOY_MODEL_PATH = str(REPOSITORY_ROOT / "models" / "njord_buoy" / "njord_buoy.engine")
+AR_TAG_MODEL_PATH = str(REPOSITORY_ROOT / "models" / "ar_tag" / "ar_tag.engine")
 
 TOLERANCE_RATIO = 0.05  # Tolerance ratio for bounding box size filtering
 TOLERANCE_DEG = 5  # Tolerance deg for tolerance ratio
