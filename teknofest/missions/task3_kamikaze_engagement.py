@@ -35,6 +35,7 @@ DRIVE_MODE = "GUIDED"
 
 class MissionState(Enum):
     INIT = auto()  # Başlangıç konumu bekleniyor
+    FINISHED = auto()  # Hedefe ulaşıldı
     FAILSAFE = auto()  # GPS kaybı / geofence ihlali / beklenmeyen hata
 
 
@@ -58,6 +59,7 @@ class Task3KamikazeEngagement:
         self.last_heading_time = None
         self.home_lat = None
         self.home_lon = None
+        self.finished = False
 
         # Bridge state telemetry
         self.bridge_connected = None
@@ -150,6 +152,9 @@ class Task3KamikazeEngagement:
 
         if distance <= 1.0:
             publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=0.0)
+            self.finished = True
+            self.state = MissionState.FINISHED
+            self.logger.info("Kamikaze hedefi tamamlandı; araç durduruldu.")
             return
 
         kp = 0.03
@@ -184,6 +189,10 @@ class Task3KamikazeEngagement:
         if self.state == MissionState.FAILSAFE:
             stop_vehicle(self.topics.cmd_vel_pub)
             self.logger.warn("FAILSAFE aktif, araç durduruldu.", throttle_duration_sec=2.0)
+            return
+
+        if self.state == MissionState.FINISHED:
+            stop_vehicle(self.topics.cmd_vel_pub)
             return
 
         if not gps_ok:
@@ -292,11 +301,16 @@ def main(args=None):
 
         node.get_logger().info("Task3 Kamikaze Engagement döngüsü başladı.")
 
-        while rclpy.ok() and node.task.state != MissionState.FAILSAFE:
+        while rclpy.ok() and node.task.state not in (
+            MissionState.FAILSAFE,
+            MissionState.FINISHED,
+        ):
             rclpy.spin_once(node, timeout_sec=0.1)
 
         if node.task.state == MissionState.FAILSAFE:
             node.get_logger().error("Görev FAILSAFE sebebiyle sonlandırıldı.")
+        elif node.task.state == MissionState.FINISHED:
+            node.get_logger().info("Task 3 başarıyla tamamlandı.")
 
         stop_vehicle(node.mission_topics.cmd_vel_pub)
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import math
 import os
 import sys
@@ -65,6 +66,20 @@ def euler_to_quaternion(roll, pitch, yaw):
     qz = cr * cp * sy - sr * sp * cy
 
     return qx, qy, qz, qw
+
+
+def gps_bearing_deg(lat1, lon1, lat2, lon2):
+    """Return the initial bearing from one WGS84 coordinate to another."""
+
+    lat1_rad = math.radians(float(lat1))
+    lat2_rad = math.radians(float(lat2))
+    delta_lon_rad = math.radians(float(lon2) - float(lon1))
+    east = math.sin(delta_lon_rad) * math.cos(lat2_rad)
+    north = (
+        math.cos(lat1_rad) * math.sin(lat2_rad)
+        - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(delta_lon_rad)
+    )
+    return math.degrees(math.atan2(east, north)) % 360.0
 
 
 def set_position(connection, destination, boot_time):
@@ -205,6 +220,7 @@ class OrangeCubeBridgeNode(Node):
         self.gps_lon = None
         self.gps_alt = None
         self.relative_alt = None
+        self.ground_speed_m_s = None
         self.heading_deg = None
         self.roll = None
         self.pitch = None
@@ -221,6 +237,8 @@ class OrangeCubeBridgeNode(Node):
         self.cmd_timeout_sec = 0.5
         self.last_target_q = self._yaw_to_mavlink_quaternion(0.0)
         self.last_thrust = 0.0
+        self.speed_setpoint_m_s = 0.0
+        self.heading_setpoint_deg = None
         self.last_attitude_tx_active = False
         self.last_position_target_time = 0.0
         self.position_target_timeout_sec = 0.5
@@ -228,6 +246,11 @@ class OrangeCubeBridgeNode(Node):
             self,
             self._cmd_vel_callback,
             self._set_position_callback,
+        )
+        self.telemetry_pub = self.create_publisher(
+            String,
+            "/cube/telemetry",
+            10,
         )
         self.bridge_services = create_bridge_services(
             self,
@@ -406,10 +429,12 @@ class OrangeCubeBridgeNode(Node):
 
     def _neutralize_outputs(self):
         self.last_thrust = 0.0
+        self.speed_setpoint_m_s = 0.0
         self.last_attitude_tx_active = False
         self.last_position_target_time = 0.0
         if self.yaw is not None:
             self.last_target_q = self._yaw_to_mavlink_quaternion(self.yaw)
+            self.heading_setpoint_deg = math.degrees(self.yaw) % 360.0
         self.last_cmd_vel_time = 0.0
 
     @staticmethod
@@ -424,6 +449,7 @@ class OrangeCubeBridgeNode(Node):
         self.gps_lon = None
         self.gps_alt = None
         self.relative_alt = None
+        self.ground_speed_m_s = None
         self.heading_deg = None
         self.roll = None
         self.pitch = None
@@ -434,6 +460,8 @@ class OrangeCubeBridgeNode(Node):
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
+        self.speed_setpoint_m_s = 0.0
+        self.heading_setpoint_deg = None
 
     def _close_master(self):
         if self.master is None:
@@ -801,11 +829,18 @@ class OrangeCubeBridgeNode(Node):
                     self.gps_lon = msg.lon / 1e7
                     self.gps_alt = msg.alt / 1000.0
                     self.relative_alt = msg.relative_alt / 1000.0
+                    if hasattr(msg, "vx") and hasattr(msg, "vy"):
+                        self.ground_speed_m_s = (
+                            math.hypot(float(msg.vx), float(msg.vy)) / 100.0
+                        )
                     if hasattr(msg, "hdg") and msg.hdg != 65535:
                         self.heading_deg = msg.hdg / 100.0
 
-                elif msg_type == "VFR_HUD" and hasattr(msg, "heading"):
-                    self.heading_deg = float(msg.heading)
+                elif msg_type == "VFR_HUD":
+                    if hasattr(msg, "heading"):
+                        self.heading_deg = float(msg.heading)
+                    if hasattr(msg, "groundspeed"):
+                        self.ground_speed_m_s = float(msg.groundspeed)
 
                 elif msg_type == "ATTITUDE":
                     self.roll = float(msg.roll)
@@ -1315,6 +1350,39 @@ class OrangeCubeBridgeNode(Node):
             battery_msg.percentage = battery_percentage_from_voltage(self.voltage_v)
             self.topics.battery_pub.publish(battery_msg)
 
+        telemetry_values = (
+            self.gps_lat,
+            self.gps_lon,
+            self.ground_speed_m_s,
+            self.roll,
+            self.pitch,
+            self.heading_deg,
+        )
+        if link_ready and all(
+            value is not None and math.isfinite(float(value))
+            for value in telemetry_values
+        ):
+            telemetry_msg = String()
+            telemetry_msg.data = json.dumps(
+                {
+                    "latitude_deg": float(self.gps_lat),
+                    "longitude_deg": float(self.gps_lon),
+                    "ground_speed_m_s": float(self.ground_speed_m_s),
+                    "roll_deg": math.degrees(float(self.roll)),
+                    "pitch_deg": math.degrees(float(self.pitch)),
+                    "heading_deg": float(self.heading_deg) % 360.0,
+                    "speed_setpoint_m_s": float(self.speed_setpoint_m_s),
+                    "heading_setpoint_deg": (
+                        float(self.heading_setpoint_deg) % 360.0
+                        if self.heading_setpoint_deg is not None
+                        else float(self.heading_deg) % 360.0
+                    ),
+                },
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            self.telemetry_pub.publish(telemetry_msg)
+
         state_msg = String()
         state_msg.data = (
             f"connected={self.connected}, armed={self.armed}, mode={self.mode}"
@@ -1567,6 +1635,13 @@ class OrangeCubeBridgeNode(Node):
         try:
             set_position(self.master, (lat, lon), self.boot_time)
             self.last_position_target_time = time.time()
+            if self.gps_lat is not None and self.gps_lon is not None:
+                self.heading_setpoint_deg = gps_bearing_deg(
+                    self.gps_lat,
+                    self.gps_lon,
+                    lat,
+                    lon,
+                )
             self.get_logger().info(
                 "MAVLink TX SET_POSITION_TARGET_GLOBAL_INT: "
                 f"lat={lat:.7f}, lon={lon:.7f}, armed={self.armed}, mode={self.mode}",
@@ -1599,6 +1674,8 @@ class OrangeCubeBridgeNode(Node):
         target_yaw_rad = (self.yaw if self.yaw is not None else 0.0) + angular_z
         self.last_target_q = self._yaw_to_mavlink_quaternion(target_yaw_rad)
         self.last_thrust = linear_x
+        self.speed_setpoint_m_s = linear_x
+        self.heading_setpoint_deg = math.degrees(target_yaw_rad) % 360.0
 
         self.last_cmd_vel_time = time.time()
 
