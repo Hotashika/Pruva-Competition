@@ -92,7 +92,7 @@ def _mission(task3_module, **config_overrides):
         "target_lost_timeout_sec": 0.2,
         "gps_timeout_sec": 100.0,
         "heading_timeout_sec": 100.0,
-        "bridge_timeout_sec": 100.0,
+        "bridge_state_timeout_sec": 100.0,
         "mission_timeout_sec": 100.0,
     }
     config_values.update(config_overrides)

@@ -40,23 +40,41 @@ WAYPOINT_PATH = WAYPOINT_DIRECTORY / "njord_task2.waypoints"
 ACTIVE_TASK_NAME = "task2"
 HOLD_MODE_NAME = "HOLD"
 
-# Bridge movement contract: positive angular_z turns starboard/right.
-AVOID_LINEAR_X = 0.5
-AVOID_TURN_Z = 0.6
-
-WAYPOINT_TOLERANCE_M = 1.0
-WAYPOINT_SETTLE_SEC = 0.75
-WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
+# ============================================================
+# GÜVENLİK PARAMETRELERİ
+# ============================================================
 GPS_TIMEOUT_SEC = 2.0
 HEADING_TIMEOUT_SEC = 2.0
 BRIDGE_STATE_TIMEOUT_SEC = 10.0
 MIN_VALID_ABS_COORD = 1e-6
 
+# ============================================================
+# NAVİGASYON PARAMETRELERİ
+# ============================================================
+WAYPOINT_TOLERANCE_M = 1.0
+WAYPOINT_SETTLE_SEC = 0.75
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
+EARTH_RADIUS_M = 6378137.0
+
+# ============================================================
+# KAÇINMA HAREKET PARAMETRELERİ
+# ============================================================
+# Bridge movement contract: positive angular_z turns starboard/right.
+AVOIDANCE_LINEAR_SPEED = 0.5
+AVOIDANCE_TURN_RATE = 0.6
+AVOIDANCE_PASS_CLEARANCE_M = 2.5
+AVOIDANCE_MIN_DURATION_SEC = 0.8
+AVOIDANCE_CLEAR_DURATION_SEC = 1.0
+AVOIDANCE_TIMEOUT_SEC = 10.0
+
+# ============================================================
+# ÇARPIŞMA RİSKİ PARAMETRELERİ
+# ============================================================
 # Vessel monitoring and collision-risk thresholds. These are competition
 # defaults, not fixed COLREG distances, and should be tuned during water tests.
 MONITOR_DISTANCE_M = 12.0
-AVOID_ENTER_DISTANCE_M = 4.5
-AVOID_EXIT_DISTANCE_M = 5.5
+AVOIDANCE_START_DISTANCE_M = 4.5
+AVOIDANCE_EXIT_DISTANCE_M = 5.5
 EMERGENCY_DISTANCE_M = 2.5
 SAFE_DCPA_M = 2.5
 MAX_TCPA_SEC = 15.0
@@ -68,9 +86,10 @@ CONSTANT_BEARING_SPAN_DEG = 8.0
 
 HEAD_ON_HALF_ANGLE_DEG = 15.0
 STAND_ON_GRACE_SEC = 2.5
-AVOID_MIN_DURATION_SEC = 0.8
-AVOID_CLEAR_DURATION_SEC = 1.0
-AVOID_MAX_DURATION_SEC = 10.0
+
+# ============================================================
+# VISION PARAMETRELERİ
+# ============================================================
 VISION_DETECTION_TIMEOUT_SEC = 1.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
@@ -312,7 +331,7 @@ class Task2CollisionAvoidance:
             item.angle_deg for item in self.track
         )
         if (
-            latest.distance_m <= AVOID_ENTER_DISTANCE_M
+            latest.distance_m <= AVOIDANCE_START_DISTANCE_M
             and angle_span <= CONSTANT_BEARING_SPAN_DEG
         ):
             return CollisionAssessment(
@@ -491,8 +510,8 @@ class Task2CollisionAvoidance:
     def _publish_starboard_command(self):
         publish_cmd_vel(
             self.topics.cmd_vel_pub,
-            linear_x=AVOID_LINEAR_X,
-            angular_z=AVOID_TURN_Z,
+            linear_x=AVOIDANCE_LINEAR_SPEED,
+            angular_z=AVOIDANCE_TURN_RATE,
         )
 
     def _update_avoidance(self, vessel, now):
@@ -500,17 +519,17 @@ class Task2CollisionAvoidance:
             self.avoid_started_time = now
 
         elapsed = now - self.avoid_started_time
-        if elapsed >= AVOID_MAX_DURATION_SEC:
+        if elapsed >= AVOIDANCE_TIMEOUT_SEC:
             self._enter_failsafe(
-                f"Starboard avoidance exceeded {AVOID_MAX_DURATION_SEC:.1f}s"
+                f"Starboard avoidance exceeded {AVOIDANCE_TIMEOUT_SEC:.1f}s"
             )
             return
 
-        vessel_clear = vessel is None or vessel["distance"] >= AVOID_EXIT_DISTANCE_M
-        if elapsed >= AVOID_MIN_DURATION_SEC and vessel_clear:
+        vessel_clear = vessel is None or vessel["distance"] >= AVOIDANCE_EXIT_DISTANCE_M
+        if elapsed >= AVOIDANCE_MIN_DURATION_SEC and vessel_clear:
             if self.avoid_clear_started_time is None:
                 self.avoid_clear_started_time = now
-            elif now - self.avoid_clear_started_time >= AVOID_CLEAR_DURATION_SEC:
+            elif now - self.avoid_clear_started_time >= AVOIDANCE_CLEAR_DURATION_SEC:
                 self.logger.info("Vessel is past and clear; resuming the same waypoint.")
                 stop_vehicle(self.topics.cmd_vel_pub)
                 self.state = MissionState.NAVIGATING

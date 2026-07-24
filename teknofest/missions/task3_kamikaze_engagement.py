@@ -32,7 +32,9 @@ from utils.mavlink_utilities import (
     wait_for_mission_services,
 )
 
-
+# ============================================================
+# GÖREV / NAVİGASYON SABİTLERİ
+# ============================================================
 DRIVE_MODE = "GUIDED"
 ACTIVE_TASK_NAME = "task3"
 EARTH_RADIUS_M = 6378137.0
@@ -40,17 +42,20 @@ EARTH_RADIUS_M = 6378137.0
 
 @dataclass(frozen=True)
 class Task3Config:
+    # Hedef parametreleri
     target_class: str = "red_buoy"
     required_impact_count: int = 3
     min_confidence: float = 0.45
 
+    # Güvenlik parametreleri
     gps_timeout_sec: float = 2.0
     heading_timeout_sec: float = 2.0
-    bridge_timeout_sec: float = 10.0
-    vision_stale_sec: float = 1.0
+    bridge_state_timeout_sec: float = 10.0
+    vision_detection_timeout_sec: float = 1.0
     geofence_radius_m: float = 25.0
     mission_timeout_sec: float = 240.0
 
+    # Arama parametreleri
     entry_settle_sec: float = 1.0
     search_angular_z: float = 0.22
     search_scan_degrees: float = 350.0
@@ -61,12 +66,14 @@ class Task3Config:
     search_relocate_tolerance_m: float = 0.8
     search_relocate_timeout_sec: float = 20.0
 
+    # Hedef doğrulama parametreleri
     confirmation_window_size: int = 7
     confirmation_required: int = 5
     confirmation_angle_spread_deg: float = 12.0
     confirmation_distance_spread_ratio: float = 0.45
     acquire_timeout_sec: float = 2.0
 
+    # Yaklaşma / dümen parametreleri
     align_tolerance_deg: float = 6.0
     realign_threshold_deg: float = 12.0
     steering_kp: float = 0.025
@@ -77,6 +84,7 @@ class Task3Config:
     medium_approach_speed: float = 0.35
     near_approach_speed: float = 0.20
 
+    # Hedef sürekliliği parametreleri
     final_confirmation_required: int = 3
     final_distance_spread_m: float = 0.35
     target_angle_jump_deg: float = 25.0
@@ -84,6 +92,7 @@ class Task3Config:
     target_lost_timeout_sec: float = 2.0
     reacquire_angular_z: float = 0.16
 
+    # Temas / geri çekilme parametreleri
     ram_speed: float = 0.75
     ram_duration_sec: float = 1.6
     contact_hold_sec: float = 0.7
@@ -325,7 +334,7 @@ class Task3KamikazeEngagement:
         if (
                 self.last_bridge_state_time is not None
                 and now - self.last_bridge_state_time
-                > self.config.bridge_timeout_sec
+                > self.config.bridge_state_timeout_sec
         ):
             self._enter_failsafe("Task 3 bridge state watchdog zaman aşımı.")
             return False
@@ -1016,7 +1025,7 @@ class Task3Node(Node):
         return (
             self.last_detection_time is not None
             and time.monotonic() - self.last_detection_time
-            <= self.config.vision_stale_sec
+            <= self.config.vision_detection_timeout_sec
         )
 
     def wait_for_vision(self, timeout_sec=30.0):

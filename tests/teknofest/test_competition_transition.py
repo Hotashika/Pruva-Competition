@@ -29,7 +29,7 @@ def _load_competition_module(monkeypatch):
         "teknofest.missions.task1_point_tracking",
         _module(
             "teknofest.missions.task1_point_tracking",
-            DETECTION_STALE_SEC=3.0,
+            VISION_DETECTION_TIMEOUT_SEC=3.0,
             MissionState=state,
             Task1Node=object,
         ),
@@ -220,7 +220,7 @@ def test_task3_uses_tighter_vision_stale_limit(monkeypatch):
         competition.CompetitionState.PARKUR_3,
     )
     node.last_detection_message_time = competition.time.monotonic() - 1.5
-    node.task3.config = types.SimpleNamespace(vision_stale_sec=1.0)
+    node.task3.config = types.SimpleNamespace(vision_detection_timeout_sec=1.0)
     failures = []
     node._enter_competition_failsafe = failures.append
 
