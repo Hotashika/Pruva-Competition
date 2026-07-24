@@ -71,7 +71,7 @@ TEST_MODE = False  # Yalnızca ayrıntılı log içindir; sensör verisi üretme
 SAFETY_STOP_DISTANCE = 1.0
 MIN_TARGET_CONFIDENCE = 0.65
 IMPACT_THRESHOLD_MPS2 = 4.0
-USE_FORCE_ARM = True
+USE_FORCE_ARM = False
 
 
 class MissionState(Enum):

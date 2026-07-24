@@ -1207,6 +1207,10 @@ class OrangeCubeBridgeNode(Node):
         self.pending_mission_command = None
         self.pending_mission_command_first_publish_time = 0.0
         self.pending_mission_command_last_publish_time = 0.0
+        # Manager basarisiz bir START'i ACK ettiginde ayni komutun otomatik
+        # tekrarini kilitler. Sifir mesaji, komutun temizlendigini bildirip
+        # yeni bir kullanici secimine izin verir.
+        self._publish_mission_start(MISSION_IDLE, track_ack=False)
 
     def _set_mission_parameter(self, value):
         if self.master is None:
