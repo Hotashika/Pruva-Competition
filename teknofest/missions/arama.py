@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Task 3 arama: gerçek heading/GPS/kamera ile 20° adımlı 360° tarama.
 
-v6 değişiklikleri:
-  - Tekne fark itkili (skid-steer) olduğundan tarama dönüşü artık YERİNDE
-    yapılıyor (TURN_LINEAR_X = 0.0). Eskiden dönüş sırasında ileri hız da
-    veriliyordu (TURN_THRUST=0.18); bu, 18 adımlık tam tur boyunca home
-    noktasından fark edilir sürüklenmeye yol açabiliyordu.
+v7 değişiklikleri:
+  - Arama, yaklaşma hizalama ve çarpma hizalama aynı sahada doğrulanmış
+    skid-steer dönüş komutunu kullanıyor.
   - Bir arama adımının dönüşü TURN_TIMEOUT_SEC içinde art arda
     TURN_MAX_RETRIES kez doğrulanamazsa artık sonsuz döngüye girmek yerine
     SearchState.FAILED'e düşülüyor (relocation'daki retry mantığıyla
@@ -26,6 +24,11 @@ from utils.mavlink_utilities import (
     publish_cmd_vel,
     stop_vehicle,
 )
+from teknofest.missions.task3_motion import (
+    TASK3_MAX_YAW_OFFSET_RAD,
+    TASK3_TURN_BASE_THRUST,
+    publish_task3_turn,
+)
 
 SEARCH_STEP_DEG = 20.0
 STEP_HOLD_SEC = 5.0
@@ -35,8 +38,8 @@ HOLD_MAX_HEADING_DRIFT_DEG = 3.0
 # Skid-steer mikserinde saat yönü steering ile birlikte küçük pozitif taban
 # itki, dıştaki (sol) motoru ileri sürüp içteki (sağ) motoru durdurmak içindir.
 # Saf thrust=0 komutu sahada iki ESC tarafından aynı yönde uygulanmıştı.
-TURN_LINEAR_X = 0.18
-MAX_YAW_OFFSET_RAD = 0.18
+TURN_LINEAR_X = TASK3_TURN_BASE_THRUST
+MAX_YAW_OFFSET_RAD = TASK3_MAX_YAW_OFFSET_RAD
 TURN_MAX_RETRIES = 3
 TURN_PROGRESS_TIMEOUT_SEC = 3.0
 TURN_MIN_PROGRESS_DEG = 2.0
@@ -140,12 +143,20 @@ class AramaGorevi:
         self.last_processed_frame_id = frame_id
         target = self._select_target(detections)
         if target is None:
+            if self.confirmations:
+                self.logger.info(
+                    "[ARAMA] Kamera hedef onayı kesildi; 5 kare sayacı sıfırlandı."
+                )
             self.confirmations.clear()
             return False
         self.confirmations.append((now, frame_id, target))
         while self.confirmations and now - self.confirmations[0][0] > SEARCH_CONFIRM_WINDOW_SEC:
             self.confirmations.popleft()
         if len(self.confirmations) < SEARCH_CONFIRM_FRAMES:
+            self.logger.info(
+                f"[ARAMA] Hedef kamera onayı "
+                f"{len(self.confirmations)}/{SEARCH_CONFIRM_FRAMES}."
+            )
             return False
         distances = [float(item[2]["distance"]) for item in self.confirmations]
         angles = [float(item[2]["Buoy angle: "]) for item in self.confirmations]
@@ -195,19 +206,7 @@ class AramaGorevi:
             )
             return
         if now - self.step_start_time > TURN_TIMEOUT_SEC:
-            stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
-            self.turn_retry_count += 1
-            if self.turn_retry_count >= TURN_MAX_RETRIES:
-                self.failed = True
-                self.state = SearchState.FAILED
-                self.logger.error(
-                    f"[ARAMA] {TURN_MAX_RETRIES} denemede 20° dönüş doğrulanamadı; arama güvenli biçimde durduruldu."
-                )
-                return
-            self.state = SearchState.START_STEP
-            self.logger.error(
-                f"[ARAMA] 20° dönüş doğrulanamadı ({self.turn_retry_count}/{TURN_MAX_RETRIES}); aynı adım yeniden denenecek."
-            )
+            self._retry_or_fail_turn("20° dönüş zaman aşımı")
             return
         if now - self.step_start_time >= TURN_PROGRESS_TIMEOUT_SEC:
             remaining_error_deg = abs(
@@ -215,17 +214,32 @@ class AramaGorevi:
             )
             error_reduction_deg = self.turn_start_error_deg - remaining_error_deg
             if error_reduction_deg < TURN_MIN_PROGRESS_DEG:
-                stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
-                self.failed = True
-                self.state = SearchState.FAILED
-                self.logger.error(
-                    "[ARAMA] Dönüş komutuna rağmen heading 3 sn içinde "
-                    f"hedefe doğru {TURN_MIN_PROGRESS_DEG:.1f}° ilerlemedi "
-                    f"(hata azalması={error_reduction_deg:.1f}°); motorlar durduruldu."
+                self._retry_or_fail_turn(
+                    "heading 3 sn içinde hedefe doğru "
+                    f"{TURN_MIN_PROGRESS_DEG:.1f}° ilerlemedi "
+                    f"(hata azalması={error_reduction_deg:.1f}°)"
                 )
                 return
-        yaw_offset = max(-MAX_YAW_OFFSET_RAD, min(MAX_YAW_OFFSET_RAD, math.radians(error_deg)))
-        publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=TURN_LINEAR_X, angular_z=yaw_offset)
+        publish_task3_turn(self.topics.cmd_vel_pub, math.radians(error_deg))
+
+    def _retry_or_fail_turn(self, reason):
+        """Başarısız dönüşü aynı mutlak heading hedefinde sınırlı tekrar et."""
+
+        stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
+        self.turn_retry_count += 1
+        if self.turn_retry_count >= TURN_MAX_RETRIES:
+            self.failed = True
+            self.state = SearchState.FAILED
+            self.logger.error(
+                f"[ARAMA] {reason}; {TURN_MAX_RETRIES} deneme sonunda "
+                "arama güvenli biçimde durduruldu."
+            )
+            return
+        self.state = SearchState.START_STEP
+        self.logger.warning(
+            f"[ARAMA] {reason}; aynı 20° adım yeniden denenecek "
+            f"({self.turn_retry_count}/{TURN_MAX_RETRIES})."
+        )
 
     def _start_relocation(self, now):
         self.relocation_start_lat = self.current_lat

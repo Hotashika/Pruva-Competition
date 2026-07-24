@@ -203,6 +203,8 @@ class OrangeCubeBridgeNode(Node):
         self.imu_linear_acceleration = None
         self.imu_angular_velocity = None
         self.last_imu_sample_time = 0.0
+        self.last_highres_imu_sample_time = 0.0
+        self.last_published_imu_sample_time = 0.0
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
@@ -244,6 +246,10 @@ class OrangeCubeBridgeNode(Node):
 
         self.create_timer(1.0, self._connect_if_needed)
         self.create_timer(0.02, self._read_mavlink_messages)
+        # Fiziksel temas darbeleri 5 Hz telemetri döngüsünde kaybolabilir.
+        # 50 Hz kontrol, gelen her yeni 20 Hz MAVLink IMU örneğini kaçırmadan
+        # yayınlar; _publish_imu aynı örneği ikinci kez göndermez.
+        self.create_timer(0.02, self._publish_imu)
         self.create_timer(0.2, self._publish_telemetry)
         self.create_timer(0.1, self._send_attitude_target_loop)
         self.create_timer(1.0, self._connection_watchdog)
@@ -416,6 +422,8 @@ class OrangeCubeBridgeNode(Node):
         self.imu_linear_acceleration = None
         self.imu_angular_velocity = None
         self.last_imu_sample_time = 0.0
+        self.last_highres_imu_sample_time = 0.0
+        self.last_published_imu_sample_time = 0.0
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
@@ -829,9 +837,16 @@ class OrangeCubeBridgeNode(Node):
                         float(msg.ygyro),
                         float(msg.zgyro),
                     )
-                    self.last_imu_sample_time = time.time()
+                    sample_time = time.time()
+                    self.last_highres_imu_sample_time = sample_time
+                    self.last_imu_sample_time = sample_time
 
                 elif msg_type == "SCALED_IMU":
+                    # HIGHRES_IMU akışı varken daha düşük çözünürlüklü
+                    # SCALED_IMU aynı fiziksel örneği ezmesin; yalnız yedek
+                    # kaynak olarak kullanılsın.
+                    if time.time() - self.last_highres_imu_sample_time <= 0.25:
+                        continue
                     # SCALED_IMU: ivme mG, acisal hiz millirad/s.
                     accel_scale = 9.80665 / 1000.0
                     gyro_scale = 1.0 / 1000.0
@@ -1211,6 +1226,45 @@ class OrangeCubeBridgeNode(Node):
         else:
             self.get_logger().info(raw_text)
 
+    def _publish_imu(self):
+        """Her yeni gerçek MAVLink IMU örneğini en fazla 20 Hz ROS'a aktar."""
+
+        if not self._has_valid_link():
+            return
+        if (
+            self.last_imu_sample_time <= self.last_published_imu_sample_time
+            or self.last_imu_sample_time <= 0.0
+            or time.time() - self.last_imu_sample_time > 0.5
+            or self.imu_linear_acceleration is None
+            or self.imu_angular_velocity is None
+        ):
+            return
+
+        imu_msg = Imu()
+        imu_msg.header.stamp = self.get_clock().now().to_msg()
+        imu_msg.header.frame_id = "base_link"
+        if self.roll is not None and self.pitch is not None and self.yaw is not None:
+            qx, qy, qz, qw = euler_to_quaternion(self.roll, self.pitch, self.yaw)
+            imu_msg.orientation.x = qx
+            imu_msg.orientation.y = qy
+            imu_msg.orientation.z = qz
+            imu_msg.orientation.w = qw
+        else:
+            imu_msg.orientation_covariance[0] = -1.0
+
+        (
+            imu_msg.linear_acceleration.x,
+            imu_msg.linear_acceleration.y,
+            imu_msg.linear_acceleration.z,
+        ) = self.imu_linear_acceleration
+        (
+            imu_msg.angular_velocity.x,
+            imu_msg.angular_velocity.y,
+            imu_msg.angular_velocity.z,
+        ) = self.imu_angular_velocity
+        self.topics.imu_pub.publish(imu_msg)
+        self.last_published_imu_sample_time = self.last_imu_sample_time
+
     # noinspection D
     def _publish_telemetry(self):
         now = self.get_clock().now().to_msg()
@@ -1253,38 +1307,6 @@ class OrangeCubeBridgeNode(Node):
             alt_msg = Float32()
             alt_msg.data = float(self.relative_alt)
             self.topics.relative_alt_pub.publish(alt_msg)
-
-        if link_ready and self.roll is not None and self.pitch is not None and self.yaw is not None:
-            imu_msg = Imu()
-            imu_msg.header.stamp = now
-            imu_msg.header.frame_id = "base_link"
-            qx, qy, qz, qw = euler_to_quaternion(self.roll, self.pitch, self.yaw)
-            imu_msg.orientation.x = qx
-            imu_msg.orientation.y = qy
-            imu_msg.orientation.z = qz
-            imu_msg.orientation.w = qw
-            imu_data_fresh = (
-                self.last_imu_sample_time > 0.0
-                and time.time() - self.last_imu_sample_time <= 0.5
-                and self.imu_linear_acceleration is not None
-                and self.imu_angular_velocity is not None
-            )
-            if imu_data_fresh:
-                (
-                    imu_msg.linear_acceleration.x,
-                    imu_msg.linear_acceleration.y,
-                    imu_msg.linear_acceleration.z,
-                ) = self.imu_linear_acceleration
-                (
-                    imu_msg.angular_velocity.x,
-                    imu_msg.angular_velocity.y,
-                    imu_msg.angular_velocity.z,
-                ) = self.imu_angular_velocity
-            else:
-                # ROS Imu sozlesmesi: ilk covariance -1 ise alan mevcut degildir.
-                imu_msg.linear_acceleration_covariance[0] = -1.0
-                imu_msg.angular_velocity_covariance[0] = -1.0
-            self.topics.imu_pub.publish(imu_msg)
 
         if link_ready and self.voltage_v is not None:
             battery_msg = BatteryState()

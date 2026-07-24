@@ -11,6 +11,10 @@ from utils.mavlink_utilities import (
     publish_cmd_vel,
     stop_vehicle,
 )
+from teknofest.missions.task3_motion import (
+    TASK3_MAX_YAW_OFFSET_RAD,
+    publish_task3_turn,
+)
 
 REQUIRED_DISTINCT_FRAMES = 5
 TARGET_LOST_TIMEOUT_SEC = 1.0
@@ -18,24 +22,28 @@ CONFIRM_WINDOW_SEC = 5.0
 SEGMENT_FRACTION = 1.0 / 3.0
 MIN_SEGMENT_M = 0.40
 MAX_SEGMENT_M = 6.0
-IMPACT_ENTRY_DISTANCE_M = 1.5
+IMPACT_ENTRY_DISTANCE_M = 1.0
 DISTANCE_CONSISTENCY_RATIO = 0.30
 MAX_CONFIRM_ANGLE_SPREAD_DEG = 18.0
 ALIGN_TOLERANCE_DEG = 4.0
 ANGLE_KP = 0.02
-MAX_ANGULAR_Z = 0.30
+MAX_ANGULAR_Z = TASK3_MAX_YAW_OFFSET_RAD
 MAX_STRAIGHT_HEADING_CORRECTION_RAD = 0.18
 MAX_MOVING_TARGET_ANGLE_DEG = 20.0
 APPROACH_SPEED = 0.30
 SEGMENT_TIMEOUT_SEC = 12.0
 STALL_TIMEOUT_SEC = 4.0
-MIN_GPS_PROGRESS_M = 0.25
 MIN_LATERAL_CORRIDOR_M = 0.75
 LATERAL_CORRIDOR_RATIO = 0.50
 MAX_TRACK_ANGLE_JUMP_DEG = 30.0
 MAX_TRACK_DISTANCE_RATIO = 0.60
 MIN_CAMERA_PROGRESS_M = 0.25
 MIN_CAMERA_PROGRESS_RATIO = 0.08
+CAMERA_PROGRESS_UPDATE_M = 0.10
+CAMERA_SEGMENT_REACHED_TOLERANCE_M = 0.05
+COLLISION_HANDOFF_MARGIN_M = 0.25
+GPS_LATERAL_CHECK_MIN_TRAVEL_M = 1.50
+GPS_SEGMENT_OVERSHOOT_MARGIN_M = 2.00
 MAX_APPROACH_SEGMENTS = 8
 APPROACH_TOTAL_TIMEOUT_SEC = 60.0
 DEFAULT_MIN_TARGET_CONFIDENCE = 0.65
@@ -76,10 +84,12 @@ class YaklasmaGorevi:
         self.confirmed_distance = None
         self.confirmed_angle = None
         self.segment_goal_m = None
+        self.segment_start_camera_distance = None
         self.segment_start_lat = self.segment_start_lon = None
         self.segment_heading_deg = None
         self.segment_start_time = self.last_progress_time = None
         self.best_travelled = 0.0
+        self.best_camera_progress = 0.0
         self.approach_start_time = None
         self.segment_count = 0
 
@@ -140,6 +150,11 @@ class YaklasmaGorevi:
         self.confirmations = [item for item in self.confirmations if now - item[0] <= CONFIRM_WINDOW_SEC]
         if len(self.confirmations) >= REQUIRED_DISTINCT_FRAMES:
             self._finish_confirmation(now)
+        else:
+            self.logger.info(
+                f"[YAKLAŞMA] Kamera onayı "
+                f"{len(self.confirmations)}/{REQUIRED_DISTINCT_FRAMES}."
+            )
         return True
 
     def _finish_confirmation(self, now):
@@ -157,11 +172,13 @@ class YaklasmaGorevi:
         # Hedef ilk yaklaşma onayında zaten çarpma mesafesindeyse 40 cm'lik
         # minimum segmenti zorla sürme; bu, kontrollü çarpma aşamasından önce
         # fiziksel temasa neden olabilir.
-        if mean_distance <= self.impact_entry_distance:
+        if mean_distance <= self.impact_entry_distance + COLLISION_HANDOFF_MARGIN_M:
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             self.state = ApproachState.DONE
             self.finished = True
-            self.logger.info("[YAKLAŞMA] 5 farklı kare ile çarpma mesafesi doğrulandı.")
+            self.logger.info(
+                "[YAKLAŞMA] 5 farklı kare ile güvenli çarpma devri mesafesi doğrulandı."
+            )
             return
         if self.state == ApproachState.CONFIRMING_RESULT and self.confirmed_distance is not None:
             camera_progress_m = self.confirmed_distance - mean_distance
@@ -180,7 +197,18 @@ class YaklasmaGorevi:
             return
         self.confirmed_distance = mean_distance
         self.confirmed_angle = mean_angle
-        self.segment_goal_m = max(MIN_SEGMENT_M, min(MAX_SEGMENT_M, mean_distance * SEGMENT_FRACTION))
+        desired_segment_m = max(
+            MIN_SEGMENT_M,
+            min(MAX_SEGMENT_M, mean_distance * SEGMENT_FRACTION),
+        )
+        # Yaklaşma segmenti hiçbir zaman çarpma devri mesafesini aşmasın.
+        # Özellikle 1.0-1.4 m aralığında 40 cm'lik minimumu zorlamak, çarpma
+        # aşaması başlamadan fiziksel temasa neden olabilir.
+        self.segment_goal_m = min(
+            desired_segment_m,
+            mean_distance - self.impact_entry_distance,
+        )
+        self.segment_start_camera_distance = mean_distance
         self.state = ApproachState.ALIGNING
         self.logger.info(
             f"[YAKLAŞMA] 5 kare ortalaması: mesafe={mean_distance:.2f}m, "
@@ -198,10 +226,11 @@ class YaklasmaGorevi:
             self.segment_heading_deg = self.current_heading
             self.segment_start_time = self.last_progress_time = now
             self.best_travelled = 0.0
+            self.best_camera_progress = 0.0
             self.state = ApproachState.MOVING_STRAIGHT
             return
         angular = max(-MAX_ANGULAR_Z, min(MAX_ANGULAR_Z, ANGLE_KP * angle))
-        publish_cmd_vel(self.topics.cmd_vel_pub, linear_x=0.0, angular_z=angular)
+        publish_task3_turn(self.topics.cmd_vel_pub, angular)
 
     def _move_straight(self, now):
         if None in (self.current_lat, self.current_lon, self.segment_start_lat, self.segment_start_lon):
@@ -225,21 +254,41 @@ class YaklasmaGorevi:
             MIN_LATERAL_CORRIDOR_M,
             self.segment_goal_m * LATERAL_CORRIDOR_RATIO,
         )
-        if lateral_offset_m > lateral_limit_m:
+        if (
+            travelled >= GPS_LATERAL_CHECK_MIN_TRAVEL_M
+            and lateral_offset_m > lateral_limit_m
+        ):
             self._lose_target(
                 f"düz yaklaşma koridoru aşıldı (yanal={lateral_offset_m:.2f}m)"
             )
             return
-        if forward_progress_m > self.best_travelled + MIN_GPS_PROGRESS_M:
-            self.best_travelled = forward_progress_m
+        self.best_travelled = max(self.best_travelled, forward_progress_m)
+        if forward_progress_m > self.segment_goal_m + GPS_SEGMENT_OVERSHOOT_MARGIN_M:
+            self._lose_target(
+                "kamera ilerlemeyi doğrulamadan GPS güvenlik sınırı aşıldı "
+                f"(GPS ileri={forward_progress_m:.2f}m)"
+            )
+            return
+
+        camera_progress_m = (
+            self.segment_start_camera_distance
+            - float(self.latest_target["distance"])
+        )
+        if camera_progress_m > self.best_camera_progress + CAMERA_PROGRESS_UPDATE_M:
+            self.best_camera_progress = camera_progress_m
             self.last_progress_time = now
-        if forward_progress_m >= self.segment_goal_m:
+        if (
+            camera_progress_m + CAMERA_SEGMENT_REACHED_TOLERANCE_M
+            >= self.segment_goal_m
+        ):
             stop_vehicle(self.topics.cmd_vel_pub, repeat_count=1)
             self.state = ApproachState.CONFIRMING_RESULT
             self._clear_confirmation()
             return
         if now - self.segment_start_time > SEGMENT_TIMEOUT_SEC or now - self.last_progress_time > STALL_TIMEOUT_SEC:
-            self._lose_target("GPS ile düz ilerleme doğrulanamadı")
+            self._lose_target(
+                "kamera mesafesiyle düz yaklaşma ilerlemesi doğrulanamadı"
+            )
             return
         if self.current_heading is None or self.segment_heading_deg is None:
             self._lose_target("düz yaklaşma heading verisi alınamadı")

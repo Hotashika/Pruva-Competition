@@ -414,6 +414,10 @@ class Task3KamikazeEngagement:
 
             if approach_done:
                 self.state = MissionState.CARPMA
+                # Arama/yaklaşma hareketlerindeki ivme örnekleri fiziksel
+                # temas referansı olamaz. Çarpma kamera onayı sırasında yeni,
+                # sakin bir IMU baseline'ı toplanır.
+                self.carpma.prepare_for_collision()
                 # Yaklaşmanın son doğrulama karesi çarpma kamera onayında
                 # yeniden kullanılamaz; çarpma beş yeni gerçek kare bekler.
                 self.carpma.last_processed_frame_id = self.yaklasma.last_processed_frame_id

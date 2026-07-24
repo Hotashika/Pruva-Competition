@@ -30,6 +30,7 @@ class BaseYOLODetector:
         self.model = YOLO(str(model_p))
         self.device = device
         self.class_names = self.model.names
+        self.last_invalid_depth_log_time = 0.0
 
         # DÜZELTME: Modelin gerçek sınıf isimlerini sahaya çıkmadan önce
         # görünür kılıyoruz. arama.py / task3_kamikaze.py "red_buoy",
@@ -144,10 +145,13 @@ class BaseYOLODetector:
             # budur — derinlik kamerası menzil dışı/gürültülüyse bu satır
             # tetiklenir.
             if not np.isfinite(distance) or distance <= 0.0:
-                _logger.debug(
-                    f"{class_name} tespiti için geçerli ZED mesafesi alınamadı "
-                    f"(bbox={bbox}); tespit görev düğümüne gönderilmeyecek."
-                )
+                now = time.monotonic()
+                if now - self.last_invalid_depth_log_time >= 2.0:
+                    self.last_invalid_depth_log_time = now
+                    _logger.warning(
+                        f"{class_name} tespiti için geçerli ZED mesafesi alınamadı "
+                        f"(bbox={bbox}); tespit görev düğümüne gönderilmeyecek."
+                    )
                 continue
 
             track_id = None
