@@ -75,6 +75,13 @@ def _mission_without_ros(task1_module, heading):
     mission.current_lon = 10.3951
     mission.current_heading = heading
     mission.aligned_target_key = None
+    mission.avoiding_class = None
+    mission.avoiding_track_id = None
+    mission.active_obstacle_reference = None
+    mission.pending_obstacle = None
+    mission.pending_obstacle_time = None
+    mission.pending_obstacle_count = 0
+    mission.recently_avoided_obstacles = []
     return mission
 
 
@@ -122,16 +129,16 @@ def test_buoy_target_uses_vehicle_relative_pass_side(
         target["lon"],
     )
     assert north_m == pytest.approx(
-        task1_module.BUOY_PASS_CLEARANCE_M
+        task1_module.AVOIDANCE_PASS_CLEARANCE_M
         * math.cos(math.radians(lateral_angle)),
         abs=0.01,
     )
     assert east_m == pytest.approx(
-        task1_module.BUOY_PASS_CLEARANCE_M
+        task1_module.AVOIDANCE_PASS_CLEARANCE_M
         * math.sin(math.radians(lateral_angle)),
         abs=0.01,
     )
-    assert task1_module.BUOY_PASS_CLEARANCE_M == 2.5
+    assert task1_module.AVOIDANCE_PASS_CLEARANCE_M == 2.5
 
 
 @pytest.mark.parametrize(
@@ -163,7 +170,7 @@ def test_cardinal_target_uses_2_5_meter_clearance(
     )
     assert north_m == pytest.approx(0.0, abs=0.01)
     assert east_m == pytest.approx(expected_east_m, abs=0.01)
-    assert task1_module.CARDINAL_PASS_CLEARANCE_M == 2.5
+    assert task1_module.AVOIDANCE_PASS_CLEARANCE_M == 2.5
 
 
 @pytest.mark.parametrize("obstacle_class", ("red_buoys", "green_buoys"))
@@ -205,7 +212,7 @@ def test_buoy_avoidance_follows_generated_gps_target(task1_module, obstacle_clas
         refreshed_target["lon"],
     )
     assert gps_targets[0][2].endswith("buoy pass")
-    assert gps_targets[0][3] == task1_module.CARDINAL_TARGET_TOLERANCE_M
+    assert gps_targets[0][3] == task1_module.AVOIDANCE_WAYPOINT_TOLERANCE_M
 
 
 def test_buoy_avoidance_finishes_only_when_temporary_target_is_reached(task1_module):
@@ -229,6 +236,10 @@ def test_buoy_avoidance_finishes_only_when_temporary_target_is_reached(task1_mod
 
     reached["value"] = True
     assert mission._update_active_avoidance([], now=12.0)
+    assert mission.state is task1_module.MissionState.AVOIDING
+    mission.current_lat = mission.cardinal_pass_target["lat"]
+    mission.current_lon = mission.cardinal_pass_target["lon"]
+    assert mission._update_active_avoidance([], now=13.0)
     assert mission.state is task1_module.MissionState.NAVIGATING
     assert mission.cardinal_pass_target is None
 
@@ -252,3 +263,126 @@ def test_missing_detection_angle_fails_safe_without_direct_maneuver(task1_module
     assert mission.state is task1_module.MissionState.FAILSAFE
     assert mission.cardinal_pass_target is None
     assert failsafe_requests[0][1] is True
+
+
+def test_singular_and_plural_class_aliases_are_normalized(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+
+    singular = mission._normalize_obstacle({
+        "class": "red_buoy",
+        "confidence": 0.9,
+        "distance": "2.0",
+    })
+    plural = mission._normalize_obstacle({
+        "class": "red_buoys",
+        "confidence": 0.9,
+        "distance": 2.0,
+    })
+
+    assert singular["class"] == task1_module.RED_BUOY_CLASS
+    assert plural["class"] == task1_module.RED_BUOY_CLASS
+    assert singular["distance"] == 2.0
+
+
+def test_active_obstacle_uses_bbox_or_angle_distance_continuity(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+    mission.avoiding_class = task1_module.RED_BUOY_CLASS
+    mission.active_obstacle_reference = {
+        "class": task1_module.RED_BUOY_CLASS,
+        "distance": 2.5,
+        "angle_deg": 0.0,
+        "bbox": [100, 100, 140, 160],
+    }
+
+    matched = mission._matching_avoidance_obstacle([
+        {
+            "class": "red_buoy",
+            "confidence": 0.9,
+            "distance": 1.0,
+            "angle_deg": 60.0,
+            "bbox": [300, 100, 340, 160],
+        },
+        {
+            "class": "red_buoy",
+            "confidence": 0.9,
+            "distance": 2.2,
+            "angle_deg": 4.0,
+            "bbox": [105, 100, 145, 160],
+        },
+    ])
+
+    assert matched["distance"] == pytest.approx(2.38)
+    assert matched["angle_deg"] == pytest.approx(1.6)
+
+
+def test_active_obstacle_prefers_exact_track_id(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+    mission.avoiding_class = task1_module.RED_BUOY_CLASS
+    mission.avoiding_track_id = 7
+    mission.active_obstacle_reference = {
+        "class": task1_module.RED_BUOY_CLASS,
+        "distance": 2.5,
+        "angle_deg": 0.0,
+        "track_id": 7,
+    }
+
+    matched = mission._matching_avoidance_obstacle([
+        {
+            "class": "red_buoy",
+            "confidence": 0.9,
+            "distance": 1.0,
+            "angle_deg": 0.0,
+            "track_id": 8,
+        },
+        {
+            "class": "red_buoy",
+            "confidence": 0.9,
+            "distance": 2.2,
+            "angle_deg": 3.0,
+            "track_id": 7,
+        },
+    ])
+
+    assert matched["track_id"] == 7
+
+
+def test_confirmation_applies_ema_to_range_and_angle(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+    first = mission._normalize_obstacle({
+        "class": "green_buoy",
+        "distance": 2.8,
+        "Buoy angle: ": -10.0,
+        "bbox": [100, 100, 140, 160],
+    })
+    second = mission._normalize_obstacle({
+        "class": "green_buoy",
+        "distance": 2.0,
+        "Buoy angle: ": -6.0,
+        "bbox": [104, 100, 144, 160],
+    })
+
+    assert mission._confirmed_obstacle(first, now=1.0) is None
+    confirmed = mission._confirmed_obstacle(second, now=1.2)
+
+    assert confirmed["distance"] == pytest.approx(2.48)
+    assert mission._detection_angle_deg(confirmed) == pytest.approx(-8.4)
+
+
+def test_trackless_recent_marker_is_suppressed_by_position(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+    detection = mission._normalize_obstacle({
+        "class": "red_buoy",
+        "confidence": 0.9,
+        "distance": 2.0,
+        "angle_deg": 0.0,
+    })
+    marker = mission._estimated_marker_gps(detection)
+    mission.recently_avoided_obstacles = [{
+        "class": task1_module.RED_BUOY_CLASS,
+        "track_id": None,
+        "marker_lat": marker["lat"],
+        "marker_lon": marker["lon"],
+        "expires_at": 10.0,
+    }]
+
+    assert mission._nearest_relevant_obstacle([detection], now=5.0) is None

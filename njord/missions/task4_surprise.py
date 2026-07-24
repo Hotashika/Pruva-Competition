@@ -38,25 +38,38 @@ WAYPOINT_PATH = Path(
 ACTIVE_TASK_NAME = "task4"
 HOLD_MODE_NAME = "HOLD"
 
+# ============================================================
+# ROTA / NAVİGASYON PARAMETRELERİ
+# ============================================================
 EARTH_RADIUS_M = 6_378_137.0
 MIN_VALID_ABS_COORD = 1e-6
 EXACT_ROUTE_LIMIT = 12
 WAYPOINT_TOLERANCE_M = float(os.getenv("TASK4_WAYPOINT_TOLERANCE_M", "1.5"))
-GEOFENCE_RADIUS_M = float(os.getenv("TASK4_GEOFENCE_RADIUS_M", "250.0"))
 
+# ============================================================
+# GÜVENLİK PARAMETRELERİ
+# ============================================================
+GEOFENCE_RADIUS_M = float(os.getenv("TASK4_GEOFENCE_RADIUS_M", "250.0"))
 GPS_TIMEOUT_SEC = 2.0
 HEADING_TIMEOUT_SEC = 2.0
 BRIDGE_STATE_TIMEOUT_SEC = 2.0
+
+# ============================================================
+# VISION PARAMETRELERİ
+# ============================================================
 VISION_DETECTION_TIMEOUT_SEC = 1.0
 
-AVOID_ENTER_DISTANCE_M = 4.5
-AVOID_EXIT_DISTANCE_M = 5.5
+# ============================================================
+# KAÇINMA PARAMETRELERİ
+# ============================================================
+AVOIDANCE_START_DISTANCE_M = 4.5
+AVOIDANCE_EXIT_DISTANCE_M = 5.5
 EMERGENCY_DISTANCE_M = 2.0
-AVOID_LINEAR_X = 0.65
-AVOID_TURN_Z = 0.65
-AVOID_MIN_DURATION_SEC = 0.6
-AVOID_CLEAR_DURATION_SEC = 0.5
-AVOID_MAX_DURATION_SEC = 6.0
+AVOIDANCE_LINEAR_SPEED = 0.65
+AVOIDANCE_TURN_RATE = 0.65
+AVOIDANCE_MIN_DURATION_SEC = 0.6
+AVOIDANCE_CLEAR_DURATION_SEC = 0.5
+AVOIDANCE_TIMEOUT_SEC = 6.0
 
 BUOY_CLASSES = {
     "red_buoy",
@@ -386,7 +399,7 @@ class Task4FastRoute:
         buoys = []
         for detection in detections or []:
             buoy = cls._normalized_buoy(detection)
-            if buoy is not None and buoy["distance"] <= AVOID_EXIT_DISTANCE_M:
+            if buoy is not None and buoy["distance"] <= AVOIDANCE_EXIT_DISTANCE_M:
                 buoys.append(buoy)
         return min(buoys, key=lambda item: item["distance"]) if buoys else None
 
@@ -413,27 +426,27 @@ class Task4FastRoute:
         linear_x = (
             0.0
             if buoy is not None and buoy["distance"] <= EMERGENCY_DISTANCE_M
-            else AVOID_LINEAR_X
+            else AVOIDANCE_LINEAR_SPEED
         )
         publish_cmd_vel(
             self.topics.cmd_vel_pub,
             linear_x=linear_x,
-            angular_z=self.avoid_turn_direction * AVOID_TURN_Z,
+            angular_z=self.avoid_turn_direction * AVOIDANCE_TURN_RATE,
         )
 
     def _update_avoidance(self, buoy, now):
         elapsed = now - self.avoid_started_time
-        if elapsed >= AVOID_MAX_DURATION_SEC:
+        if elapsed >= AVOIDANCE_TIMEOUT_SEC:
             self.enter_failsafe(
-                f"Task 4 obstacle did not clear within {AVOID_MAX_DURATION_SEC:.1f}s"
+                f"Task 4 obstacle did not clear within {AVOIDANCE_TIMEOUT_SEC:.1f}s"
             )
             return
 
-        clear = buoy is None or buoy["distance"] >= AVOID_EXIT_DISTANCE_M
-        if elapsed >= AVOID_MIN_DURATION_SEC and clear:
+        clear = buoy is None or buoy["distance"] >= AVOIDANCE_EXIT_DISTANCE_M
+        if elapsed >= AVOIDANCE_MIN_DURATION_SEC and clear:
             if self.avoid_clear_started_time is None:
                 self.avoid_clear_started_time = now
-            elif now - self.avoid_clear_started_time >= AVOID_CLEAR_DURATION_SEC:
+            elif now - self.avoid_clear_started_time >= AVOIDANCE_CLEAR_DURATION_SEC:
                 stop_vehicle(self.topics.cmd_vel_pub)
                 self.state = MissionState.NAVIGATING
                 self.avoid_started_time = None
@@ -467,7 +480,7 @@ class Task4FastRoute:
         if self.state == MissionState.AVOIDING:
             self._update_avoidance(buoy, now)
             return
-        if buoy is not None and buoy["distance"] <= AVOID_ENTER_DISTANCE_M:
+        if buoy is not None and buoy["distance"] <= AVOIDANCE_START_DISTANCE_M:
             self.state = MissionState.AVOIDING
             self.avoid_started_time = now
             self.avoid_clear_started_time = None

@@ -263,7 +263,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertIsNotNone(target)
         self.assertEqual("starboard", target["side"])
         self.assertAlmostEqual(
-            task2.AVOID_PASS_CLEARANCE_M,
+            task2.AVOIDANCE_PASS_CLEARANCE_M,
             self._target_clearance_m(target),
             places=3,
         )
@@ -322,7 +322,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         target = self.mission.avoidance_target
         self.assertIsNotNone(target)
         self.assertAlmostEqual(
-            task2.AVOID_PASS_CLEARANCE_M,
+            task2.AVOIDANCE_PASS_CLEARANCE_M,
             self._target_clearance_m(target),
             places=3,
         )
