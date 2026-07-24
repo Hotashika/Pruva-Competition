@@ -46,14 +46,13 @@ KINEMATICS_OUTPUT_DIR = (
 ACTIVE_TASK_NAME = "task2"
 HOLD_MODE_NAME = "HOLD"
 
-WAYPOINT_TOLERANCE_M = 1.0
-WAYPOINT_SETTLE_SEC = 0.75
-WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
+# ============================================================
+# GÜVENLİK PARAMETRELERİ
+# ============================================================
 GPS_TIMEOUT_SEC = 2.0
 HEADING_TIMEOUT_SEC = 2.0
 BRIDGE_STATE_TIMEOUT_SEC = 10.0
 MIN_VALID_ABS_COORD = 1e-6
-EARTH_RADIUS_M = 6378137.0
 
 # ============================================================
 # NAVİGASYON PARAMETRELERİ
@@ -68,7 +67,8 @@ EARTH_RADIUS_M = 6378137.0
 # ============================================================
 AVOIDANCE_PASS_CLEARANCE_M = 2.5
 AVOIDANCE_WAYPOINT_TOLERANCE_M = 0.5
-AVOIDANCE_TIMEOUT_SEC = 10.0
+AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M = 0.25
+AVOIDANCE_TIMEOUT_SEC = 20.0
 
 # ============================================================
 # ÇARPIŞMA RİSKİ PARAMETRELERİ
@@ -88,10 +88,10 @@ CONSTANT_BEARING_SPAN_DEG = 8.0
 
 HEAD_ON_HALF_ANGLE_DEG = 15.0
 STAND_ON_GRACE_SEC = 2.5
-AVOID_PASS_CLEARANCE_M = 2.5
-AVOID_TARGET_TOLERANCE_M = 0.5
-AVOID_TARGET_REFRESH_MIN_SHIFT_M = 0.25
-AVOID_TARGET_TIMEOUT_SEC = 20.0
+
+# ============================================================
+# VISION PARAMETRELERİ
+# ============================================================
 VISION_DETECTION_TIMEOUT_SEC = 1.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
@@ -786,8 +786,8 @@ class Task2CollisionAvoidance:
         target = self._offset_gps(
             marker_gps["lat"],
             marker_gps["lon"],
-            north_m=AVOID_PASS_CLEARANCE_M * math.cos(lateral_bearing_rad),
-            east_m=AVOID_PASS_CLEARANCE_M * math.sin(lateral_bearing_rad),
+            north_m=AVOIDANCE_PASS_CLEARANCE_M * math.cos(lateral_bearing_rad),
+            east_m=AVOIDANCE_PASS_CLEARANCE_M * math.sin(lateral_bearing_rad),
         )
         target.update({
             "side": "starboard",
@@ -830,7 +830,7 @@ class Task2CollisionAvoidance:
             self.avoidance_target,
             refreshed_target,
         )
-        if target_shift_m < AVOID_TARGET_REFRESH_MIN_SHIFT_M:
+        if target_shift_m < AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M:
             return
 
         self.avoidance_target = refreshed_target
@@ -853,7 +853,7 @@ class Task2CollisionAvoidance:
             target["lat"],
             target["lon"],
         )
-        if distance <= AVOID_TARGET_TOLERANCE_M:
+        if distance <= AVOIDANCE_WAYPOINT_TOLERANCE_M:
             return True
 
         target_name = "starboard avoidance WP"
@@ -928,7 +928,7 @@ class Task2CollisionAvoidance:
                 dcpa_text,
                 target["lat"],
                 target["lon"],
-                AVOID_PASS_CLEARANCE_M,
+                AVOIDANCE_PASS_CLEARANCE_M,
             )
         )
         self._publish_starboard_avoidance_target()
@@ -941,10 +941,10 @@ class Task2CollisionAvoidance:
             return
 
         elapsed = now - self.avoid_started_time
-        if elapsed >= AVOID_TARGET_TIMEOUT_SEC:
+        if elapsed >= AVOIDANCE_TIMEOUT_SEC:
             self._enter_failsafe(
                 "Starboard avoidance GPS target was not reached within "
-                f"{AVOID_TARGET_TIMEOUT_SEC:.1f}s"
+                f"{AVOIDANCE_TIMEOUT_SEC:.1f}s"
             )
             return
 

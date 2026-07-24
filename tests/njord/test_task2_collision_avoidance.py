@@ -297,13 +297,13 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
 
                 self.assertEqual("starboard", target["side"])
                 self.assertAlmostEqual(
-                    task2.AVOID_PASS_CLEARANCE_M
+                    task2.AVOIDANCE_PASS_CLEARANCE_M
                     * math.cos(right_bearing_rad),
                     north_m,
                     places=3,
                 )
                 self.assertAlmostEqual(
-                    task2.AVOID_PASS_CLEARANCE_M
+                    task2.AVOIDANCE_PASS_CLEARANCE_M
                     * math.sin(right_bearing_rad),
                     east_m,
                     places=3,

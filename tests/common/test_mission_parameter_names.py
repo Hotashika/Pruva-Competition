@@ -28,6 +28,12 @@ DISTANCE_HYSTERESIS_TASKS = {
     "teknofest_task2",
 }
 
+GPS_TARGET_AVOIDANCE_TASKS = {
+    "njord_task1",
+    "njord_task2",
+    "teknofest_task2",
+}
+
 FORBIDDEN_PARAMETER_NAMES = {
     "AVOID_ENTER_DISTANCE_M",
     "AVOID_EXIT_DISTANCE_M",
@@ -39,7 +45,9 @@ FORBIDDEN_PARAMETER_NAMES = {
     "AVOID_CLEAR_DURATION_SEC",
     "AVOID_MAX_DURATION_SEC",
     "AVOID_PASS_CLEARANCE_M",
+    "AVOID_TARGET_TOLERANCE_M",
     "AVOID_TARGET_REFRESH_MIN_SHIFT_M",
+    "AVOID_TARGET_TIMEOUT_SEC",
     "AVOID_WAYPOINT_TOLERANCE_M",
     "AVOID_TIMEOUT_SEC",
     "DETECTION_STALE_SEC",
@@ -77,6 +85,11 @@ def test_avoidance_parameter_names_are_consistent():
     for task_name in DISTANCE_HYSTERESIS_TASKS:
         names = _assigned_names(MISSION_FILES[task_name])
         assert "AVOIDANCE_EXIT_DISTANCE_M" in names, task_name
+    for task_name in GPS_TARGET_AVOIDANCE_TASKS:
+        names = _assigned_names(MISSION_FILES[task_name])
+        assert "AVOIDANCE_PASS_CLEARANCE_M" in names, task_name
+        assert "AVOIDANCE_WAYPOINT_TOLERANCE_M" in names, task_name
+        assert "AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M" in names, task_name
 
 
 def test_parameter_sections_are_grouped():
