@@ -24,6 +24,7 @@ from njord.core import data_writer
 from njord.servers import data_server
 from njord.servers import video_server
 
+os.environ.setdefault("YOLO_OFFLINE", "true")
 
 def launch_child_process(command):
     return subprocess.Popen(
