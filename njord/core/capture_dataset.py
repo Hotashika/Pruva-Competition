@@ -2,102 +2,40 @@ from __future__ import annotations
 
 import math
 import os
-import threading
-import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 import numpy as np
 
 from njord.core.dataset_recorder import DatasetRecorder
 
 
-class ActiveTaskRecordingGate:
-    """Keep a process-safe recording event active while a task heartbeat exists."""
-
-    def __init__(
-        self,
-        record_event: Any,
-        *,
-        task_name: str = "task2",
-        timeout_sec: float = 2.5,
-        clock: Callable[[], float] = time.monotonic,
-    ):
-        normalized_task = "" if task_name is None else str(task_name).strip().lower()
-        if not normalized_task:
-            raise ValueError("task_name must be non-empty")
-
-        timeout_sec = float(timeout_sec)
-        if not math.isfinite(timeout_sec) or timeout_sec <= 0.0:
-            raise ValueError("timeout_sec must be a positive finite number")
-
-        self.task_name = normalized_task
-        self.timeout_sec = timeout_sec
-        self._record_event = record_event
-        self._clock = clock
-        self._last_heartbeat: Optional[float] = None
-        self._lock = threading.Lock()
-        self._record_event.clear()
-
-    def observe(self, active_task: str, *, now: Optional[float] = None) -> bool:
-        """Apply an active-task heartbeat and return the resulting gate state."""
-
-        normalized_task = (
-            "" if active_task is None else str(active_task).strip().lower()
-        )
-        observed_at = self._clock() if now is None else float(now)
-        with self._lock:
-            if normalized_task == self.task_name:
-                self._last_heartbeat = observed_at
-                self._record_event.set()
-                return True
-
-            self._last_heartbeat = None
-            self._record_event.clear()
-            return False
-
-    def expire(self, *, now: Optional[float] = None) -> bool:
-        """Clear a stale task heartbeat; return True only when it expires."""
-
-        checked_at = self._clock() if now is None else float(now)
-        with self._lock:
-            if self._last_heartbeat is None:
-                return False
-            if checked_at - self._last_heartbeat < self.timeout_sec:
-                return False
-
-            self._last_heartbeat = None
-            self._record_event.clear()
-            return True
-
-    def close(self) -> None:
-        with self._lock:
-            self._last_heartbeat = None
-            self._record_event.clear()
-
-
 class CaptureDatasetSession:
-    """Sample synchronized capture frames into a task-specific dataset run."""
+    """Sample synchronized capture frames into a named manual collection run."""
 
     def __init__(
         self,
         output_root: os.PathLike[str] | str,
         *,
-        task_name: str,
+        collection_name: str,
         calibration: Mapping[str, Any],
         record_fps: float = 5.0,
         record_right: bool = True,
         queue_size: int = 64,
     ):
-        normalized_task = "" if task_name is None else str(task_name).strip().lower()
+        normalized_name = (
+            "" if collection_name is None else str(collection_name).strip().lower()
+        )
         if (
-            not normalized_task
-            or normalized_task in (".", "..")
-            or Path(normalized_task).name != normalized_task
-            or "/" in normalized_task
-            or "\\" in normalized_task
+            not normalized_name
+            or normalized_name in (".", "..")
+            or Path(normalized_name).name != normalized_name
+            or "/" in normalized_name
+            or "\\" in normalized_name
         ):
-            raise ValueError("task_name must be a single non-empty directory name")
+            raise ValueError(
+                "collection_name must be a single non-empty directory name"
+            )
 
         record_fps = float(record_fps)
         if not math.isfinite(record_fps) or record_fps <= 0.0:
@@ -105,18 +43,18 @@ class CaptureDatasetSession:
 
         calibration_payload = dict(calibration)
         calibration_payload["dataset_capture"] = {
-            "task_name": normalized_task,
+            "collection_name": normalized_name,
             "record_fps": record_fps,
             "record_right": bool(record_right),
             "record_depth": True,
         }
 
-        self.task_name = normalized_task
+        self.collection_name = normalized_name
         self.record_fps = record_fps
         self.record_interval_ms = max(1, int(round(1000.0 / record_fps)))
         self.last_record_timestamp_ms: Optional[int] = None
         self.recorder = DatasetRecorder(
-            Path(output_root) / normalized_task,
+            Path(output_root) / normalized_name,
             calibration=calibration_payload,
             record_right=record_right,
             queue_size=queue_size,

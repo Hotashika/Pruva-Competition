@@ -1,12 +1,11 @@
 import csv
 import json
 import tempfile
-import threading
 import unittest
 
 import numpy as np
 
-from njord.core.capture_dataset import ActiveTaskRecordingGate, CaptureDatasetSession
+from njord.core.capture_dataset import CaptureDatasetSession
 
 
 def image(value):
@@ -22,7 +21,7 @@ class CaptureDatasetSessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:
             session = CaptureDatasetSession(
                 temporary_dir,
-                task_name="task2",
+                collection_name="manual",
                 calibration={"left": {"fx": 700.0}, "right": {"fx": 700.0}},
                 record_fps=5.0,
             )
@@ -65,7 +64,7 @@ class CaptureDatasetSessionTests(unittest.TestCase):
             run_dir = session.run_dir
             session.close()
 
-            self.assertEqual("task2", run_dir.parent.name)
+            self.assertEqual("manual", run_dir.parent.name)
             self.assertTrue((run_dir / "left" / "00000001.jpg").is_file())
             self.assertTrue((run_dir / "right" / "00000001.jpg").is_file())
             self.assertTrue((run_dir / "depth" / "00000001.npy").is_file())
@@ -102,7 +101,10 @@ class CaptureDatasetSessionTests(unittest.TestCase):
 
             with (run_dir / "calibration.yaml").open(encoding="utf-8") as file:
                 calibration = json.load(file)["camera"]
-            self.assertEqual("task2", calibration["dataset_capture"]["task_name"])
+            self.assertEqual(
+                "manual",
+                calibration["dataset_capture"]["collection_name"],
+            )
             self.assertEqual(5.0, calibration["dataset_capture"]["record_fps"])
 
             with (run_dir / "manifest.json").open(encoding="utf-8") as file:
@@ -110,58 +112,20 @@ class CaptureDatasetSessionTests(unittest.TestCase):
             self.assertEqual("closed", manifest["status"])
             self.assertEqual(2, manifest["frames_written"])
 
-    def test_rejects_invalid_task_name_and_record_rate(self):
+    def test_rejects_invalid_collection_name_and_record_rate(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:
-            with self.assertRaisesRegex(ValueError, "task_name"):
+            with self.assertRaisesRegex(ValueError, "collection_name"):
                 CaptureDatasetSession(
                     temporary_dir,
-                    task_name="../task2",
+                    collection_name="../manual",
                     calibration={},
                 )
             with self.assertRaisesRegex(ValueError, "record_fps"):
                 CaptureDatasetSession(
                     temporary_dir,
-                    task_name="task2",
+                    collection_name="manual",
                     calibration={},
                     record_fps=0.0,
                 )
-
-
-class ActiveTaskRecordingGateTests(unittest.TestCase):
-    def test_recording_stays_off_until_task2_heartbeat_arrives(self):
-        record_event = threading.Event()
-        gate = ActiveTaskRecordingGate(
-            record_event,
-            task_name="task2",
-            timeout_sec=2.5,
-        )
-
-        self.assertFalse(record_event.is_set())
-        self.assertTrue(gate.observe("task2", now=10.0))
-        self.assertTrue(record_event.is_set())
-        self.assertFalse(gate.expire(now=12.4))
-        self.assertTrue(record_event.is_set())
-
-    def test_recording_stops_after_heartbeat_timeout(self):
-        record_event = threading.Event()
-        gate = ActiveTaskRecordingGate(
-            record_event,
-            task_name="task2",
-            timeout_sec=2.5,
-        )
-
-        gate.observe("task2", now=10.0)
-        self.assertTrue(gate.expire(now=12.5))
-        self.assertFalse(record_event.is_set())
-
-    def test_another_active_task_stops_task2_recording_immediately(self):
-        record_event = threading.Event()
-        gate = ActiveTaskRecordingGate(record_event, task_name="task2")
-
-        gate.observe("task2", now=10.0)
-        self.assertFalse(gate.observe("task3", now=11.0))
-        self.assertFalse(record_event.is_set())
-
-
 if __name__ == "__main__":
     unittest.main()

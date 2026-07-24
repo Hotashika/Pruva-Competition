@@ -90,9 +90,9 @@ def run_capture(
         stop_event=None,
         ready_queue=None,
         dataset_output_root=None,
-        dataset_task=None,
+        dataset_name=None,
         dataset_record_fps=5.0,
-        dataset_record_event=None,
+        publish_shared_memory=True,
 ):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -108,7 +108,6 @@ def run_capture(
     calib_shm = None
     dataset_session = None
     dataset_start_error = None
-    dataset_start_blocked = False
     ready_sent = False
 
     try:
@@ -141,106 +140,92 @@ def run_capture(
         sensors_data = sl.SensorsData()
         dataset_calibration = _calibration_payload(cam_info)
 
-        if dataset_output_root is not None and dataset_record_event is None:
+        if dataset_output_root is not None:
             try:
                 dataset_session = CaptureDatasetSession(
                     dataset_output_root,
-                    task_name=dataset_task,
+                    collection_name=dataset_name,
                     calibration=dataset_calibration,
                     record_fps=dataset_record_fps,
                     record_right=True,
                 )
                 print(
-                    f"[DATASET] {dataset_session.task_name} recording enabled: "
+                    f"[DATASET] {dataset_session.collection_name} recording enabled: "
                     f"{dataset_session.run_dir}"
                 )
             except Exception as exc:
                 dataset_start_error = str(exc)
-                dataset_start_blocked = True
                 print(f"[DATASET] Recording could not be started: {exc}")
-        elif dataset_output_root is not None:
-            print(f"[DATASET] Waiting for active task: {dataset_task}")
-
         # ------------------------------------------------------------------
         # Create Shared Memory
         # ------------------------------------------------------------------
-        rgb_shm = _create_owned_shared_memory(
-            rgb_shm_name,
-            int(np.prod(RGB_SHAPE) * np.dtype(np.uint8).itemsize),
-        )
+        if publish_shared_memory:
+            rgb_shm = _create_owned_shared_memory(
+                rgb_shm_name,
+                int(np.prod(RGB_SHAPE) * np.dtype(np.uint8).itemsize),
+            )
 
-        depth_shm = _create_owned_shared_memory(
-            depth_shm_name,
-            int(np.prod(DEPTH_SHAPE) * np.dtype(np.float32).itemsize),
-        )
+            depth_shm = _create_owned_shared_memory(
+                depth_shm_name,
+                int(np.prod(DEPTH_SHAPE) * np.dtype(np.float32).itemsize),
+            )
 
-        depth_vision_shm = _create_owned_shared_memory(
-            depth_vision_shm_name,
-            int(np.prod(RGB_SHAPE) * np.dtype(np.uint8).itemsize),
-        )
+            depth_vision_shm = _create_owned_shared_memory(
+                depth_vision_shm_name,
+                int(np.prod(RGB_SHAPE) * np.dtype(np.uint8).itemsize),
+            )
 
-        meta_shm = _create_owned_shared_memory(
-            meta_shm_name,
-            int(np.prod(shared_state.META_SHAPE) * np.dtype(np.int64).itemsize),
-        )
+            meta_shm = _create_owned_shared_memory(
+                meta_shm_name,
+                int(np.prod(shared_state.META_SHAPE) * np.dtype(np.int64).itemsize),
+            )
 
-        imu_shm = _create_owned_shared_memory(
-            imu_shm_name,
-            int(np.prod(shared_state.IMU_SHAPE) * np.dtype(np.float64).itemsize),
-        )
+            imu_shm = _create_owned_shared_memory(
+                imu_shm_name,
+                int(np.prod(shared_state.IMU_SHAPE) * np.dtype(np.float64).itemsize),
+            )
 
-        calib_shm = _create_owned_shared_memory(
-            calib_shm_name,
-            int(np.prod(shared_state.CALIB_SHAPE) * np.dtype(np.float64).itemsize),
-        )
+            calib_shm = _create_owned_shared_memory(
+                calib_shm_name,
+                int(np.prod(shared_state.CALIB_SHAPE) * np.dtype(np.float64).itemsize),
+            )
 
-        rgb_buf = np.ndarray(
-            RGB_SHAPE,
-            dtype=np.uint8,
-            buffer=rgb_shm.buf,
-        )
+            rgb_buf = np.ndarray(RGB_SHAPE, dtype=np.uint8, buffer=rgb_shm.buf)
+            depth_buf = np.ndarray(
+                DEPTH_SHAPE,
+                dtype=np.float32,
+                buffer=depth_shm.buf,
+            )
+            depth_vision_buf = np.ndarray(
+                RGB_SHAPE,
+                dtype=np.uint8,
+                buffer=depth_vision_shm.buf,
+            )
+            meta_buf = np.ndarray(
+                shared_state.META_SHAPE,
+                dtype=np.int64,
+                buffer=meta_shm.buf,
+            )
+            imu_buf = np.ndarray(
+                shared_state.IMU_SHAPE,
+                dtype=np.float64,
+                buffer=imu_shm.buf,
+            )
+            calib_buf = np.ndarray(
+                shared_state.CALIB_SHAPE,
+                dtype=np.float64,
+                buffer=calib_shm.buf,
+            )
 
-        depth_buf = np.ndarray(
-            DEPTH_SHAPE,
-            dtype=np.float32,
-            buffer=depth_shm.buf,
-        )
-
-        depth_vision_buf = np.ndarray(
-            RGB_SHAPE,
-            dtype=np.uint8,
-            buffer=depth_vision_shm.buf,
-        )
-
-        meta_buf = np.ndarray(
-            shared_state.META_SHAPE,
-            dtype=np.int64,
-            buffer=meta_shm.buf,
-        )
-
-        imu_buf = np.ndarray(
-            shared_state.IMU_SHAPE,
-            dtype=np.float64,
-            buffer=imu_shm.buf,
-        )
-
-        calib_buf = np.ndarray(
-            shared_state.CALIB_SHAPE,
-            dtype=np.float64,
-            buffer=calib_shm.buf,
-        )
-
-        meta_buf[:] = 0
-        imu_buf[:] = 0.0
-        calib_buf[:] = (fx, fy, cx, cy)
+            meta_buf[:] = 0
+            imu_buf[:] = 0.0
+            calib_buf[:] = (fx, fy, cx, cy)
         frame_index = 0
 
         if ready_queue is not None:
             ready_payload = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
             if dataset_session is not None:
                 ready_payload["dataset_run_dir"] = str(dataset_session.run_dir)
-            elif dataset_output_root is not None and dataset_record_event is not None:
-                ready_payload["dataset_waiting_for_task"] = str(dataset_task)
             if dataset_start_error is not None:
                 ready_payload["dataset_error"] = dataset_start_error
             ready_queue.put(ready_payload)
@@ -250,46 +235,13 @@ def run_capture(
         # Capture Loop
         # ------------------------------------------------------------------
         while stop_event is None or not stop_event.is_set():
-            if dataset_output_root is not None:
-                recording_requested = (
-                    dataset_record_event is None or dataset_record_event.is_set()
-                )
-                if not recording_requested:
-                    dataset_start_blocked = False
-                    if dataset_session is not None:
-                        closing_session = dataset_session
-                        dataset_session = None
-                        try:
-                            closing_session.close()
-                            print(
-                                "[DATASET] Task recording finalized: "
-                                f"{closing_session.run_dir}"
-                            )
-                        except Exception as exc:
-                            print(f"[DATASET] Recording finalization failed: {exc}")
-                elif dataset_session is None and not dataset_start_blocked:
-                    try:
-                        dataset_session = CaptureDatasetSession(
-                            dataset_output_root,
-                            task_name=dataset_task,
-                            calibration=dataset_calibration,
-                            record_fps=dataset_record_fps,
-                            record_right=True,
-                        )
-                        print(
-                            f"[DATASET] {dataset_session.task_name} recording enabled: "
-                            f"{dataset_session.run_dir}"
-                        )
-                    except Exception as exc:
-                        dataset_start_blocked = True
-                        print(f"[DATASET] Recording could not be started: {exc}")
-
             if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 continue
 
             zed.retrieve_image(rgb_mat, sl.VIEW.LEFT)
             zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
-            zed.retrieve_image(depth_vision_mat, sl.VIEW.DEPTH)
+            if publish_shared_memory:
+                zed.retrieve_image(depth_vision_mat, sl.VIEW.DEPTH)
             zed.get_sensors_data(sensors_data, sl.TIME_REFERENCE.IMAGE)
             timestamp_ms = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_milliseconds()
 
@@ -304,19 +256,20 @@ def run_capture(
             frame_index += 1
             left_image = rgb_mat.get_data()
             depth_image = depth_mat.get_data()
-            if lock is None:
-                rgb_buf[:] = left_image
-                depth_buf[:] = depth_image
-                depth_vision_buf[:] = depth_vision_mat.get_data()
-                imu_buf[:] = (roll, pitch, yaw)
-                meta_buf[:] = (frame_index, timestamp_ms)
-            else:
-                with lock:
+            if publish_shared_memory:
+                if lock is None:
                     rgb_buf[:] = left_image
                     depth_buf[:] = depth_image
                     depth_vision_buf[:] = depth_vision_mat.get_data()
                     imu_buf[:] = (roll, pitch, yaw)
                     meta_buf[:] = (frame_index, timestamp_ms)
+                else:
+                    with lock:
+                        rgb_buf[:] = left_image
+                        depth_buf[:] = depth_image
+                        depth_vision_buf[:] = depth_vision_mat.get_data()
+                        imu_buf[:] = (roll, pitch, yaw)
+                        meta_buf[:] = (frame_index, timestamp_ms)
 
             if dataset_session is not None:
                 try:
@@ -339,9 +292,9 @@ def run_capture(
                     except Exception as close_exc:
                         print(f"[DATASET] Recorder close failed: {close_exc}")
                     dataset_session = None
-                    dataset_start_blocked = True
+                    raise RuntimeError("Dataset recording stopped after a write failure") from exc
 
-            if frame_ready_event is not None:
+            if publish_shared_memory and frame_ready_event is not None:
                 frame_ready_event.set()
 
     except Exception as exc:
