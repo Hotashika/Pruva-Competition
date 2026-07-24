@@ -26,6 +26,7 @@ from teknofest.config.mission_config import (
 from teknofest.servers import data_server
 from utils import waypoint_server
 
+os.environ.setdefault("YOLO_OFFLINE", "true")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Start the selected TEKNOFEST mission.")
