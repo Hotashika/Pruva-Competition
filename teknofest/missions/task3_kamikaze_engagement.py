@@ -71,7 +71,7 @@ TEST_MODE = False  # Yalnızca ayrıntılı log içindir; sensör verisi üretme
 SAFETY_STOP_DISTANCE = 1.0
 MIN_TARGET_CONFIDENCE = 0.65
 IMPACT_THRESHOLD_MPS2 = 4.0
-USE_FORCE_ARM = False
+USE_FORCE_ARM = True
 
 
 class MissionState(Enum):
@@ -531,7 +531,7 @@ class Task3Node(Node):
         self.active_task_pub = self.create_publisher(String, '/mission/active_task', 10)
         self.active_task_timer = self.create_timer(1.0, self._publish_active_task)
 
-        # Bridge gerçek Pixhawk SCR_USER1 parametresini Int32 /mission_start
+        # Bridge gerçek Pixhawk SCR_USER2 parametresini Int32 /mission_start
         # mesajına çevirir. Farklı isim/türde ikinci bir sahte komut kanalı yoktur.
         self.mission_start_sub = self.create_subscription(
             Int32, '/mission_start', self.mission_start_callback, 10
@@ -711,7 +711,7 @@ class Task3Node(Node):
         label = "ACİL DISARM" if int(command) == 99 else "STOP DISARM"
         try:
             if self._disarm_with_retries(label):
-                # Bridge SCR_USER1 parametresini ancak gerçek DISARM başarısı
+                # Bridge SCR_USER2 parametresini ancak gerçek DISARM başarısı
                 # sonrasında sıfırlasın. Başarısızlıkta ACK göndermemek komutun
                 # bridge tarafından yeniden denenmesini sağlar.
                 self._ack_mission_command(command)

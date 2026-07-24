@@ -255,7 +255,16 @@ class BaseYOLODetector:
 
 
 class BuoyDetector(BaseYOLODetector):
-    REQUIRED_CLASSES = {"red_buoy", "green_buoy", "black_buoy"}
+    # Task 1 turuncu parkur sinirini, Task 2 sari engeli, Task 3 ise hedef
+    # rengini kullanir. Model eksik sinifla acilirsa bir gorevin sessizce
+    # calismamasi yerine sistem baslangicta acik hata vermelidir.
+    REQUIRED_CLASSES = {
+        "red_buoy",
+        "green_buoy",
+        "black_buoy",
+        "orange_buoy",
+        "yellow_buoy",
+    }
 
     def __init__(
             self,

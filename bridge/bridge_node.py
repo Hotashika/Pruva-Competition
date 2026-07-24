@@ -30,7 +30,13 @@ from utils.pixhawk_waypoints import mission_items_to_qgc
 from utils.waypoint_server import DEFAULT_WAYPOINT_DIRECTORY, overwrite_waypoint_file
 from utils.battery import battery_percentage_from_voltage
 
-MISSION_PARAM_NAME = "SCR_USER1"
+# TEKNOFEST komut sistemi Mission Planner'daki SCR_USER2 parametresini kullanir.
+# Ortam degiskeni yalniz farkli bir saha kurulumu gerektiğinde kontrollu override
+# saglar; varsayilan ve dokumante edilen parametre SCR_USER2'dir.
+MISSION_PARAM_NAME = (
+    os.getenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER2").strip()
+    or "SCR_USER2"
+)
 MISSION_IDLE = 0
 MISSION_1 = 1
 MISSION_2 = 2
@@ -140,6 +146,10 @@ class OrangeCubeBridgeNode(Node):
             "mission_start_retry_sec",
             float(os.getenv("MAVLINK_MISSION_START_RETRY_SEC", "1.0")),
         )
+        self.declare_parameter(
+            "waypoint_prefix",
+            os.getenv("MAVLINK_WAYPOINT_PREFIX", "njord"),
+        )
 
         self.connection_string = self.get_parameter("connection_string").value
         self.baud = int(self.get_parameter("baud").value)
@@ -160,6 +170,15 @@ class OrangeCubeBridgeNode(Node):
         self.mission_start_retry_sec = float(
             self.get_parameter("mission_start_retry_sec").value
         )
+        waypoint_prefix = str(self.get_parameter("waypoint_prefix").value).strip()
+        if not waypoint_prefix or any(
+                char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                for char in waypoint_prefix
+        ):
+            raise ValueError(
+                "waypoint_prefix yalniz harf, rakam, '-' ve '_' icerebilir."
+            )
+        self.waypoint_prefix = waypoint_prefix
 
         self.master = None
         self.connected = False
@@ -1004,7 +1023,8 @@ class OrangeCubeBridgeNode(Node):
         self.mission_download_retry_count = 0
         self._request_mission_list()
         self.get_logger().info(
-            f"Pixhawk mission listesi njord_task{mission_number}.waypoints icin isteniyor."
+            f"Pixhawk mission listesi "
+            f"{self.waypoint_prefix}_task{mission_number}.waypoints icin isteniyor."
         )
 
     def _request_mission_list(self):
@@ -1067,7 +1087,7 @@ class OrangeCubeBridgeNode(Node):
             return
 
         task_number = self.mission_download_task
-        filename = f"njord_task{task_number}.waypoints"
+        filename = f"{self.waypoint_prefix}_task{task_number}.waypoints"
         try:
             content = mission_items_to_qgc(self.mission_download_items.values())
             destination = overwrite_waypoint_file(

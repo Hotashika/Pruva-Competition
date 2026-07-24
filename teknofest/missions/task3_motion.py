@@ -1,30 +1,43 @@
-"""Task 3 boyunca kullanılan ortak skid-steer dönüş komutu."""
+"""Task 3 boyunca kullanilan ortak skid-steer donus komutu."""
 
-from utils.mavlink_utilities import publish_cmd_vel
+try:
+    from utils.mavlink_utilities import (
+        DEFAULT_SKID_STEER_MAX_YAW_OFFSET,
+        DEFAULT_SKID_STEER_TURN_THRUST,
+        publish_skid_steer_turn,
+    )
+except ImportError:
+    # Sensor-flow birim testleri mavlink_utilities icin kucuk bir fake modul
+    # kurar. Uretim kodunda her zaman yukaridaki ortak yardimci kullanilir.
+    from utils.mavlink_utilities import publish_cmd_vel
+
+    DEFAULT_SKID_STEER_TURN_THRUST = 0.18
+    DEFAULT_SKID_STEER_MAX_YAW_OFFSET = 0.18
+
+    def publish_skid_steer_turn(
+            cmd_vel_pub,
+            angular_z,
+            base_thrust=DEFAULT_SKID_STEER_TURN_THRUST,
+            max_yaw_offset=DEFAULT_SKID_STEER_MAX_YAW_OFFSET,
+    ):
+        limit = abs(float(max_yaw_offset))
+        limited = max(-limit, min(limit, float(angular_z)))
+        publish_cmd_vel(cmd_vel_pub, float(base_thrust), limited)
+        return float(base_thrust), limited
 
 
-# Bu ikili sahadaki Pixhawk skid-steer mikseri için arama aşamasında
-# doğrulanan komuttur. Her aşamanın farklı bir "saf yaw" davranışı
-# kullanması, aynı araçta farklı motor sonuçları üretmemelidir.
-TASK3_TURN_BASE_THRUST = 0.18
-TASK3_MAX_YAW_OFFSET_RAD = 0.18
+# Bu degerler sahadaki Pixhawk skid-steer mikseri icin dogrulanan komuttur.
+# Tum gorevlerin ayni arac donus sozlesmesini kullanmasi gerekir.
+TASK3_TURN_BASE_THRUST = DEFAULT_SKID_STEER_TURN_THRUST
+TASK3_MAX_YAW_OFFSET_RAD = DEFAULT_SKID_STEER_MAX_YAW_OFFSET
 
 
 def publish_task3_turn(cmd_vel_pub, angular_z):
-    """Bütün Task 3 aşamalarında aynı dönüş sözleşmesini uygula.
+    """Task 3 asamalarinda ortak, sinirli donus komutunu uygula."""
 
-    Motorların gerçek sol/sağ karışımı Pixhawk tarafından yapılır. Bu
-    fonksiyon doğrudan motor çıkışı üretmez; sahada doğrulanan taban itki ve
-    yaw-offset sınırlarını tek yerde tutar.
-    """
-
-    limited_angular = max(
-        -TASK3_MAX_YAW_OFFSET_RAD,
-        min(TASK3_MAX_YAW_OFFSET_RAD, float(angular_z)),
-    )
-    publish_cmd_vel(
+    return publish_skid_steer_turn(
         cmd_vel_pub,
-        linear_x=TASK3_TURN_BASE_THRUST,
-        angular_z=limited_angular,
+        angular_z=angular_z,
+        base_thrust=TASK3_TURN_BASE_THRUST,
+        max_yaw_offset=TASK3_MAX_YAW_OFFSET_RAD,
     )
-    return TASK3_TURN_BASE_THRUST, limited_angular

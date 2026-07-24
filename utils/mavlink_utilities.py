@@ -13,6 +13,9 @@ from sensor_msgs.msg import Imu, NavSatFix, BatteryState
 from std_msgs.msg import String, Float32
 from std_srvs.srv import Trigger
 
+DEFAULT_SKID_STEER_TURN_THRUST = 0.18
+DEFAULT_SKID_STEER_MAX_YAW_OFFSET = 0.18
+
 
 def parse_bridge_state(text):
     """Parse the bridge's ``connected/armed/mode`` status string."""
@@ -535,6 +538,30 @@ def publish_cmd_vel(cmd_vel_pub, linear_x, angular_z):
     cmd_vel_pub.publish(msg)
 
 
+def publish_skid_steer_turn(
+        cmd_vel_pub,
+        angular_z,
+        base_thrust=DEFAULT_SKID_STEER_TURN_THRUST,
+        max_yaw_offset=DEFAULT_SKID_STEER_MAX_YAW_OFFSET,
+):
+    """Pixhawk skid-steer mikseri icin ortak, sinirli donus komutu yayinla.
+
+    Bu aracta sifir ileri itki + yaw komutu sahada guvenilir tek-motor
+    donusu uretmedi. Bu nedenle tum gorevler ayni kucuk taban itkiyi ve
+    sinirli yaw offsetini kullanir. Motor karisimi yine Pixhawk tarafindadir.
+    """
+
+    limit = abs(float(max_yaw_offset))
+    limited_angular = max(-limit, min(limit, float(angular_z)))
+    thrust = max(0.0, min(1.0, float(base_thrust)))
+    publish_cmd_vel(
+        cmd_vel_pub,
+        linear_x=thrust,
+        angular_z=limited_angular,
+    )
+    return thrust, limited_angular
+
+
 def publish_set_position(position_target_pub, lat, lon, altitude=20.0):
     """
     /cube/set_position topic'ine GPS hedefi yayinlar.
@@ -601,7 +628,7 @@ def align_heading_to_gps_target(
         target_name="GPS target",
         tolerance_deg=8.0,
         kp=0.015,
-        max_angular_z=0.35
+        max_angular_z=DEFAULT_SKID_STEER_MAX_YAW_OFFSET
 ):
     target_bearing = calculate_bearing(
         current_lat,
@@ -626,7 +653,11 @@ def align_heading_to_gps_target(
     # uygular. Compass bearing hatasi da hedef sagdaysa pozitiftir; bu nedenle
     # iki isaret dogrudan ayni yönde kullanilmalidir.
     angular_z = max(-max_angular_z, min(max_angular_z, kp * heading_error))
-    publish_cmd_vel(cmd_vel_pub, linear_x=0.0, angular_z=angular_z)
+    _, angular_z = publish_skid_steer_turn(
+        cmd_vel_pub,
+        angular_z=angular_z,
+        max_yaw_offset=max_angular_z,
+    )
 
     if logger is not None:
         logger.info(

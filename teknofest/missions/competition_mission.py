@@ -1,6 +1,7 @@
 """TEKNOFEST parkurlarını tek ARM/GUIDED yaşam döngüsünde sırayla çalıştırır."""
 
 import sys
+import math
 import time
 from enum import Enum, auto
 from pathlib import Path
@@ -10,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import rclpy
+from sensor_msgs.msg import Imu
 from std_msgs.msg import String
 
 from teknofest.missions.task1_point_tracking import (
@@ -42,6 +44,7 @@ class CompetitionState(Enum):
     PARKUR_1 = auto()
     PARKUR_2 = auto()
     PARKUR_3 = auto()
+    COMPLETE = auto()
     FAILSAFE = auto()
 
 
@@ -63,6 +66,7 @@ class CompetitionNode(Task1Node):
             self.mission_clients,
             target_class=ACTIVE_TARGET_CLASS,
         )
+        self.create_subscription(Imu, "/cube/imu", self.imu_callback, 10)
 
         routes = build_competition_routes(competition_points)
         self.task1.waypoints = routes["task1"]
@@ -103,6 +107,32 @@ class CompetitionNode(Task1Node):
                 state["connected"], state["armed"], state["mode"]
             )
         self.task3.update_bridge_state(msg.data)
+
+    def detection_callback(self, msg):
+        super().detection_callback(msg)
+        if hasattr(self, "task3") and self.last_detection_message_time is not None:
+            self.task3.update_vision_timestamp()
+
+    def imu_callback(self, msg):
+        if not hasattr(self, "task3"):
+            return
+        values = (
+            float(msg.angular_velocity.z),
+            float(msg.linear_acceleration.x),
+            float(msg.linear_acceleration.y),
+            float(msg.linear_acceleration.z),
+        )
+        covariance = getattr(msg, "linear_acceleration_covariance", None)
+        if (
+                not all(math.isfinite(value) for value in values)
+                or (
+                    covariance is not None
+                    and len(covariance) > 0
+                    and covariance[0] < 0.0
+                )
+        ):
+            return
+        self.task3.update_imu(*values)
 
     def _transition_to(self, state, task_name):
         stop_vehicle(self.mission_topics.cmd_vel_pub)
@@ -150,6 +180,11 @@ class CompetitionNode(Task1Node):
                     self._transition_to(CompetitionState.PARKUR_3, "task3")
 
             elif self.competition_state == CompetitionState.PARKUR_3:
+                if self.task3.state == Task3State.DONE:
+                    stop_vehicle(self.mission_topics.cmd_vel_pub)
+                    self.competition_state = CompetitionState.COMPLETE
+                    self.get_logger().info("Tum TEKNOFEST parkurlari tamamlandi.")
+                    return
                 if not self.task3.mission_enabled:
                     ok, reason = self.task3.start_mission()
                     if not ok:
@@ -163,6 +198,10 @@ class CompetitionNode(Task1Node):
                 )
                 if self.task3.state == Task3State.FAILSAFE:
                     self._enter_competition_failsafe("Task 3 FAILSAFE.")
+                elif self.task3.state == Task3State.DONE:
+                    stop_vehicle(self.mission_topics.cmd_vel_pub)
+                    self.competition_state = CompetitionState.COMPLETE
+                    self.get_logger().info("Tum TEKNOFEST parkurlari tamamlandi.")
         except Exception as exc:  # noqa: BLE001
             self._enter_competition_failsafe(f"Competition timer hatası: {exc}")
 
@@ -199,7 +238,8 @@ def main(args=None):
         node.get_logger().info("Kesintisiz competition görev döngüsü başladı.")
         while (
                 rclpy.ok()
-                and node.competition_state != CompetitionState.FAILSAFE
+                and node.competition_state
+                not in (CompetitionState.FAILSAFE, CompetitionState.COMPLETE)
         ):
             rclpy.spin_once(node, timeout_sec=0.1)
     except KeyboardInterrupt:

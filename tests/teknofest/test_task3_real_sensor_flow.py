@@ -883,6 +883,16 @@ class Task3RealSensorFlowTests(unittest.TestCase):
             methods["_read_mavlink_messages"],
         )
 
+    def test_bridge_uses_scr_user2_as_the_default_mission_parameter(self):
+        source_path = REPO_ROOT / "bridge" / "bridge_node.py"
+        source = source_path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'os.getenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER2")',
+            source,
+        )
+        self.assertNotIn("SCR_USER1", source)
+
     def test_manager_failsafe_when_total_mission_time_expires(self):
         manager = self._ready_task_manager()
         clock.advance(t3.MISSION_TOTAL_TIMEOUT_SEC + 0.1)

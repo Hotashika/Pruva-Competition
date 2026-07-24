@@ -12,6 +12,7 @@ from pathlib import Path
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
+ZED_STARTUP_TIMEOUT_SEC = float(os.getenv("ZED_STARTUP_TIMEOUT_SEC", "60.0"))
 if COMPETITION_ROOT not in sys.path:
     sys.path.insert(0, COMPETITION_ROOT)
 
@@ -84,9 +85,14 @@ def stop_child_process(name, process, timeout_sec=5.0, sig=signal.SIGINT):
     process.wait(timeout=2)
 
 
-def monitor_child_processes(processes, shutdown_event, poll_interval_sec=0.25):
+def monitor_child_processes(
+        processes,
+        monitor_stop_event,
+        system_stop_event,
+        poll_interval_sec=0.25,
+):
     """Kritik bir ROS alt prosesi kapanırsa ana veri döngüsünü durdurur."""
-    while shutdown_event is not None and not shutdown_event.is_set():
+    while monitor_stop_event is not None and not monitor_stop_event.is_set():
         for name, process in processes:
             if process is None:
                 continue
@@ -96,7 +102,9 @@ def monitor_child_processes(processes, shutdown_event, poll_interval_sec=0.25):
                     f"[SYSTEM] CRITICAL: {name} beklenmedik şekilde kapandı "
                     f"(exit={return_code}). Sistem güvenli kapatılıyor."
                 )
-                shutdown_event.set()
+                if system_stop_event is not None:
+                    system_stop_event.set()
+                monitor_stop_event.set()
                 return
         time.sleep(poll_interval_sec)
 
@@ -132,12 +140,15 @@ def start_capture_process():
     process.start()
 
     try:
-        ready_msg = ready_queue.get(timeout=20)
+        ready_msg = ready_queue.get(timeout=ZED_STARTUP_TIMEOUT_SEC)
     except queue.Empty as exc:
         stop_event.set()
         process.terminate()
         process.join(timeout=2)
-        raise RuntimeError("ZED capture process did not become ready in time.") from exc
+        raise RuntimeError(
+            "ZED capture process did not become ready in time "
+            f"({ZED_STARTUP_TIMEOUT_SEC:.0f}s)."
+        ) from exc
 
     if "error" in ready_msg:
         stop_event.set()
@@ -160,9 +171,7 @@ if __name__ == "__main__":
     frame_ready_event = None
     p_bridge = None
     p_vision = None
-    p_teknofest_task1 = None
-    p_teknofest_task2 = None
-    p_teknofest_task3 = None
+    p_mission_manager = None
     child_monitor_stop_event = None
 
     try:
@@ -199,39 +208,29 @@ if __name__ == "__main__":
 
         vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
+        mission_manager_path = os.path.join(
+            PROJECT_ROOT,
+            "missions",
+            "mission_manager.py",
+        )
 
         vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
-
-        ################################################################################################################
-        # SETUP TEKNOFEST MISSION PATHS
-        ################################################################################################################
-        teknofest_task1_path = os.path.join(PROJECT_ROOT, "missions", "task1_point_tracking.py")
-        teknofest_task2_path = os.path.join(PROJECT_ROOT, "missions", "task2_point_tracking_task_in_an_environment_with_obstacle.py")
-        teknofest_task3_path = os.path.join(PROJECT_ROOT, "missions", "task3_kamikaze_engagement.py")
-        ################################################################################################################
+        bridge_teknofest_setup = (
+            "export MAVLINK_MISSION_PARAM_NAME=SCR_USER2 && "
+            "export MAVLINK_WAYPOINT_PREFIX=teknofest"
+        )
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
         )
         cmd_bridge = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
+            f"{ros2_setup} && {python_path_setup} && {bridge_teknofest_setup} && "
+            f"{shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
-        ################################################################################################################
-        # SETUP TEKNOFEST MISSION COMMANDS
-        ################################################################################################################
-
-        # cmd_teknofest_task1 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task1_path)}"
-        # )
-
-        # cmd_teknofest_task2 = (
-        #     f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task2_path)}"
-        # )
-
-        cmd_teknofest_task3 = (
-            f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(teknofest_task3_path)}"
+        cmd_mission_manager = (
+            f"{ros2_setup} && {python_path_setup} && "
+            f"{shlex.quote(sys.executable)} {shlex.quote(mission_manager_path)}"
         )
-        ################################################################################################################
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
@@ -241,17 +240,13 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        ################################################################################################################
-        #   TEKNOFEST MISSION START CMD
-        ################################################################################################################
-        # p_teknofest_task1 = launch_child_process(cmd_teknofest_task1)
-        # print(f" -> TEKNOFEST Mission 1 Node launched (PID: {p_teknofest_task1.pid})\n")
-
-        # p_teknofest_task2 = launch_child_process(cmd_teknofest_task2)
-        # print(f" -> TEKNOFEST Mission 2 Node launched (PID: {p_teknofest_task2.pid})\n")
-
-        p_teknofest_task3 = launch_child_process(cmd_teknofest_task3)
-        print(f" -> TEKNOFEST Mission 3 Node launched (PID: {p_teknofest_task3.pid})\n")
+        # Tek manager SCR_USER2=1/2/3 komutuna gore yalniz secilen
+        # algoritmanin araca hareket komutu gondermesine izin verir.
+        p_mission_manager = launch_child_process(cmd_mission_manager)
+        print(
+            f" -> TEKNOFEST Mission Manager launched "
+            f"(PID: {p_mission_manager.pid})\n"
+        )
         child_monitor_stop_event = threading.Event()
         threading.Thread(
             target=monitor_child_processes,
@@ -259,14 +254,13 @@ if __name__ == "__main__":
                 (
                     ("Bridge Node", p_bridge),
                     ("Vision Node", p_vision),
-                    ("TEKNOFEST Mission 3 Node", p_teknofest_task3),
+                    ("TEKNOFEST Mission Manager", p_mission_manager),
                 ),
                 child_monitor_stop_event,
+                capture_stop_event,
             ),
             daemon=True,
         ).start()
-        ################################################################################################################
-
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
         data_writer.run(
@@ -294,7 +288,7 @@ if __name__ == "__main__":
         # Mission once kapanir; SIGINT handler'i bridge hâlâ ayaktayken araci
         # durdurup DISARM eder. Ardindan vision, en son bridge kapatilir.
         subprocesses = (
-            ("TEKNOFEST Mission 3 Node", p_teknofest_task3, 7.0),
+            ("TEKNOFEST Mission Manager", p_mission_manager, 7.0),
             ("Vision Node", p_vision, 3.0),
             ("Bridge Node", p_bridge, 5.0),
         )
