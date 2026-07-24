@@ -272,6 +272,43 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             self.topics.position_target_pub.messages[-1],
         )
 
+    def test_avoidance_target_is_always_right_of_entry_heading(self):
+        for heading in (0.0, 90.0, 225.0):
+            with self.subTest(heading=heading):
+                self.mission.update_heading(heading, now=10.0)
+                target = self.mission._create_starboard_avoidance_target({
+                    "distance": 3.0,
+                    "angle": -30.0,
+                })
+
+                mean_lat = math.radians(
+                    (target["marker_lat"] + target["lat"]) / 2.0
+                )
+                north_m = (
+                    math.radians(target["lat"] - target["marker_lat"])
+                    * task2.EARTH_RADIUS_M
+                )
+                east_m = (
+                    math.radians(target["lon"] - target["marker_lon"])
+                    * task2.EARTH_RADIUS_M
+                    * math.cos(mean_lat)
+                )
+                right_bearing_rad = math.radians((heading + 90.0) % 360.0)
+
+                self.assertEqual("starboard", target["side"])
+                self.assertAlmostEqual(
+                    task2.AVOID_PASS_CLEARANCE_M
+                    * math.cos(right_bearing_rad),
+                    north_m,
+                    places=3,
+                )
+                self.assertAlmostEqual(
+                    task2.AVOID_PASS_CLEARANCE_M
+                    * math.sin(right_bearing_rad),
+                    east_m,
+                    places=3,
+                )
+
     def test_closing_buoy_is_used_as_collision_target(self):
         for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
             self._refresh_sensors(now)

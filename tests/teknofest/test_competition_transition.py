@@ -199,7 +199,14 @@ def test_finished_task3_finishes_competition(monkeypatch):
         competition.CompetitionState.PARKUR_3,
     )
     node.mission_topics = types.SimpleNamespace(cmd_vel_pub="cmd_vel")
+    node.active_task_name = "task3"
     node.task3.finished = True
+    active_task_updates = []
+    node._publish_active_task = lambda: active_task_updates.append(
+        node.active_task_name
+    )
+    telemetry_stops = []
+    node.stop_telemetry_recording = lambda: telemetry_stops.append(True)
     logs = []
     node.get_logger = lambda: types.SimpleNamespace(info=logs.append)
 
@@ -208,8 +215,11 @@ def test_finished_task3_finishes_competition(monkeypatch):
     assert updates == [("task3", ["detection"])]
     assert stopped == ["cmd_vel"]
     assert node.competition_state is competition.CompetitionState.FINISHED
+    assert node.active_task_name == "finished"
+    assert active_task_updates == ["finished"]
+    assert telemetry_stops == [True]
     assert logs == [
-        "Task 3 tamamlandı; competition zinciri başarıyla bitti."
+        "Task 3 tamamlandı; yarışma zinciri ve telemetri kaydı sonlandırıldı."
     ]
 
 
