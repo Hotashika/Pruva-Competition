@@ -16,7 +16,7 @@ import rclpy
 from std_msgs.msg import String
 
 from teknofest.missions.task1_point_tracking import (
-    DETECTION_STALE_SEC,
+    VISION_DETECTION_TIMEOUT_SEC,
     MissionState as Task1State,
     Task1Node,
 )
@@ -160,16 +160,16 @@ class CompetitionNode(Task1Node):
             if self.last_detection_message_time is None
             else time.monotonic() - self.last_detection_message_time
         )
-        vision_stale_limit = DETECTION_STALE_SEC
+        vision_stale_limit = VISION_DETECTION_TIMEOUT_SEC
         if self.competition_state == CompetitionState.PARKUR_3:
             task3_config = getattr(self.task3, "config", None)
             vision_stale_limit = min(
-                DETECTION_STALE_SEC,
+                VISION_DETECTION_TIMEOUT_SEC,
                 float(
                     getattr(
                         task3_config,
-                        "vision_stale_sec",
-                        DETECTION_STALE_SEC,
+                        "vision_detection_timeout_sec",
+                        VISION_DETECTION_TIMEOUT_SEC,
                     )
                 ),
             )

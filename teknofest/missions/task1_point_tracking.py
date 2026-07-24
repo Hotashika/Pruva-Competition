@@ -37,18 +37,27 @@ from utils.read_waypoints import parse_qgc_waypoints
 WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task1.waypoints"
 
 # ============================================================
-# SAFETY PARAMS
+# GÜVENLİK PARAMETRELERİ
 # ============================================================
-GPS_TIMEOUT_SEC = 2.0  # Bu süre GPS/heading gelmezse dur
+GPS_TIMEOUT_SEC = 2.0
+HEADING_TIMEOUT_SEC = 2.0
 BRIDGE_STATE_TIMEOUT_SEC = 10.0
 HOLD_MODE_NAME = "HOLD"
 GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
 MIN_VALID_ABS_COORD = 1e-6
+
+# ============================================================
+# NAVİGASYON PARAMETRELERİ
+# ============================================================
+WAYPOINT_TOLERANCE_M = 1.0
 WAYPOINT_SETTLE_SEC = 0.75
 WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 
+# ============================================================
+# VISION PARAMETRELERİ
+# ============================================================
 DETECTION_TOPIC = "/vision/detections"
-DETECTION_STALE_SEC = 3.00
+VISION_DETECTION_TIMEOUT_SEC = 3.00
 
 
 class MissionState(Enum):
@@ -74,7 +83,7 @@ class Task1Maneuvering:
 
         self.waypoints = parse_qgc_waypoints(WAYPOINT_PATH)
         self.current_target_index = 0
-        self.waypoint_tolerance = 1
+        self.waypoint_tolerance = WAYPOINT_TOLERANCE_M
 
         self.logger.info(f"[INIT-DEBUG] Parsed waypoints: {self.waypoints}")
 
@@ -163,10 +172,11 @@ class Task1Maneuvering:
         if self.last_heading_time is None:
             return False
 
-        if (now - self.last_heading_time) > GPS_TIMEOUT_SEC:
+        if (now - self.last_heading_time) > HEADING_TIMEOUT_SEC:
             if self.state != MissionState.FAILSAFE:
                 self.logger.error(
-                    f"HEADING DATA NOT RECEIVED FOR OVER {GPS_TIMEOUT_SEC}s! FAILSAFE."
+                    f"HEADING DATA NOT RECEIVED FOR OVER "
+                    f"{HEADING_TIMEOUT_SEC}s! FAILSAFE."
                 )
             self.state = MissionState.FAILSAFE
             return False
@@ -514,7 +524,7 @@ class Task1Node(Node):
     def _get_fresh_detections(self):
         if self.last_detection_message_time is None:
             return []
-        if time.monotonic() - self.last_detection_message_time > DETECTION_STALE_SEC:
+        if time.monotonic() - self.last_detection_message_time > VISION_DETECTION_TIMEOUT_SEC:
             return []
         return list(self.latest_detections)
 
@@ -579,7 +589,7 @@ class Task1Node(Node):
             if (
                     self.last_detection_message_time is not None
                     and time.monotonic() - self.last_detection_message_time
-                    <= DETECTION_STALE_SEC
+                    <= VISION_DETECTION_TIMEOUT_SEC
             ):
                 return True
 

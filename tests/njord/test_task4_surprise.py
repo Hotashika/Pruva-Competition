@@ -212,7 +212,7 @@ class Task4AvoidanceTests(unittest.TestCase):
         self.mission.update([self._buoy(4.0, 15.0)], now=10.0)
         self.assertEqual(task4.MissionState.AVOIDING, self.mission.state)
         self.assertEqual(
-            ("cmd_vel", task4.AVOID_LINEAR_X, task4.AVOID_TURN_Z),
+            ("cmd_vel", task4.AVOIDANCE_LINEAR_SPEED, task4.AVOIDANCE_TURN_RATE),
             self.topics.cmd_vel_pub.messages[-1],
         )
 

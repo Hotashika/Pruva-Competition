@@ -81,6 +81,14 @@ def _mission(task2_module):
     mission.avoidance_target = None
     mission.avoidance_side = None
     mission.avoided_obstacle_side = None
+    mission.avoidance_phase = None
+    mission.avoidance_started_time = None
+    mission.avoiding_track_id = None
+    mission.active_obstacle_reference = None
+    mission.pending_obstacle = None
+    mission.pending_obstacle_time = None
+    mission.pending_obstacle_count = 0
+    mission.recently_avoided_obstacles = []
     mission.last_angular_z = 0.0
     mission.aligned_target_key = None
     mission.yellow_course_acquired = False
@@ -136,8 +144,8 @@ def test_avoidance_target_is_created_on_opposite_side(task2_module):
     assert mission._gps_target_shift_m(
         marker,
         mission.avoidance_target,
-    ) == pytest.approx(task2_module.AVOID_PASS_CLEARANCE_M, abs=0.01)
-    assert task2_module.AVOID_PASS_CLEARANCE_M == 2.5
+    ) == pytest.approx(task2_module.AVOIDANCE_PASS_CLEARANCE_M, abs=0.01)
+    assert task2_module.AVOIDANCE_PASS_CLEARANCE_M == 2.5
 
 
 def test_active_avoidance_target_is_refreshed_from_vision(task2_module):
@@ -190,7 +198,7 @@ def test_finishing_avoidance_clears_target_and_resumes_route(task2_module):
     assert mission.avoidance_target is None
     assert mission.avoidance_side is None
     assert mission.avoided_obstacle_side is None
-    assert held == ["kaçınma WP (right)"]
+    assert held == ["kaçınma çıkış WP (right)"]
 
 
 def test_active_avoidance_bypasses_yellow_course_target(task2_module):
@@ -325,3 +333,185 @@ def test_initial_yellow_search_uses_main_waypoint_then_stops(task2_module):
 
     assert published_targets == [main_target, main_target]
     assert velocity_commands == [(0.0, 0.0)]
+
+
+def test_active_obstacle_uses_bbox_or_angle_distance_continuity(task2_module):
+    mission = _mission(task2_module)
+    mission.active_obstacle_reference = {
+        "class": "yellow_buoy",
+        "confidence": 0.9,
+        "distance": 2.5,
+        "side": "left",
+        "angle": 0.0,
+        "bbox": [100, 100, 140, 160],
+        "track_id": None,
+    }
+
+    matched = mission._matching_avoidance_obstacle([
+        {
+            "class": "yellow_buoy",
+            "confidence": 0.9,
+            "distance": 1.0,
+            "angle": 60.0,
+            "bbox": [300, 100, 340, 160],
+        },
+        {
+            "class": "yellow_buoy",
+            "confidence": 0.9,
+            "distance": 2.2,
+            "angle": 4.0,
+            "bbox": [105, 100, 145, 160],
+        },
+    ])
+
+    assert matched["distance"] == pytest.approx(2.38)
+    assert matched["angle"] == pytest.approx(1.6)
+
+
+def test_active_obstacle_prefers_exact_track_id(task2_module):
+    mission = _mission(task2_module)
+    mission.avoiding_track_id = 7
+    mission.active_obstacle_reference = {
+        "class": "yellow_buoy",
+        "confidence": 0.9,
+        "distance": 2.5,
+        "side": "left",
+        "angle": 0.0,
+        "track_id": 7,
+    }
+
+    matched = mission._matching_avoidance_obstacle([
+        {
+            "class": "yellow_buoy",
+            "confidence": 0.9,
+            "distance": 1.0,
+            "angle": 0.0,
+            "track_id": 8,
+        },
+        {
+            "class": "yellow_buoy",
+            "confidence": 0.9,
+            "distance": 2.2,
+            "angle": 3.0,
+            "track_id": 7,
+        },
+    ])
+
+    assert matched["track_id"] == 7
+
+
+def test_confirmation_applies_ema_to_range_and_angle(task2_module):
+    mission = _mission(task2_module)
+    first = mission._normalize_detection({
+        "class": "yellow_buoy",
+        "confidence": 0.9,
+        "distance": 2.8,
+        "angle": -10.0,
+        "bbox": [100, 100, 140, 160],
+    })
+    second = mission._normalize_detection({
+        "class": "yellow_buoy",
+        "confidence": 0.9,
+        "distance": 2.0,
+        "angle": -6.0,
+        "bbox": [104, 100, 144, 160],
+    })
+
+    assert mission._confirmed_obstacle(first, now=1.0) is None
+    confirmed = mission._confirmed_obstacle(second, now=1.2)
+
+    assert confirmed["distance"] == pytest.approx(2.48)
+    assert confirmed["angle"] == pytest.approx(-8.4)
+
+
+def test_pass_then_exit_requires_obstacle_to_be_behind(task2_module):
+    mission = _mission(task2_module)
+    mission._start_avoidance(
+        {
+            "class": "yellow_buoy",
+            "confidence": 0.9,
+            "distance": 2.0,
+            "side": "left",
+            "angle": 0.0,
+        },
+        mission.current_lat + 0.001,
+        mission.current_lon,
+        now=1.0,
+    )
+    pass_target = dict(mission.avoidance_target)
+    exit_target = mission._create_exit_target(pass_target)
+
+    assert pass_target["phase"] == "pass"
+    assert exit_target["phase"] == "exit"
+    assert mission._gps_target_shift_m(
+        pass_target,
+        exit_target,
+    ) == pytest.approx(task2_module.AVOIDANCE_EXIT_FORWARD_DISTANCE_M, abs=0.01)
+    assert not mission._obstacle_is_behind(exit_target)
+
+    mission.current_lat = exit_target["lat"]
+    mission.current_lon = exit_target["lon"]
+    assert mission._obstacle_is_behind(exit_target)
+
+
+def test_trackless_recent_marker_is_suppressed_by_position(task2_module):
+    mission = _mission(task2_module)
+    detection = mission._normalize_detection({
+        "class": "yellow_buoy",
+        "confidence": 0.9,
+        "distance": 2.0,
+        "side": "center",
+        "angle": 0.0,
+    })
+    marker = mission._estimated_marker_gps(detection)
+    mission.recently_avoided_obstacles = [{
+        "class": "yellow_buoy",
+        "track_id": None,
+        "marker_lat": marker["lat"],
+        "marker_lon": marker["lon"],
+        "expires_at": 10.0,
+    }]
+
+    assert mission._nearest_relevant_obstacle([detection], now=5.0) is None
+
+
+def test_avoidance_timeout_is_enforced(task2_module):
+    mission = _mission(task2_module)
+    mission.avoidance_started_time = 10.0
+
+    assert not mission._avoidance_timed_out(now=29.9)
+    assert mission._avoidance_timed_out(now=30.0)
+
+
+def test_exit_target_is_not_replaced_by_vision_refresh(task2_module):
+    mission = _mission(task2_module)
+    mission._start_avoidance(
+        {
+            "class": "yellow_buoy",
+            "confidence": 0.9,
+            "distance": 2.0,
+            "side": "left",
+            "angle": 0.0,
+        },
+        mission.current_lat + 0.001,
+        mission.current_lon,
+        now=1.0,
+    )
+    mission.avoidance_target = mission._create_exit_target(
+        mission.avoidance_target
+    )
+    exit_target = dict(mission.avoidance_target)
+
+    mission._refresh_avoidance_target(
+        {
+            "class": "yellow_buoy",
+            "confidence": 0.9,
+            "distance": 1.0,
+            "side": "left",
+            "angle": 20.0,
+        },
+        mission.current_lat + 0.001,
+        mission.current_lon,
+    )
+
+    assert mission.avoidance_target == exit_target
