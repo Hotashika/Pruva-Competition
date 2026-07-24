@@ -20,8 +20,8 @@ class BaseYOLODetector:
     def __init__(self, model_path, device=DEVICE):
         model_p = Path(model_path)
         if not model_p.is_absolute():
-            project_root = Path(__file__).resolve().parent.parent
-            model_p = project_root / model_path
+            repository_root = Path(__file__).resolve().parents[2]
+            model_p = repository_root / model_path
         self.model = YOLO(str(model_p))
         self.device = device
         self.class_names = self.model.names
