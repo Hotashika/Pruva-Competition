@@ -6,7 +6,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from teknofest.config.camera_config import CAMERA_WIDTH
-from teknofest.config.vision_config import DEVICE, BUOY_MODEL_PATH, TOLERANCE_RATIO, TOLARANCE_DEG
+from teknofest.config.vision_config import DEVICE, BUOY_MODEL_PATH, TOLERANCE_RATIO, TOLERANCE_DEG
 from teknofest.vision.depth_utils import get_distance_from_bbox
 
 
@@ -15,8 +15,8 @@ class BaseYOLODetector:
         model_p = Path(model_path)
 
         if not model_p.is_absolute():
-            project_root = Path(__file__).resolve().parent.parent
-            model_p = project_root / model_path
+            repository_root = Path(__file__).resolve().parents[2]
+            model_p = repository_root / model_path
 
         self.model = YOLO(str(model_p))
         self.device = device
@@ -266,7 +266,7 @@ class BuoyDetector(BaseYOLODetector):
             angle_deg = self._compute_angle(detection)
 
         if angle_deg is not None:
-            if abs(angle_deg) <= TOLARANCE_DEG:
+            if abs(angle_deg) <= TOLERANCE_DEG:
                 return "across"
             elif angle_deg > 0:
                 return "right"
