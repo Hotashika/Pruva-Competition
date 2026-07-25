@@ -96,6 +96,8 @@ STAND_ON_GRACE_SEC = 2.5
 VISION_DETECTION_TIMEOUT_SEC = 1.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
+DEPTH_OBSTACLE_TYPE = "depth_obstacle"
+DEPTH_OBSTACLE_CLASS = "surface_obstacle_candidate"
 BUOY_MODEL_TYPES = {
     # Class names embedded in the current buoy.pt model.
     "red_buoy",
@@ -354,7 +356,11 @@ class Task2CollisionAvoidance:
         # Task 2 water tests use the buoy detector as the collision target.
         # These names mirror the classes embedded in the current buoy model.
         is_buoy = detector_type == "buoy" and model_class in BUOY_MODEL_TYPES
-        return is_vessel or is_buoy
+        is_depth_obstacle = (
+            detector_type == DEPTH_OBSTACLE_TYPE
+            and model_class == DEPTH_OBSTACLE_CLASS
+        )
+        return is_vessel or is_buoy or is_depth_obstacle
 
     @classmethod
     def _detection_angle_deg(cls, detection):

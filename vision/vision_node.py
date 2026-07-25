@@ -32,7 +32,7 @@ def load_profile(competition):
 
 
 class VisionNode(Node):
-    def __init__(self, profile, fx=None, cx=None):
+    def __init__(self, profile, fx=None, fy=None, cx=None, cy=None):
         super().__init__("vision_node")
         self.profile = profile
         self.detectors = {}
@@ -90,9 +90,21 @@ class VisionNode(Node):
                 fx = calibration[profile.CALIBRATION_FX_INDEX]
             if cx is None:
                 cx = calibration[profile.CALIBRATION_CX_INDEX]
+            fy_index = getattr(profile, "CALIBRATION_FY_INDEX", None)
+            cy_index = getattr(profile, "CALIBRATION_CY_INDEX", None)
+            if fy is None and fy_index is not None:
+                fy = calibration[fy_index]
+            if cy is None and cy_index is not None:
+                cy = calibration[cy_index]
 
         self.fx = None if fx is None else float(fx)
+        self.fy = self.fx if fy is None else float(fy)
         self.cx = None if cx is None else float(cx)
+        self.cy = (
+            profile.DEPTH_SHAPE[0] / 2.0
+            if cy is None
+            else float(cy)
+        )
         self.last_frame_id = -1
         self.pub = self.create_publisher(String, "/vision/detections", 10)
         self.create_subscription(
@@ -131,14 +143,26 @@ class VisionNode(Node):
                 continue
             spec = self.profile.DETECTOR_SPECS[name]
             self.get_logger().info(f"Loading '{name}' detector...")
+            detector_kwargs = {
+                "fx": self.fx,
+                "cx": self.cx,
+                "camera_width": self.profile.CAMERA_WIDTH,
+            }
+            if "model_path" in spec:
+                detector_kwargs.update({
+                    "model_path": spec["model_path"],
+                    "device": self.profile.DEVICE,
+                    "tolerance_ratio": self.profile.TOLERANCE_RATIO,
+                    "tolerance_deg": self.profile.TOLERANCE_DEG,
+                })
+            if spec.get("uses_full_intrinsics"):
+                detector_kwargs.update({
+                    "fy": self.fy,
+                    "cy": self.cy,
+                })
+            detector_kwargs.update(spec.get("kwargs", {}))
             self.detectors[name] = spec["class"](
-                model_path=spec["model_path"],
-                device=self.profile.DEVICE,
-                fx=self.fx,
-                cx=self.cx,
-                camera_width=self.profile.CAMERA_WIDTH,
-                tolerance_ratio=self.profile.TOLERANCE_RATIO,
-                tolerance_deg=self.profile.TOLERANCE_DEG,
+                **detector_kwargs,
             )
 
         try:
@@ -282,7 +306,7 @@ class VisionNode(Node):
                         self.last_ar_template = None
 
             for detection in detections:
-                detection["type"] = name
+                detection.setdefault("type", name)
             all_detections.extend(detections)
 
         if self.current_task == self.profile.QR_TASK:
@@ -331,12 +355,20 @@ def main(argv=None):
         choices=("njord", "teknofest"),
     )
     parser.add_argument("--fx", type=float, default=None)
+    parser.add_argument("--fy", type=float, default=None)
     parser.add_argument("--cx", type=float, default=None)
+    parser.add_argument("--cy", type=float, default=None)
     args = parser.parse_args(argv)
 
     profile = load_profile(args.competition)
     rclpy.init()
-    node = VisionNode(profile=profile, fx=args.fx, cx=args.cx)
+    node = VisionNode(
+        profile=profile,
+        fx=args.fx,
+        fy=args.fy,
+        cx=args.cx,
+        cy=args.cy,
+    )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
