@@ -112,6 +112,11 @@ class Task3KamikazeEngagement:
         self.last_vision_time = None
         self.last_imu_time = None
         self.mission_start_time = None
+        # Tek basina Task 3 testinde bu sinir START anindan 20 dakika sonradir.
+        # Kesintisiz yaris modunda ise CompetitionNode, ilk parkur baslarken
+        # ortak deadline'i buraya verir; Task 3'e yeni bir 20 dakika acilmaz.
+        self.competition_deadline_time = None
+        self.mission_deadline_time = None
         self.home_lat = None
         self.home_lon = None
 
@@ -158,10 +163,23 @@ class Task3KamikazeEngagement:
             self.current_heading,
         )
 
+    def configure_competition_deadline(self, deadline_monotonic):
+        """Ilk parkurdan itibaren gecerli ortak yaris deadline'ini ayarla."""
+        deadline = float(deadline_monotonic)
+        if not math.isfinite(deadline):
+            raise ValueError("Yaris deadline degeri sonlu olmali.")
+        self.competition_deadline_time = deadline
+
     def start_mission(self):
         """Komut sistemi tarafından çağrılır; sensör ölçümü üretmez."""
         if self.current_lat is None or self.current_lon is None or self.current_heading is None:
             return False, "Gerçek GPS ve heading henüz hazır değil."
+        now = time.monotonic()
+        if (
+            self.competition_deadline_time is not None
+            and now >= self.competition_deadline_time
+        ):
+            return False, "Ortak 20 dakikalik yaris suresi dolmus."
         self.reset_search()
         # Geofence merkezi ilk GPS paketinde degil, gerçek START aninda
         # sabitlenir. Arac karada acilip suya tasinirsa eski konum home kalmaz.
@@ -174,15 +192,25 @@ class Task3KamikazeEngagement:
             f"heading={self.current_heading:.2f}°"
         )
         self.mission_enabled = True
-        self.mission_start_time = time.monotonic()
+        self.mission_start_time = now
+        self.mission_deadline_time = (
+            self.competition_deadline_time
+            if self.competition_deadline_time is not None
+            else now + MISSION_TOTAL_TIMEOUT_SEC
+        )
         self.state = MissionState.SEARCHING
-        self.logger.info("[GÖREV] Komut sisteminden START alındı; Task 3 araması başladı.")
+        remaining_sec = max(0.0, self.mission_deadline_time - now)
+        self.logger.info(
+            "[GÖREV] Komut sisteminden START alındı; Task 3 araması başladı. "
+            f"Kalan toplam süre={remaining_sec:.1f} sn."
+        )
         return True, "Task 3 başlatıldı."
 
     def stop_mission(self, reason="Komut sisteminden STOP komutu"):
         stop_vehicle(self.topics.cmd_vel_pub, repeat_count=2)
         self.mission_enabled = False
         self.mission_start_time = None
+        self.mission_deadline_time = None
         self.state = MissionState.INIT
         self.arama.reset_search()
         self.yaklasma.reset_approach()
@@ -222,14 +250,11 @@ class Task3KamikazeEngagement:
         """GPS + heading watchdog kontrolü."""
         now = time.monotonic()
 
-        if (
-            self.mission_start_time is not None
-            and now - self.mission_start_time > MISSION_TOTAL_TIMEOUT_SEC
-        ):
+        if self.mission_deadline_time is not None and now >= self.mission_deadline_time:
             if self.state != MissionState.FAILSAFE:
                 self.logger.error(
-                    f"Task 3 toplam {MISSION_TOTAL_TIMEOUT_SEC / 60.0:.0f} dakika "
-                    "sınırını aştı; FAILSAFE."
+                    "Ilk parkurdan itibaren hesaplanan toplam 20 dakikalik "
+                    "yaris suresi doldu; FAILSAFE."
                 )
             self.state = MissionState.FAILSAFE
             return False
