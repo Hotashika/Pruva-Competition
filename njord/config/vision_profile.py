@@ -32,7 +32,11 @@ DETECTOR_SPECS = {
         "kwargs": {
             "camera_height_m": 0.25,
             "detection_max_range_m": 12.0,
-            "plane_ransac_iterations": 350,
+            "plane_ransac_iterations": 100,
+            "plane_full_ransac_interval": 5,
+            "plane_tracking_min_confidence": 0.35,
+            "depth_downsample_factor": 2,
+            "geometry_hz": 7.5,
         },
     },
     "ar_tag": {
