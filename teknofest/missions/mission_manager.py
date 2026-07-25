@@ -8,9 +8,22 @@ gorev dugumlerinin ayni anda motor komutu gondermesi engellenir.
 import json
 import math
 import os
+import sys
 import threading
 import time
 from enum import Enum, auto
+from pathlib import Path
+
+# Bu dosya ``python3 teknofest/missions/mission_manager.py`` biçiminde
+# çalıştırıldığında sys.path[0] teknofest/missions olur. Buradaki yerel
+# ``utils`` paketi depo kökündeki ortak ``utils.mavlink_utilities`` paketini
+# gölgeleyebilir. Depo kökünü, PYTHONPATH içinde zaten bulunsa bile, kesin
+# olarak ilk sıraya taşı.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+repo_root_str = str(REPO_ROOT)
+while repo_root_str in sys.path:
+    sys.path.remove(repo_root_str)
+sys.path.insert(0, repo_root_str)
 
 import rclpy
 from mavros_msgs.srv import SetMode

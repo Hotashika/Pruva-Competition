@@ -20,6 +20,14 @@ class MissionManagerContractTests(unittest.TestCase):
     def test_manager_source_is_valid_python(self):
         ast.parse(MANAGER_PATH.read_text(encoding="utf-8"))
 
+    def test_manager_prioritizes_repository_root_before_importing_utils(self):
+        source = MANAGER_PATH.read_text(encoding="utf-8")
+        root_insert = source.index("sys.path.insert(0, repo_root_str)")
+        ros_import = source.index("import rclpy")
+        utilities_import = source.index("from utils.mavlink_utilities import")
+        self.assertLess(root_insert, ros_import)
+        self.assertLess(root_insert, utilities_import)
+
     def test_main_launches_one_manager_instead_of_a_task3_only_node(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
         self.assertIn('"mission_manager.py"', source)
