@@ -1,6 +1,5 @@
 # import csv  # IMU CSV logging is disabled for now.
 import logging
-import json
 import os
 import threading
 import time
@@ -8,21 +7,22 @@ import time
 import cv2
 import numpy as np
 import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
 
-from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
+from njord.config.camera_config import RGB_SHAPE
 from njord.core import shared_state
 from njord.core.shared_memory_utils import attach_existing_shared_memory
+from utils.frame_cadence import FrameCadence
 from utils.video_writer import QueuedVideoWriter, close_video_writers
-from vision.detector import BaseYOLODetector
+from vision.detection_cache import VisionDetectionCache
+from vision.detection_distance import nearest_bbox_median_distance
+from vision.render import draw_detections
 
 OUTPUT_DIR = "logs"
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 # CSV_PATH = os.path.join(OUTPUT_DIR, "imu_log.csv")  # IMU CSV logging is disabled for now.
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
 DEPTH_VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "depth_run_{ts}.mp4")
-VIDEO_FPS = 5
+VIDEO_FPS = 10
 VIDEO_WRITER_CLOSE_TIMEOUT_SEC = 30.0
 
 logger = logging.getLogger("zed_capture")
@@ -35,36 +35,6 @@ def setup_output_dirs():
 def attach_shared_memory(name, retries=50, delay=0.1):
     return attach_existing_shared_memory(name, retries=retries, delay=delay)
 
-
-class VisionDetectionCache(Node):
-    """Cache vision output so recording never reruns the detector models."""
-
-    def __init__(self):
-        super().__init__("njord_video_detection_cache")
-        self._lock = threading.Lock()
-        self._frame_id = None
-        self._detections = []
-        self.create_subscription(String, "/vision/detections", self._callback, 10)
-
-    def _callback(self, message):
-        try:
-            payload = json.loads(message.data)
-            frame_id = int(payload.get("frame_id"))
-            detections = payload.get("detections", [])
-            if not isinstance(detections, list):
-                return
-        except (TypeError, ValueError, json.JSONDecodeError):
-            self.get_logger().warn("Invalid /vision/detections message ignored.")
-            return
-        with self._lock:
-            self._frame_id = frame_id
-            self._detections = detections
-
-    def latest(self, frame_id, max_frame_lag=3):
-        with self._lock:
-            if self._frame_id is None or abs(int(frame_id) - self._frame_id) > max_frame_lag:
-                return []
-            return [dict(item) for item in self._detections if isinstance(item, dict)]
 
 def draw_frame_timestamp(frame, timestamp_ms, frame_index):
     timestamp_seconds = timestamp_ms / 1000.0
@@ -111,8 +81,7 @@ def draw_frame_timestamp(frame, timestamp_ms, frame_index):
 
 
 def annotate_frame(frame_bgr, detections):
-    # draw_detections does not access model state; avoid loading a second YOLO model.
-    return BaseYOLODetector.draw_detections(None, frame_bgr, detections)
+    return draw_detections(frame_bgr, detections)
 
 
 # noinspection D
@@ -133,12 +102,10 @@ def run(
     video_recorder = None
     depth_video_recorder = None
     rgb_shm = None
-    depth_shm = None
     depth_vision_shm = None
     meta_shm = None
     imu_shm = None
     shm_rgb = None
-    shm_depth = None
     shm_depth_vision = None
     shm_meta = None
     shm_imu = None
@@ -148,37 +115,31 @@ def run(
 
     # Preallocated reusable buffers -> avoids per-frame np/cv2 allocation churn.
     bgra_buf = np.empty(RGB_SHAPE, dtype=np.uint8)
-    depth_buf = np.empty(DEPTH_SHAPE, dtype=np.float32)
     depth_vision_bgra_buf = np.empty(RGB_SHAPE, dtype=np.uint8)
     h, w = RGB_SHAPE[:2]
     frame_bgr_buf = np.empty((h, w, 3), dtype=np.uint8)
     depth_vision_bgr_buf = np.empty((h, w, 3), dtype=np.uint8)
-    dh, dw = h // 2, w // 2
-    downsampled_depth_buf = np.empty((dh, dw), dtype=np.float32)
 
     last_drop_log = 0.0
     last_frame_id = 0
-    record_interval_ms = max(1, int(1000 / VIDEO_FPS))
-    last_record_time_ms = None
+    record_cadence = FrameCadence(VIDEO_FPS)
 
     try:
         if not rclpy.ok():
             rclpy.init()
             owns_rclpy_context = True
-        detection_node = VisionDetectionCache()
+        detection_node = VisionDetectionCache("njord_video_detection_cache")
         detection_spin_thread = threading.Thread(
             target=rclpy.spin, args=(detection_node,), daemon=True
         )
         detection_spin_thread.start()
 
         rgb_shm = attach_shared_memory(shared_state.RGB_SHM_NAME)
-        depth_shm = attach_shared_memory(shared_state.DEPTH_SHM_NAME)
         depth_vision_shm = attach_shared_memory(shared_state.DEPTH_VISION_SHM_NAME)
         meta_shm = attach_shared_memory(shared_state.META_SHM_NAME)
         imu_shm = attach_shared_memory(shared_state.IMU_SHM_NAME)
 
         shm_rgb = np.ndarray(RGB_SHAPE, dtype=np.uint8, buffer=rgb_shm.buf)
-        shm_depth = np.ndarray(DEPTH_SHAPE, dtype=np.float32, buffer=depth_shm.buf)
         shm_depth_vision = np.ndarray(
             RGB_SHAPE, dtype=np.uint8, buffer=depth_vision_shm.buf
         )
@@ -212,45 +173,42 @@ def run(
 
             if frame_lock is None:
                 current_frame_id = int(shm_meta[0])
+                if current_frame_id == 0 or current_frame_id == last_frame_id:
+                    continue
+                should_record = record_cadence.due(time.monotonic() * 1000.0)
                 timestamp_ms = int(shm_meta[1])
                 roll, pitch, yaw = shm_imu.tolist()
-                np.copyto(bgra_buf, shm_rgb)
-                np.copyto(depth_buf, shm_depth)
-                np.copyto(depth_vision_bgra_buf, shm_depth_vision)
+                if should_record:
+                    np.copyto(bgra_buf, shm_rgb)
+                    np.copyto(depth_vision_bgra_buf, shm_depth_vision)
+                if int(shm_meta[0]) != current_frame_id:
+                    continue
             else:
                 with frame_lock:
                     current_frame_id = int(shm_meta[0])
+                    if current_frame_id == 0 or current_frame_id == last_frame_id:
+                        continue
+                    should_record = record_cadence.due(time.monotonic() * 1000.0)
                     timestamp_ms = int(shm_meta[1])
                     roll, pitch, yaw = shm_imu.tolist()
-                    np.copyto(bgra_buf, shm_rgb)
-                    np.copyto(depth_buf, shm_depth)
-                    np.copyto(depth_vision_bgra_buf, shm_depth_vision)
+                    if should_record:
+                        np.copyto(bgra_buf, shm_rgb)
+                        np.copyto(depth_vision_bgra_buf, shm_depth_vision)
 
-            if current_frame_id == 0 or current_frame_id == last_frame_id:
-                continue
             last_frame_id = current_frame_id
 
-            # Reuse output buffers via dst= to avoid new allocations every frame
-            cv2.cvtColor(bgra_buf, cv2.COLOR_BGRA2BGR, dst=frame_bgr_buf)
-            cv2.cvtColor(
-                depth_vision_bgra_buf,
-                cv2.COLOR_BGRA2BGR,
-                dst=depth_vision_bgr_buf,
-            )
-            cv2.resize(
-                depth_buf, (0, 0), dst=downsampled_depth_buf,
-                fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA,
-            )
-            now_record_time_ms = int(time.monotonic() * 1000)
-            should_record = (
-                last_record_time_ms is None
-                or now_record_time_ms - last_record_time_ms >= record_interval_ms
-            )
-
             if should_record:
+                detections = detection_node.latest(current_frame_id)
+                bbox_median_depth = nearest_bbox_median_distance(detections)
+                cv2.cvtColor(bgra_buf, cv2.COLOR_BGRA2BGR, dst=frame_bgr_buf)
+                cv2.cvtColor(
+                    depth_vision_bgra_buf,
+                    cv2.COLOR_BGRA2BGR,
+                    dst=depth_vision_bgr_buf,
+                )
                 try:
                     processed_frame = annotate_frame(
-                        frame_bgr_buf, detection_node.latest(current_frame_id)
+                        frame_bgr_buf, detections
                     )
                 except Exception:
                     logger.exception("NJORD video annotation failed. Raw frame will be used.")
@@ -269,10 +227,10 @@ def run(
                 )
 
                 # The Flask video server reads this same annotated frame.
-                with shared_state.frame_lock:
+                with shared_state.frame_condition:
                     shared_state.latest_frame = processed_frame.copy()
-
-                shared_state.frame_event.set()
+                    shared_state.latest_frame_id = current_frame_id
+                    shared_state.frame_condition.notify_all()
 
                 if not video_recorder.enqueue(processed_frame):
                     dropped_frames += 1
@@ -293,16 +251,19 @@ def run(
                             dropped_depth_frames,
                         )
                         last_drop_log = now
+            else:
+                bbox_median_depth = (
+                    detection_node.nearest_bbox_median_distance(current_frame_id)
+                )
 
-                last_record_time_ms = now_record_time_ms
-
-            # --- minimize time spent holding locks: just pointer/scalar assignment ---
-            with shared_state.data_lock:
-                shared_state.latest_depth_array = downsampled_depth_buf.copy()
+            with shared_state.data_condition:
+                # Kept for API compatibility; this is the nearest detection's
+                # already-computed bbox median depth, not the center pixel.
+                shared_state.latest_center_depth = bbox_median_depth
                 shared_state.latest_imu = {"roll": roll, "pitch": pitch, "yaw": yaw}
                 shared_state.latest_timestamp = timestamp_ms
-
-            shared_state.data_event.set()
+                shared_state.latest_data_id = current_frame_id
+                shared_state.data_condition.notify_all()
             frame_index += 1
     finally:
         if on_shutdown_started is not None:
@@ -325,12 +286,11 @@ def run(
                 )
 
         shm_rgb = None
-        shm_depth = None
         shm_depth_vision = None
         shm_meta = None
         shm_imu = None
 
-        for shm in (rgb_shm, depth_shm, depth_vision_shm, meta_shm, imu_shm):
+        for shm in (rgb_shm, depth_vision_shm, meta_shm, imu_shm):
             if shm is not None:
                 shm.close()
 
