@@ -352,6 +352,14 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             )
         )
 
+    def test_depth_obstacle_is_used_as_collision_target(self):
+        self.assertTrue(
+            self.mission._is_vessel({
+                "type": "depth_obstacle",
+                "class": "surface_obstacle_candidate",
+            })
+        )
+
     def test_port_side_risk_stands_on_then_uses_starboard_gps_target(self):
         self._update(5.0, -25.0, 10.0)
         self._update(4.7, -25.0, 10.3)
