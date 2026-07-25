@@ -23,7 +23,7 @@ class BaseYOLODetector:
 
         self.model = YOLO(str(model_p))
         self.device = (
-            torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            torch.device("cuda") if torch.cuda.is_available() else "cpu"
             if device is None
             else device
         )
