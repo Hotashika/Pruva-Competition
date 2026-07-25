@@ -7,8 +7,10 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_WAYPOINT_DIRECTORY = REPOSITORY_ROOT / "waypoints"
+def _required_waypoint_directory(value):
+    if value is None or not str(value).strip():
+        raise ValueError("waypoint_directory is required")
+    return Path(value)
 
 
 def _validated_filename(value):
@@ -62,7 +64,8 @@ def overwrite_waypoint_file(directory, filename, content):
     return destination
 
 
-def create_app(waypoint_directory=DEFAULT_WAYPOINT_DIRECTORY):
+def create_app(waypoint_directory=None):
+    waypoint_directory = _required_waypoint_directory(waypoint_directory)
     app = Flask(__name__)
     app.config["WAYPOINT_DIRECTORY"] = str(waypoint_directory)
 
@@ -112,14 +115,13 @@ def create_app(waypoint_directory=DEFAULT_WAYPOINT_DIRECTORY):
     return app
 
 
-app = create_app()
-
-
-def start(port=8000):
+def start(port=8000, waypoint_directory=None):
+    waypoint_directory = _required_waypoint_directory(waypoint_directory)
+    server_app = create_app(waypoint_directory)
     print(
         "[WAYPOINT] Receiver ready: "
         f"http://0.0.0.0:{port}/api/mission/upload_txt -> "
-        f"{DEFAULT_WAYPOINT_DIRECTORY.resolve()}",
+        f"{waypoint_directory.resolve()}",
         flush=True,
     )
-    app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+    server_app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)

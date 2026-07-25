@@ -1,3 +1,5 @@
+"""Manual CUDA/PyTorch environment check; not part of the pytest suite."""
+
 import torch
 
 # 1. Check if an NVIDIA GPU with CUDA is available

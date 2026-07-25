@@ -1,5 +1,5 @@
 """
-    python3 tests/test_angle.py --device cuda
+    python3 tests/manual/angle_check.py --device cuda
 """
 import argparse
 import importlib
@@ -27,7 +27,7 @@ if str(COMPETITION_ROOT) not in sys.path:
 camera_config = importlib.import_module(f"{PROJECT_PACKAGE}.config.camera_config")
 vision_config = importlib.import_module(f"{PROJECT_PACKAGE}.config.vision_config")
 shared_frame_source = importlib.import_module(f"{PROJECT_PACKAGE}.core.shared_frame_source")
-detector_module = importlib.import_module(f"{PROJECT_PACKAGE}.vision.detector")
+detector_module = importlib.import_module("vision.detector")
 
 globals().update(
     {
@@ -227,7 +227,15 @@ def main():
         print(f"[INFO] Calibration read from capture_proc: fx={FX:.2f}, cx={CX:.2f}")
 
         print(f"[INFO] Loading BuoyDetector: {BUOY_MODEL_PATH} (device={args.device})")
-        detector = BuoyDetector(model_path=BUOY_MODEL_PATH, device=args.device, fx=FX, cx=CX)
+        detector = BuoyDetector(
+            model_path=BUOY_MODEL_PATH,
+            device=args.device,
+            fx=FX,
+            cx=CX,
+            camera_width=CAMERA_WIDTH,
+            tolerance_ratio=TOLERANCE_RATIO,
+            tolerance_deg=TOLERANCE_DEG,
+        )
         if detector.model is None:
             raise RuntimeError("Failed to load BuoyDetector model.")
 

@@ -24,6 +24,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 from njord.core.mission_decision import DECISION_TOPIC, mission_decision_json
+from njord.config.mission_config import WAYPOINT_DIRECTORY
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
     calculate_gps_distance,
@@ -39,13 +40,86 @@ from utils.mavlink_utilities import (
 )
 from utils.read_waypoints import parse_qgc_waypoints
 
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "njord_task2.waypoints"
-KINEMATICS_OUTPUT_DIR = BASE_DIR / "logs" / "task2_vessel_kinematics"
+WAYPOINT_PATH = WAYPOINT_DIRECTORY / "njord_task2.waypoints"
+KINEMATICS_OUTPUT_DIR = (
+    Path(__file__).resolve().parents[1] / "logs" / "task2_vessel_kinematics"
+)
 ACTIVE_TASK_NAME = "task2"
 HOLD_MODE_NAME = "HOLD"
-EARTH_RADIUS_M = 6_371_000.0
+
+# ============================================================
+# GÜVENLİK PARAMETRELERİ
+# ============================================================
+GPS_TIMEOUT_SEC = 2.0
+HEADING_TIMEOUT_SEC = 2.0
+BRIDGE_STATE_TIMEOUT_SEC = 10.0
+MIN_VALID_ABS_COORD = 1e-6
+
+# ============================================================
+# NAVİGASYON PARAMETRELERİ
+# ============================================================
+WAYPOINT_TOLERANCE_M = 1.0
+WAYPOINT_SETTLE_SEC = 0.75
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
+EARTH_RADIUS_M = 6378137.0
+
+# ============================================================
+# KAÇINMA HAREKET PARAMETRELERİ
+# ============================================================
+AVOIDANCE_PASS_CLEARANCE_M = 2.5
+AVOIDANCE_WAYPOINT_TOLERANCE_M = 0.5
+AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M = 0.25
+AVOIDANCE_TIMEOUT_SEC = 20.0
+
+# ============================================================
+# ÇARPIŞMA RİSKİ PARAMETRELERİ
+# ============================================================
+# Vessel monitoring and collision-risk thresholds. These are competition
+# defaults, not fixed COLREG distances, and should be tuned during water tests.
+MONITOR_DISTANCE_M = 12.0
+AVOIDANCE_START_DISTANCE_M = 4.5
+EMERGENCY_DISTANCE_M = 2.5
+SAFE_DCPA_M = 2.5
+MAX_TCPA_SEC = 15.0
+EMERGENCY_TCPA_SEC = 4.0
+MIN_TRACK_SPAN_SEC = 0.4
+MIN_TRACK_SAMPLES = 3
+MIN_CLOSING_RATE_MPS = 0.05
+CONSTANT_BEARING_SPAN_DEG = 8.0
+
+HEAD_ON_HALF_ANGLE_DEG = 15.0
+STAND_ON_GRACE_SEC = 2.5
+
+# ============================================================
+# VISION PARAMETRELERİ
+# ============================================================
+VISION_DETECTION_TIMEOUT_SEC = 1.0
+
+VESSEL_TYPES = {"vessel", "boat", "ship"}
+BUOY_MODEL_TYPES = {
+    # Class names embedded in the current buoy.pt model.
+    "red_buoy",
+    "green_buoy",
+    "black_buoy",
+    "orange_buoy",
+    "yellow_buoy",
+    # Legacy aliases kept for older datasets and recorded detections.
+    "green_buoys",
+    "red_buoys",
+    "north_buoys",
+    "east_buoys",
+    "south_buoys",
+    "west_buoys",
+}
+COLLISION_TARGET_ANGLE_KEYS = (
+    "Vessel angle: ",
+    "Vessel angle",
+    "Buoy angle: ",
+    "Buoy angle",
+    "bearing",
+    "angle_deg",
+    "angle",
+)
 
 KINEMATICS_CSV_FIELDS = (
     "system_timestamp_utc",
@@ -62,58 +136,6 @@ KINEMATICS_CSV_FIELDS = (
     "closing_rate_mps",
     "tcpa_sec",
     "dcpa_m",
-)
-# Existing movement commands are intentionally preserved. In this project,
-# negative angular_z means starboard/right.
-AVOID_LINEAR_X = 0.5
-AVOID_TURN_Z = -0.6
-
-WAYPOINT_TOLERANCE_M = 1.0
-WAYPOINT_SETTLE_SEC = 0.75
-WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
-GPS_TIMEOUT_SEC = 2.0
-HEADING_TIMEOUT_SEC = 2.0
-BRIDGE_STATE_TIMEOUT_SEC = 10.0
-MIN_VALID_ABS_COORD = 1e-6
-
-# Vessel monitoring and collision-risk thresholds. These are competition
-# defaults, not fixed COLREG distances, and should be tuned during water tests.
-MONITOR_DISTANCE_M = 12.0
-AVOID_ENTER_DISTANCE_M = 4.5
-AVOID_EXIT_DISTANCE_M = 5.5
-EMERGENCY_DISTANCE_M = 2.5
-SAFE_DCPA_M = 2.5
-MAX_TCPA_SEC = 15.0
-EMERGENCY_TCPA_SEC = 4.0
-MIN_TRACK_SPAN_SEC = 0.4
-MIN_TRACK_SAMPLES = 3
-MIN_CLOSING_RATE_MPS = 0.05
-CONSTANT_BEARING_SPAN_DEG = 8.0
-
-HEAD_ON_HALF_ANGLE_DEG = 15.0
-STAND_ON_GRACE_SEC = 2.5
-AVOID_MIN_DURATION_SEC = 0.8
-AVOID_CLEAR_DURATION_SEC = 1.0
-AVOID_MAX_DURATION_SEC = 10.0
-VISION_DETECTION_TIMEOUT_SEC = 1.0
-
-VESSEL_TYPES = {"vessel", "boat", "ship"}
-BUOY_MODEL_TYPES = {
-    "green_buoys",
-    "red_buoys",
-    "north_buoys",
-    "east_buoys",
-    "south_buoys",
-    "west_buoys",
-}
-COLLISION_TARGET_ANGLE_KEYS = (
-    "Vessel angle: ",
-    "Vessel angle",
-    "Buoy angle: ",
-    "Buoy angle",
-    "bearing",
-    "angle_deg",
-    "angle",
 )
 
 
@@ -209,9 +231,11 @@ class VesselKinematicsCsvRecorder:
                 "camera_timestamp_ms": camera_timestamp_ms,
                 "frame_id": frame_id,
                 "detected": int(detected),
-                "track_id": 0
-                if not detected or observation.track_id is None
-                else observation.track_id,
+                "track_id": (
+                    0
+                    if not detected or observation.track_id is None
+                    else observation.track_id
+                ),
                 "distance_m": self._number(
                     0.0 if not detected else observation.distance_m
                 ),
@@ -219,14 +243,10 @@ class VesselKinematicsCsvRecorder:
                     0.0 if not detected else observation.angle_deg
                 ),
                 "relative_course_deg": self._number(
-                    0.0
-                    if kinematics is None
-                    else kinematics.relative_course_deg
+                    0.0 if kinematics is None else kinematics.relative_course_deg
                 ),
                 "relative_speed_mps": self._number(
-                    0.0
-                    if kinematics is None
-                    else kinematics.relative_speed_mps
+                    0.0 if kinematics is None else kinematics.relative_speed_mps
                 ),
                 "true_course_deg": self._number(
                     0.0 if kinematics is None else kinematics.true_course_deg
@@ -286,7 +306,7 @@ class Task2CollisionAvoidance:
         self.track = deque(maxlen=12)
         self.stand_on_risk_since = None
         self.avoid_started_time = None
-        self.avoid_clear_started_time = None
+        self.avoidance_target = None
         self.aligned_target_key = None
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
@@ -393,8 +413,8 @@ class Task2CollisionAvoidance:
             heading_deg=float(self.current_heading),
         )
 
-        # Without a tracker id, a large jump is treated as another vessel so
-        # observations from different targets are not mixed in one CPA track.
+        # Track ids are preferred. Geometry continuity remains a fallback for
+        # detectors or recorded samples that do not provide a track id.
         if self.track:
             previous = self.track[-1]
             track_id_changed = (
@@ -548,7 +568,7 @@ class Task2CollisionAvoidance:
             item.angle_deg for item in self.track
         )
         if (
-            latest.distance_m <= AVOID_ENTER_DISTANCE_M
+            latest.distance_m <= AVOIDANCE_START_DISTANCE_M
             and angle_span <= CONSTANT_BEARING_SPAN_DEG
         ):
             return CollisionAssessment(
@@ -660,22 +680,29 @@ class Task2CollisionAvoidance:
         )
         return False
 
-    def _publish_waypoint_target(self, target):
+    def _publish_waypoint_target(
+        self,
+        target,
+        *,
+        target_name=None,
+        tolerance_m=None,
+    ):
         if self.current_lat is None or self.current_lon is None:
             return False
+        if target_name is None:
+            target_name = f"WP{self.current_target_index}"
+        if tolerance_m is None:
+            tolerance_m = self.waypoint_tolerance
         distance = calculate_gps_distance(
             self.current_lat,
             self.current_lon,
             target["lat"],
             target["lon"],
         )
-        if distance <= self.waypoint_tolerance:
-            self.logger.info(
-                f"WP{self.current_target_index} reached. Remaining={distance:.2f}m"
-            )
+        if distance <= tolerance_m:
+            self.logger.info(f"{target_name} reached. Remaining={distance:.2f}m")
             return True
 
-        target_name = f"WP{self.current_target_index}"
         target_key = (
             target_name,
             round(float(target["lat"]), 7),
@@ -703,61 +730,240 @@ class Task2CollisionAvoidance:
             target.get("alt", 20.0),
         )
         self.logger.info(
-            f"WP{self.current_target_index}: distance={distance:.2f}m | set_position sent",
+            f"{target_name}: distance={distance:.2f}m | set_position sent",
             throttle_duration_sec=1.0,
         )
         return False
 
-    def _start_starboard_avoidance(self, now, encounter, assessment):
+    @staticmethod
+    def _offset_gps(lat, lon, north_m, east_m):
+        """Convert a local north/east offset in metres to a GPS coordinate."""
+        lat_rad = math.radians(lat)
+        new_lat = lat + math.degrees(north_m / EARTH_RADIUS_M)
+
+        cos_lat = math.cos(lat_rad)
+        if abs(cos_lat) < 1e-6:
+            cos_lat = 1e-6 if cos_lat >= 0.0 else -1e-6
+
+        new_lon = lon + math.degrees(
+            east_m / (EARTH_RADIUS_M * cos_lat)
+        )
+        return {"lat": new_lat, "lon": new_lon}
+
+    def _create_starboard_avoidance_target(
+            self,
+            vessel,
+            reference_heading=None,
+    ):
+        """Create a temporary GPS point on the vessel's starboard side."""
+        if (
+            vessel is None
+            or self.current_lat is None
+            or self.current_lon is None
+            or self.current_heading is None
+        ):
+            return None
+
+        distance_m = self._finite_float(vessel.get("distance"))
+        angle_deg = self._finite_float(vessel.get("angle"))
+        if distance_m is None or distance_m <= 0.0 or angle_deg is None:
+            return None
+
+        obstacle_bearing = (self.current_heading + angle_deg) % 360.0
+        obstacle_bearing_rad = math.radians(obstacle_bearing)
+        marker_gps = self._offset_gps(
+            self.current_lat,
+            self.current_lon,
+            north_m=distance_m * math.cos(obstacle_bearing_rad),
+            east_m=distance_m * math.sin(obstacle_bearing_rad),
+        )
+
+        # Keep the pass side fixed to the vehicle heading at avoidance entry.
+        # A +90 degree bearing is always starboard/right.
+        if reference_heading is None:
+            reference_heading = float(self.current_heading)
+        lateral_bearing = (float(reference_heading) + 90.0) % 360.0
+        lateral_bearing_rad = math.radians(lateral_bearing)
+        target = self._offset_gps(
+            marker_gps["lat"],
+            marker_gps["lon"],
+            north_m=AVOIDANCE_PASS_CLEARANCE_M * math.cos(lateral_bearing_rad),
+            east_m=AVOIDANCE_PASS_CLEARANCE_M * math.sin(lateral_bearing_rad),
+        )
+        target.update({
+            "side": "starboard",
+            "marker_lat": marker_gps["lat"],
+            "marker_lon": marker_gps["lon"],
+            "reference_heading": float(reference_heading),
+        })
+        return target
+
+    @staticmethod
+    def _gps_target_shift_m(old_target, new_target):
+        """Return the approximate distance between two nearby GPS targets."""
+        mean_lat = math.radians(
+            (old_target["lat"] + new_target["lat"]) / 2.0
+        )
+        north_m = (
+            math.radians(new_target["lat"] - old_target["lat"])
+            * EARTH_RADIUS_M
+        )
+        east_m = (
+            math.radians(new_target["lon"] - old_target["lon"])
+            * EARTH_RADIUS_M
+            * math.cos(mean_lat)
+        )
+        return math.hypot(north_m, east_m)
+
+    def _refresh_starboard_avoidance_target(self, vessel):
+        """Refresh the temporary GPS point from a new vision observation."""
+        if vessel is None or self.avoidance_target is None:
+            return
+
+        refreshed_target = self._create_starboard_avoidance_target(
+            vessel,
+            reference_heading=self.avoidance_target["reference_heading"],
+        )
+        if refreshed_target is None:
+            return
+
+        target_shift_m = self._gps_target_shift_m(
+            self.avoidance_target,
+            refreshed_target,
+        )
+        if target_shift_m < AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M:
+            return
+
+        self.avoidance_target = refreshed_target
+        self.aligned_target_key = None
+        self.logger.info(
+            "Starboard avoidance GPS target refreshed from vision "
+            f"(shift={target_shift_m:.2f}m).",
+            throttle_duration_sec=0.5,
+        )
+
+    def _publish_starboard_avoidance_target(self):
+        """Align to and publish the active temporary starboard GPS target."""
+        target = self.avoidance_target
+        if target is None:
+            return False
+
+        distance = calculate_gps_distance(
+            self.current_lat,
+            self.current_lon,
+            target["lat"],
+            target["lon"],
+        )
+        if distance <= AVOIDANCE_WAYPOINT_TOLERANCE_M:
+            return True
+
+        target_name = "starboard avoidance WP"
+        target_key = (
+            target_name,
+            round(float(target["lat"]), 7),
+            round(float(target["lon"]), 7),
+        )
+        if self.aligned_target_key != target_key:
+            if not align_heading_to_gps_target(
+                self.topics.cmd_vel_pub,
+                self.current_lat,
+                self.current_lon,
+                self.current_heading,
+                target["lat"],
+                target["lon"],
+                logger=self.logger,
+                target_name=target_name,
+                tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
+            ):
+                return False
+            self.aligned_target_key = target_key
+
+        publish_set_position(
+            self.topics.position_target_pub,
+            target["lat"],
+            target["lon"],
+            target.get("alt", 20.0),
+        )
+        self.logger.info(
+            f"{target_name}: distance={distance:.2f}m | set_position sent",
+            throttle_duration_sec=1.0,
+        )
+        return False
+
+    def _reset_avoidance_state(self):
+        self.state = MissionState.NAVIGATING
+        self.avoid_started_time = None
+        self.avoidance_target = None
+        self.stand_on_risk_since = None
+        self.aligned_target_key = None
+        self.track.clear()
+
+    def _start_starboard_avoidance(
+            self,
+            vessel,
+            now,
+            encounter,
+            assessment,
+    ):
         self.state = MissionState.AVOIDING
         self.avoid_started_time = now
-        self.avoid_clear_started_time = None
         self.stand_on_risk_since = None
-        # Avoidance changes the heading, so re-align before resuming this leg.
         self.aligned_target_key = None
-        tcpa_text = "unknown" if assessment.tcpa_sec is None else f"{assessment.tcpa_sec:.1f}s"
-        dcpa_text = "unknown" if assessment.dcpa_m is None else f"{assessment.dcpa_m:.1f}m"
-        self.logger.warn(
-            "Collision risk: encounter=%s reason=%s TCPA=%s DCPA=%s; "
-            "starting starboard avoidance."
-            % (encounter, assessment.reason, tcpa_text, dcpa_text)
-        )
-        self._publish_starboard_command()
-
-    def _publish_starboard_command(self):
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
-            linear_x=AVOID_LINEAR_X,
-            angular_z=AVOID_TURN_Z,
-        )
-
-    def _update_avoidance(self, vessel, now):
-        if self.avoid_started_time is None:
-            self.avoid_started_time = now
-
-        elapsed = now - self.avoid_started_time
-        if elapsed >= AVOID_MAX_DURATION_SEC:
+        self.avoidance_target = self._create_starboard_avoidance_target(vessel)
+        if self.avoidance_target is None:
             self._enter_failsafe(
-                f"Starboard avoidance exceeded {AVOID_MAX_DURATION_SEC:.1f}s"
+                "Starboard avoidance GPS target could not be created"
             )
             return
 
-        vessel_clear = vessel is None or vessel["distance"] >= AVOID_EXIT_DISTANCE_M
-        if elapsed >= AVOID_MIN_DURATION_SEC and vessel_clear:
-            if self.avoid_clear_started_time is None:
-                self.avoid_clear_started_time = now
-            elif now - self.avoid_clear_started_time >= AVOID_CLEAR_DURATION_SEC:
-                self.logger.info("Vessel is past and clear; resuming the same waypoint.")
-                stop_vehicle(self.topics.cmd_vel_pub)
-                self.state = MissionState.NAVIGATING
-                self.avoid_started_time = None
-                self.avoid_clear_started_time = None
-                self.track.clear()
-                return
-        else:
-            self.avoid_clear_started_time = None
+        tcpa_text = "unknown" if assessment.tcpa_sec is None else f"{assessment.tcpa_sec:.1f}s"
+        dcpa_text = "unknown" if assessment.dcpa_m is None else f"{assessment.dcpa_m:.1f}m"
+        target = self.avoidance_target
+        self.logger.warn(
+            "Collision risk: encounter=%s reason=%s TCPA=%s DCPA=%s; "
+            "starboard GPS target=(%.7f, %.7f), clearance=%.1fm."
+            % (
+                encounter,
+                assessment.reason,
+                tcpa_text,
+                dcpa_text,
+                target["lat"],
+                target["lon"],
+                AVOIDANCE_PASS_CLEARANCE_M,
+            )
+        )
+        self._publish_starboard_avoidance_target()
 
-        self._publish_starboard_command()
+    def _update_avoidance(self, vessel, now, refresh_target):
+        if self.avoid_started_time is None:
+            self.avoid_started_time = now
+        if self.avoidance_target is None:
+            self._enter_failsafe("AVOIDING state has no temporary GPS target")
+            return
+
+        elapsed = now - self.avoid_started_time
+        if elapsed >= AVOIDANCE_TIMEOUT_SEC:
+            self._enter_failsafe(
+                "Starboard avoidance GPS target was not reached within "
+                f"{AVOIDANCE_TIMEOUT_SEC:.1f}s"
+            )
+            return
+
+        if self.avoidance_target is None:
+            self._enter_failsafe(
+                "AVOIDING state has no temporary starboard GPS target"
+            )
+            return
+
+        if refresh_target:
+            self._refresh_starboard_avoidance_target(vessel)
+
+        if self._publish_starboard_avoidance_target():
+            self.logger.info(
+                "Starboard avoidance GPS target reached; "
+                "resuming the same mission waypoint."
+            )
+            self._reset_avoidance_state()
 
     def update(
         self,
@@ -823,7 +1029,11 @@ class Task2CollisionAvoidance:
             )
 
         if self.state == MissionState.AVOIDING:
-            self._update_avoidance(vessel, now)
+            self._update_avoidance(
+                vessel,
+                now,
+                refresh_target=record_observation,
+            )
             return
 
         if vessel is None:
@@ -841,7 +1051,12 @@ class Task2CollisionAvoidance:
                 )
             )
             if role == "give_way":
-                self._start_starboard_avoidance(now, encounter, assessment)
+                self._start_starboard_avoidance(
+                    vessel,
+                    now,
+                    encounter,
+                    assessment,
+                )
                 return
 
             if self.stand_on_risk_since is None:
@@ -851,7 +1066,12 @@ class Task2CollisionAvoidance:
                 )
             self.state = MissionState.STAND_ON
             if emergency or now - self.stand_on_risk_since >= STAND_ON_GRACE_SEC:
-                self._start_starboard_avoidance(now, encounter, assessment)
+                self._start_starboard_avoidance(
+                    vessel,
+                    now,
+                    encounter,
+                    assessment,
+                )
                 return
         else:
             self.stand_on_risk_since = None

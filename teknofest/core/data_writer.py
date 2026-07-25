@@ -10,8 +10,15 @@ import cv2
 import numpy as np
 
 from teknofest.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
+from teknofest.config.camera_config import CAMERA_WIDTH
+from teknofest.config.vision_config import (
+    BUOY_MODEL_PATH,
+    DEVICE,
+    TOLERANCE_DEG,
+    TOLERANCE_RATIO,
+)
 from teknofest.core import shared_state
-from teknofest.vision.detector import BuoyDetector
+from vision.detector import BuoyDetector
 
 OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")
@@ -258,6 +265,11 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
     # Döngünün içinde oluşturulmaz; yoksa her frame'de model tekrar yüklenir.
     try:
         buoy_detector = BuoyDetector(
+            model_path=BUOY_MODEL_PATH,
+            device=DEVICE,
+            camera_width=CAMERA_WIDTH,
+            tolerance_ratio=TOLERANCE_RATIO,
+            tolerance_deg=TOLERANCE_DEG,
             use_tracking=ENABLE_TRACKING,
         )
     except Exception:

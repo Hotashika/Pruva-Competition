@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+"""Manual ROS service integration check; not part of the pytest suite."""
+
 import argparse
 import sys
 import time

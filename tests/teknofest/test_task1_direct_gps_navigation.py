@@ -133,3 +133,47 @@ def test_reached_waypoint_is_not_published_again(task1_module):
 
     assert reached is True
     assert published_targets == []
+
+
+def test_node_gps_callback_tracks_latest_valid_position(task1_module):
+    node = task1_module.Task1Node.__new__(task1_module.Task1Node)
+    updates = []
+    node.task = types.SimpleNamespace(
+        update_gps=lambda lat, lon: updates.append((lat, lon))
+    )
+    node.valid_gps_received = False
+
+    accepted = node.gps_callback(
+        types.SimpleNamespace(latitude=37.9515533, longitude=32.5005982)
+    )
+
+    assert accepted is True
+    assert node.current_lat == 37.9515533
+    assert node.current_lon == 32.5005982
+    assert node.valid_gps_received is True
+    assert updates == [(37.9515533, 32.5005982)]
+
+
+def test_node_gps_callback_rejects_zero_position(task1_module):
+    node = task1_module.Task1Node.__new__(task1_module.Task1Node)
+    updates = []
+    node.task = types.SimpleNamespace(
+        update_gps=lambda lat, lon: updates.append((lat, lon))
+    )
+    node.current_lat = 37.9515533
+    node.current_lon = 32.5005982
+    node.valid_gps_received = True
+    warnings = []
+    node.get_logger = lambda: types.SimpleNamespace(
+        warn=lambda message, **kwargs: warnings.append(message)
+    )
+
+    accepted = node.gps_callback(
+        types.SimpleNamespace(latitude=0.0, longitude=0.0)
+    )
+
+    assert accepted is False
+    assert node.current_lat == 37.9515533
+    assert node.current_lon == 32.5005982
+    assert updates == []
+    assert warnings == ["Gecersiz GPS (0,0) yok sayiliyor."]

@@ -1,8 +1,17 @@
-from utils.waypoint_server import create_app, overwrite_waypoint_file
+import pytest
+
+from utils.waypoint_server import create_app, overwrite_waypoint_file, start
 
 
 FIRST_MISSION = "QGC WPL 110\n0\t1\t0\t16\t0\t0\t0\t0\t1\t2\t3\t1\n"
 SECOND_MISSION = "QGC WPL 110\n0\t1\t0\t16\t0\t0\t0\t0\t4\t5\t6\t1\n"
+
+
+def test_server_requires_profile_waypoint_directory():
+    with pytest.raises(ValueError, match="waypoint_directory"):
+        create_app()
+    with pytest.raises(ValueError, match="waypoint_directory"):
+        start()
 
 
 def test_overwrite_waypoint_file_replaces_existing_content(tmp_path):

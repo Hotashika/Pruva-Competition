@@ -6,8 +6,10 @@ from enum import Enum, auto
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_TEXT = str(REPO_ROOT)
+while REPO_ROOT_TEXT in sys.path:
+    sys.path.remove(REPO_ROOT_TEXT)
+sys.path.insert(0, REPO_ROOT_TEXT)
 
 import rclpy
 from mavros_msgs.srv import SetMode
@@ -15,6 +17,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
 
+from teknofest.config.mission_config import WAYPOINT_DIRECTORY
 # Yardımcı fonksiyonlar (Kendi yazdıklarımız ve mavlink_utilities içindekiler)
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
@@ -31,22 +34,30 @@ from utils.mavlink_utilities import (
 )
 from utils.read_waypoints import parse_qgc_waypoints
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "teknofest_task1.waypoints"
+WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task1.waypoints"
 
 # ============================================================
-# SAFETY PARAMS
+# GÜVENLİK PARAMETRELERİ
 # ============================================================
-GPS_TIMEOUT_SEC = 2.0  # Bu süre GPS/heading gelmezse dur
+GPS_TIMEOUT_SEC = 2.0
+HEADING_TIMEOUT_SEC = 2.0
 BRIDGE_STATE_TIMEOUT_SEC = 10.0
 HOLD_MODE_NAME = "HOLD"
 GEOFENCE_RADIUS_M = 150.0  # Başlangıç noktasından max uzaklık
 MIN_VALID_ABS_COORD = 1e-6
+
+# ============================================================
+# NAVİGASYON PARAMETRELERİ
+# ============================================================
+WAYPOINT_TOLERANCE_M = 1.0
 WAYPOINT_SETTLE_SEC = 0.75
 WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 
+# ============================================================
+# VISION PARAMETRELERİ
+# ============================================================
 DETECTION_TOPIC = "/vision/detections"
-DETECTION_STALE_SEC = 3.00
+VISION_DETECTION_TIMEOUT_SEC = 3.00
 
 
 class MissionState(Enum):
@@ -72,7 +83,7 @@ class Task1Maneuvering:
 
         self.waypoints = parse_qgc_waypoints(WAYPOINT_PATH)
         self.current_target_index = 0
-        self.waypoint_tolerance = 1
+        self.waypoint_tolerance = WAYPOINT_TOLERANCE_M
 
         self.logger.info(f"[INIT-DEBUG] Parsed waypoints: {self.waypoints}")
 
@@ -161,10 +172,11 @@ class Task1Maneuvering:
         if self.last_heading_time is None:
             return False
 
-        if (now - self.last_heading_time) > GPS_TIMEOUT_SEC:
+        if (now - self.last_heading_time) > HEADING_TIMEOUT_SEC:
             if self.state != MissionState.FAILSAFE:
                 self.logger.error(
-                    f"HEADING DATA NOT RECEIVED FOR OVER {GPS_TIMEOUT_SEC}s! FAILSAFE."
+                    f"HEADING DATA NOT RECEIVED FOR OVER "
+                    f"{HEADING_TIMEOUT_SEC}s! FAILSAFE."
                 )
             self.state = MissionState.FAILSAFE
             return False
@@ -397,6 +409,8 @@ class Task1Node(Node):
         self.task = Task1Maneuvering(self, self.mission_topics, self.mission_clients)
 
         # Anlık Yönelim Değişkeni (GPS Callback'e aktarmak için)
+        self.current_lat = None
+        self.current_lon = None
         self.current_heading = None
         self.bridge_connected = False
         self.bridge_armed = False
@@ -439,10 +453,13 @@ class Task1Node(Node):
                 "Gecersiz GPS (0,0) yok sayiliyor.",
                 throttle_duration_sec=2.0
             )
-            return
+            return False
 
+        self.current_lat = float(msg.latitude)
+        self.current_lon = float(msg.longitude)
         self.valid_gps_received = True
-        self.task.update_gps(msg.latitude, msg.longitude)
+        self.task.update_gps(self.current_lat, self.current_lon)
+        return True
 
     def heading_callback(self, msg):
         """Araçtan gelen Float32 yön verisini dinler."""
@@ -507,7 +524,7 @@ class Task1Node(Node):
     def _get_fresh_detections(self):
         if self.last_detection_message_time is None:
             return []
-        if time.monotonic() - self.last_detection_message_time > DETECTION_STALE_SEC:
+        if time.monotonic() - self.last_detection_message_time > VISION_DETECTION_TIMEOUT_SEC:
             return []
         return list(self.latest_detections)
 
@@ -572,7 +589,7 @@ class Task1Node(Node):
             if (
                     self.last_detection_message_time is not None
                     and time.monotonic() - self.last_detection_message_time
-                    <= DETECTION_STALE_SEC
+                    <= VISION_DETECTION_TIMEOUT_SEC
             ):
                 return True
 

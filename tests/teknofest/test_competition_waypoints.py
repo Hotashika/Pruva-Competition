@@ -23,35 +23,55 @@ def _write_waypoints(path, points):
 
 def test_competition_points_are_named_in_required_order(tmp_path):
     path = tmp_path / "competition.waypoints"
-    _write_waypoints(path, [(37.1, 32.1), (37.4, 32.4), (37.5, 32.5)])
+    _write_waypoints(
+        path,
+        [
+            (37.1, 32.1),
+            (37.2, 32.2),
+            (37.3, 32.3),
+            (37.4, 32.4),
+            (37.5, 32.5),
+        ],
+    )
 
     points = load_competition_points(path)
 
-    assert tuple(points) == ("GN1", "GN4", "GN5")
+    assert tuple(points) == ("GN1", "GN2", "GN3", "GN4", "GN5")
     assert points["GN4"]["lat"] == pytest.approx(37.4)
     assert points["GN5"]["lon"] == pytest.approx(32.5)
 
 
 def test_default_competition_source_is_teknofest_waypoints():
     assert GN_WAYPOINT_PATH.name == "teknofest.waypoints"
+    assert GN_WAYPOINT_PATH.parent.name == "teknofest"
 
 
 def test_competition_routes_use_gn_boundaries():
     points = {
         "GN1": {"name": "GN1"},
+        "GN2": {"name": "GN2"},
+        "GN3": {"name": "GN3"},
         "GN4": {"name": "GN4"},
         "GN5": {"name": "GN5"},
     }
 
     routes = build_competition_routes(points)
 
-    assert [point["name"] for point in routes["task1"]] == ["GN1", "GN4"]
+    assert [point["name"] for point in routes["task1"]] == [
+        "GN1",
+        "GN2",
+        "GN3",
+        "GN4",
+    ]
     assert [point["name"] for point in routes["task2"]] == ["GN4", "GN5"]
 
 
-def test_competition_file_requires_exactly_three_points(tmp_path):
+def test_competition_file_requires_exactly_five_points(tmp_path):
     path = Path(tmp_path) / "competition.waypoints"
-    _write_waypoints(path, [(37.1, 32.1), (37.4, 32.4)])
+    _write_waypoints(
+        path,
+        [(37.1, 32.1), (37.2, 32.2), (37.3, 32.3), (37.4, 32.4)],
+    )
 
-    with pytest.raises(ValueError, match="tam 3 nokta"):
+    with pytest.raises(ValueError, match="tam 5 nokta"):
         load_competition_points(path)

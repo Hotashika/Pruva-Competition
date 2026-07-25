@@ -13,20 +13,18 @@ COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
 if COMPETITION_ROOT not in sys.path:
     sys.path.insert(0, COMPETITION_ROOT)
 
-from utils.task_selection_state import default_task_selection_file
 from utils import waypoint_server
+from njord.config.mission_config import (
+    MAVLINK_BRIDGE_DEFAULTS,
+    MAVLINK_BRIDGE_OVERRIDES,
+    WAYPOINT_DIRECTORY,
+)
 from njord.core import capture_proc
 from njord.core import data_writer
 from njord.servers import data_server
 from njord.servers import video_server
 
-
-DATASET_OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "logs", "datasets")
-DATASET_TASK_NAME = (
-    os.getenv("NJORD_DATASET_TASK", "task2").strip().lower() or "task2"
-)
-DATASET_RECORD_FPS = float(os.getenv("NJORD_DATASET_RECORD_FPS", "5.0"))
-
+os.environ.setdefault("YOLO_OFFLINE", "true")
 
 def launch_child_process(command):
     return subprocess.Popen(
@@ -84,18 +82,9 @@ def run_startup_cleanup():
 
 
 def configure_mavlink_bridge_environment():
-    defaults = {
-        "MAVLINK20": "1",
-        "DETECTION_MIN_CONFIDENCE": "0.30",
-        "MAVLINK_CONNECTION_STRING": "/dev/ttyACM0",
-        "MAVLINK_BAUD": "921600",
-        "MAVLINK_SOURCE_SYSTEM": "1",
-        "MAVLINK_SOURCE_COMPONENT": "191",
-        "MAVLINK_MISSION_START_TOPIC": "/mission_start",
-        "MISSION_SELECTION_FILE": default_task_selection_file(),
-    }
-    for key, value in defaults.items():
+    for key, value in MAVLINK_BRIDGE_DEFAULTS.items():
         os.environ.setdefault(key, value)
+    os.environ.update(MAVLINK_BRIDGE_OVERRIDES)
 
     print(
         "[SYSTEM] MAVLink bridge env: "
@@ -103,7 +92,9 @@ def configure_mavlink_bridge_environment():
         f"baud={os.environ.get('MAVLINK_BAUD')}, "
         f"source={os.environ.get('MAVLINK_SOURCE_SYSTEM')}:"
         f"{os.environ.get('MAVLINK_SOURCE_COMPONENT')}, "
+        f"mission_param={os.environ.get('MAVLINK_MISSION_PARAM_NAME')}, "
         f"mission_start_topic={os.environ.get('MAVLINK_MISSION_START_TOPIC')}, "
+        f"waypoint_directory={os.environ.get('MAVLINK_MISSION_WAYPOINT_DIRECTORY')}, "
         f"mission_selection_file={os.environ.get('MISSION_SELECTION_FILE')}"
     )
 
@@ -113,7 +104,6 @@ def start_capture_process():
     frame_lock = mp_context.Lock()
     frame_ready_event = mp_context.Event()
     stop_event = mp_context.Event()
-    dataset_record_event = mp_context.Event()
     ready_queue = mp_context.Queue(maxsize=1)
 
     process = mp_context.Process(
@@ -123,10 +113,6 @@ def start_capture_process():
             "frame_ready_event": frame_ready_event,
             "stop_event": stop_event,
             "ready_queue": ready_queue,
-            "dataset_output_root": DATASET_OUTPUT_ROOT,
-            "dataset_task": DATASET_TASK_NAME,
-            "dataset_record_fps": DATASET_RECORD_FPS,
-            "dataset_record_event": dataset_record_event,
         },
         daemon=False,
     )
@@ -150,22 +136,11 @@ def start_capture_process():
     fx = ready_msg["fx"]
     cx = ready_msg["cx"]
     print(f"[SYSTEM] ZED calibration loaded: fx={fx:.2f}, cx={cx:.2f}")
-    if "dataset_run_dir" in ready_msg:
-        print(f"[SYSTEM] Dataset recording -> {ready_msg['dataset_run_dir']}")
-    if "dataset_waiting_for_task" in ready_msg:
-        print(
-            "[SYSTEM] Dataset recorder is waiting for active task -> "
-            f"{ready_msg['dataset_waiting_for_task']}"
-        )
-    if "dataset_error" in ready_msg:
-        print(f"[SYSTEM] Dataset recording disabled: {ready_msg['dataset_error']}")
-
     return (
         process,
         frame_lock,
         frame_ready_event,
         stop_event,
-        dataset_record_event,
         fx,
         cx,
     )
@@ -177,7 +152,6 @@ if __name__ == "__main__":
     bridge_only = False
     capture_process = None
     capture_stop_event = None
-    dataset_record_event = None
     frame_lock = None
     frame_ready_event = None
     p_bridge = None
@@ -186,7 +160,11 @@ if __name__ == "__main__":
 
     try:
         run_startup_cleanup()
-        threading.Thread(target=waypoint_server.start, args=(8000,), daemon=True).start()
+        threading.Thread(
+            target=waypoint_server.start,
+            args=(8000, WAYPOINT_DIRECTORY),
+            daemon=True,
+        ).start()
         print("[SYSTEM] Waypoint upload -> http://0.0.0.0:8000/api/mission/upload_txt")
         try:
             (
@@ -194,7 +172,6 @@ if __name__ == "__main__":
                 frame_lock,
                 frame_ready_event,
                 capture_stop_event,
-                dataset_record_event,
                 fx,
                 cx,
             ) = start_capture_process()
@@ -226,11 +203,14 @@ if __name__ == "__main__":
             f"{shlex.quote(COMPETITION_ROOT)}:${{PYTHONPATH:-}}"
         )
 
-        vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
+        vision_path = os.path.join(COMPETITION_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
         mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
 
-        vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        vision_args_setup = (
+            f"--competition njord "
+            f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        )
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
@@ -254,7 +234,10 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        print(" -> Bridge publishes SCR_USER1 commands to /mission_start.")
+        print(
+            " -> Bridge publishes "
+            f"{os.environ['MAVLINK_MISSION_PARAM_NAME']} commands to /mission_start."
+        )
         print(" -> Mission Manager starts the selected task process after waypoint sync.")
         print(" -> Mission selection and process state are written to JSON.\n")
 
@@ -268,8 +251,6 @@ if __name__ == "__main__":
                 frame_lock,
                 frame_ready_event,
                 capture_stop_event,
-                dataset_record_event=dataset_record_event,
-                dataset_task=DATASET_TASK_NAME,
             )
 
     except KeyboardInterrupt:

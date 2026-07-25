@@ -102,18 +102,22 @@ class GpsPoint:
 
 @dataclass
 class ModeConfig:
+    # İskele geometrisi / görev sırası
     name: str
     hold_seconds: float
     berth_width_m: float
     berth_length_m: float
     approach_point: GpsPoint = field(default_factory=GpsPoint)
     exit_point: GpsPoint = field(default_factory=GpsPoint)
+
+    # Manevra parametreleri
     reverse_seconds: float = 3.0
     stop_area_ratio: float = 0.060
     search_timeout_seconds: float = 20.0
     final_approach_timeout_seconds: float = 18.0
     target_payloads: Tuple[str, ...] = field(default_factory=tuple)
 
+    # Heading hizalama parametreleri
     # Opsiyonel global liman/dock açısı.
     # Verilirse ALIGN_TO_TAG aşamasında önce tekne bu global heading'e hizalanır,
     # sonra QR görüntü merkezleme ile ince hizalama yapılır.
@@ -125,24 +129,33 @@ class ModeConfig:
 
 @dataclass
 class Task3Config:
+    # Çalıştırma / araç yönetimi parametreleri
     dry_run: bool = True
     auto_start: bool = True
     arm_vehicle: bool = True
     set_guided_mode: bool = True
     require_gps_for_visual_docking: bool = False
     real_run_acknowledged: bool = False
+
+    # Güvenlik parametreleri
     gps_timeout_sec: float = 2.0
     heading_timeout_sec: float = 2.0
     bridge_state_timeout_sec: float = 2.0
     geofence_radius_m: float = 150.0
+
+    # Navigasyon parametreleri
     waypoint_tolerance_m: float = 1.2
     control_hz: float = 10.0
+
+    # ROS / vision parametreleri
     qr_topic: str = "/njord/task3/qr_detections"
     docking_state_topic: str = "/njord/task3/docking_state"
     active_task_topic: str = "/mission/active_task"
     min_tag_confidence: float = 0.20
     qr_detection_timeout_sec: float = 1.0
     allowed_payloads: Tuple[str, ...] = ("middle_berth_1", "middle_berth_2", "middle_parallel")
+
+    # Görsel hizalama parametreleri
     image_center_deadband_norm: float = 0.08
     align_kp_yaw: float = 0.45
     final_kp_yaw: float = 0.28
@@ -152,11 +165,15 @@ class Task3Config:
     approach_linear_speed: float = 0.5
     final_linear_speed: float = 0.5
     reverse_linear_speed: float = -0.14
+
+    # Detection doğrulama parametreleri
     max_frame_age_ms: float = 500.0
     require_qr_confirmation: bool = True
     confirmation_window_size: int = 6
     confirmation_required_count: int = 3
     confirmation_max_age_sec: float = 1.5
+
+    # Görev modu sırası
     sequence: Tuple[str, ...] = ("normal", "parallel")
     modes: Dict[str, ModeConfig] = field(default_factory=dict)
 

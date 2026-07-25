@@ -37,11 +37,17 @@ from utils.mavlink_utilities import (
     create_bridge_services,
     create_bridge_topics,
 )
+from utils.mission_waypoint_files import (
+    parse_mission_waypoint_files,
+    resolve_mission_waypoint_directory,
+)
 from utils.pixhawk_waypoints import mission_items_to_qgc
-from utils.waypoint_server import DEFAULT_WAYPOINT_DIRECTORY, overwrite_waypoint_file
+from utils.waypoint_server import overwrite_waypoint_file
 from utils.battery import battery_percentage_from_voltage
 
-MISSION_PARAM_NAME = os.getenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER1").strip() or "SCR_USER1"
+MISSION_PARAM_NAME = (
+    os.getenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER1").strip() or "SCR_USER1"
+)
 MISSION_IDLE = 0
 MISSION_1 = 1
 MISSION_2 = 2
@@ -57,11 +63,6 @@ VALID_MISSION_COMMANDS = {
     MISSION_4,
     MISSION_STOP,
     MISSION_EMERGENCY,
-}
-MISSION_DOWNLOAD_COMMANDS = {
-    int(value)
-    for value in os.getenv("MAVLINK_MISSION_DOWNLOAD_COMMANDS", "1,2,4").split(",")
-    if value.strip()
 }
 DETECTION_SEND_INTERVAL_SEC = 0.2
 DETECTION_MAX_PER_FRAME = 4
@@ -90,6 +91,20 @@ def euler_to_quaternion(roll, pitch, yaw):
     qz = cr * cp * sy - sr * sp * cy
 
     return qx, qy, qz, qw
+
+
+def gps_bearing_deg(lat1, lon1, lat2, lon2):
+    """Return the initial bearing from one WGS84 coordinate to another."""
+
+    lat1_rad = math.radians(float(lat1))
+    lat2_rad = math.radians(float(lat2))
+    delta_lon_rad = math.radians(float(lon2) - float(lon1))
+    east = math.sin(delta_lon_rad) * math.cos(lat2_rad)
+    north = (
+        math.cos(lat1_rad) * math.sin(lat2_rad)
+        - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(delta_lon_rad)
+    )
+    return math.degrees(math.atan2(east, north)) % 360.0
 
 
 def set_position(connection, destination, boot_time):
@@ -167,6 +182,14 @@ class OrangeCubeBridgeNode(Node):
             "mission_start_retry_sec",
             float(os.getenv("MAVLINK_MISSION_START_RETRY_SEC", "1.0")),
         )
+        self.declare_parameter(
+            "mission_waypoint_files",
+            os.getenv("MAVLINK_MISSION_WAYPOINT_FILES", ""),
+        )
+        self.declare_parameter(
+            "mission_waypoint_directory",
+            os.getenv("MAVLINK_MISSION_WAYPOINT_DIRECTORY", ""),
+        )
 
         self.connection_string = self.get_parameter("connection_string").value
         self.baud = int(self.get_parameter("baud").value)
@@ -186,6 +209,13 @@ class OrangeCubeBridgeNode(Node):
         self.mission_start_ack_topic = str(self.get_parameter("mission_start_ack_topic").value)
         self.mission_start_retry_sec = float(
             self.get_parameter("mission_start_retry_sec").value
+        )
+        self.mission_waypoint_files = parse_mission_waypoint_files(
+            self.get_parameter("mission_waypoint_files").value
+        )
+        self.mission_waypoint_directory = resolve_mission_waypoint_directory(
+            self.mission_waypoint_files,
+            self.get_parameter("mission_waypoint_directory").value,
         )
 
         self.master = None
@@ -215,6 +245,7 @@ class OrangeCubeBridgeNode(Node):
         self.gps_lon = None
         self.gps_alt = None
         self.relative_alt = None
+        self.ground_speed_m_s = None
         self.heading_deg = None
         self.roll = None
         self.pitch = None
@@ -236,6 +267,8 @@ class OrangeCubeBridgeNode(Node):
         self.cmd_timeout_sec = 0.5
         self.last_target_q = self._yaw_to_mavlink_quaternion(0.0)
         self.last_thrust = 0.0
+        self.speed_setpoint_m_s = 0.0
+        self.heading_setpoint_deg = None
         self.last_attitude_tx_active = False
         self.last_position_target_time = 0.0
         self.position_target_timeout_sec = 0.5
@@ -243,6 +276,11 @@ class OrangeCubeBridgeNode(Node):
             self,
             self._cmd_vel_callback,
             self._set_position_callback,
+        )
+        self.telemetry_pub = self.create_publisher(
+            String,
+            "/cube/telemetry",
+            10,
         )
         self.bridge_services = create_bridge_services(
             self,
@@ -294,6 +332,17 @@ class OrangeCubeBridgeNode(Node):
             f"{self.mission_start_topic} topic'ine Int32 olarak yayinlanacak; "
             f"{self.mission_start_ack_topic} ack geldikten sonra {MISSION_PARAM_NAME}=0 yapilacak."
         )
+        if self.mission_waypoint_files:
+            self.get_logger().info(
+                "Mission waypoint senkron hedefleri: "
+                f"directory={self.mission_waypoint_directory}, "
+                f"files={self.mission_waypoint_files}"
+            )
+        else:
+            self.get_logger().warn(
+                "Mission waypoint senkronizasyonu yapilandirilmadi; "
+                "gorev komutlari waypoint indirmeden yayinlanacak."
+            )
 
         self.get_logger().info("/cube topic ve servisleri aktif.")
 
@@ -639,10 +688,12 @@ class OrangeCubeBridgeNode(Node):
 
     def _neutralize_outputs(self):
         self.last_thrust = 0.0
+        self.speed_setpoint_m_s = 0.0
         self.last_attitude_tx_active = False
         self.last_position_target_time = 0.0
         if self.yaw is not None:
             self.last_target_q = self._yaw_to_mavlink_quaternion(self.yaw)
+            self.heading_setpoint_deg = math.degrees(self.yaw) % 360.0
         self.last_cmd_vel_time = 0.0
 
     @staticmethod
@@ -657,6 +708,7 @@ class OrangeCubeBridgeNode(Node):
         self.gps_lon = None
         self.gps_alt = None
         self.relative_alt = None
+        self.ground_speed_m_s = None
         self.heading_deg = None
         self.roll = None
         self.pitch = None
@@ -667,6 +719,8 @@ class OrangeCubeBridgeNode(Node):
         self.voltage_v = None
         self.current_a = None
         self.battery_remaining = None
+        self.speed_setpoint_m_s = 0.0
+        self.heading_setpoint_deg = None
 
     def _close_master(self):
         if self.master is None:
@@ -1034,11 +1088,18 @@ class OrangeCubeBridgeNode(Node):
                     self.gps_lon = msg.lon / 1e7
                     self.gps_alt = msg.alt / 1000.0
                     self.relative_alt = msg.relative_alt / 1000.0
+                    if hasattr(msg, "vx") and hasattr(msg, "vy"):
+                        self.ground_speed_m_s = (
+                            math.hypot(float(msg.vx), float(msg.vy)) / 100.0
+                        )
                     if hasattr(msg, "hdg") and msg.hdg != 65535:
                         self.heading_deg = msg.hdg / 100.0
 
-                elif msg_type == "VFR_HUD" and hasattr(msg, "heading"):
-                    self.heading_deg = float(msg.heading)
+                elif msg_type == "VFR_HUD":
+                    if hasattr(msg, "heading"):
+                        self.heading_deg = float(msg.heading)
+                    if hasattr(msg, "groundspeed"):
+                        self.ground_speed_m_s = float(msg.groundspeed)
 
                 elif msg_type == "ATTITUDE":
                     self.roll = float(msg.roll)
@@ -1180,8 +1241,9 @@ class OrangeCubeBridgeNode(Node):
         mission_number = command
         mission_name = f"M{mission_number}"
 
-        if mission_number in MISSION_DOWNLOAD_COMMANDS:
-            self._start_mission_download(mission_number)
+        if mission_number in self.mission_waypoint_files:
+            if not self._start_mission_download(mission_number):
+                return
             self._send_status_text(
                 f"{MISSION_PARAM_NAME} received: {mission_name}, downloading mission",
                 mavutil.mavlink.MAV_SEVERITY_INFO,
@@ -1207,18 +1269,28 @@ class OrangeCubeBridgeNode(Node):
         )
 
     def _start_mission_download(self, mission_number):
-        if self.master is None:
-            self.get_logger().warn("Waypoint senkronizasyonu baslatilamadi: MAVLink yok.")
-            return
-
         self.mission_download_task = int(mission_number)
         self.mission_download_count = None
         self.mission_download_items = {}
         self.mission_download_retry_count = 0
-        self._request_mission_list()
+        if self.master is None:
+            self._abort_mission_download(
+                "Waypoint senkronizasyonu baslatilamadi: MAVLink yok."
+            )
+            return False
+
+        try:
+            self._request_mission_list()
+        except Exception as exc:
+            self._abort_mission_download(
+                f"Pixhawk mission listesi istenemedi: {exc}"
+            )
+            return False
         self.get_logger().info(
-            f"Pixhawk mission listesi njord_task{mission_number}.waypoints icin isteniyor."
+            "Pixhawk mission listesi "
+            f"{self.mission_waypoint_files[mission_number]} icin isteniyor."
         )
+        return True
 
     def _request_mission_list(self):
         try:
@@ -1256,8 +1328,9 @@ class OrangeCubeBridgeNode(Node):
         self.mission_download_count = int(msg.count)
         self.mission_download_retry_count = 0
         if self.mission_download_count <= 0:
-            self.get_logger().warn("Pixhawk mission listesi bos; waypoint dosyasi degistirilmedi.")
-            self._reset_mission_download()
+            self._abort_mission_download(
+                "Pixhawk mission listesi bos; waypoint dosyasi degistirilmedi."
+            )
             return
         self._request_mission_item(0)
 
@@ -1280,11 +1353,11 @@ class OrangeCubeBridgeNode(Node):
             return
 
         task_number = self.mission_download_task
-        filename = f"njord_task{task_number}.waypoints"
+        filename = self.mission_waypoint_files[task_number]
         try:
             content = mission_items_to_qgc(self.mission_download_items.values())
             destination = overwrite_waypoint_file(
-                DEFAULT_WAYPOINT_DIRECTORY, filename, content
+                self.mission_waypoint_directory, filename, content
             )
             save_text = (
                 f"Pixhawk mission dosyaya yazildi: path={destination.resolve()}, "
@@ -1307,9 +1380,11 @@ class OrangeCubeBridgeNode(Node):
                 )
             self._publish_downloaded_mission_start(task_number)
         except Exception as exc:
-            self.get_logger().error(f"Pixhawk waypoint dosyasi yazilamadi: {exc}")
-        finally:
-            self._reset_mission_download()
+            self._abort_mission_download(
+                f"Pixhawk waypoint dosyasi yazilamadi: {exc}"
+            )
+            return
+        self._reset_mission_download()
 
     def _mission_download_watchdog(self):
         if self.mission_download_task is None:
@@ -1318,19 +1393,39 @@ class OrangeCubeBridgeNode(Node):
             return
         self.mission_download_retry_count += 1
         if self.mission_download_retry_count > 4:
-            self.get_logger().error("Pixhawk mission indirme zaman asimina ugradi.")
-            self._reset_mission_download()
+            self._abort_mission_download(
+                "Pixhawk mission indirme zaman asimina ugradi."
+            )
             return
-        if self.mission_download_count is None:
-            self._request_mission_list()
-            return
-        missing = next(
-            (seq for seq in range(self.mission_download_count)
-             if seq not in self.mission_download_items),
-            None,
+        try:
+            if self.mission_download_count is None:
+                self._request_mission_list()
+                return
+            missing = next(
+                (seq for seq in range(self.mission_download_count)
+                 if seq not in self.mission_download_items),
+                None,
+            )
+            if missing is not None:
+                self._request_mission_item(missing)
+        except Exception as exc:
+            self._abort_mission_download(
+                f"Pixhawk mission indirme istegi gonderilemedi: {exc}"
+            )
+
+    def _abort_mission_download(self, reason):
+        task_number = self.mission_download_task
+        self.get_logger().error(reason)
+        self._publish_diagnostic(reason)
+        self._send_status_text(
+            f"mission download failed: M{task_number}",
+            mavutil.mavlink.MAV_SEVERITY_ERROR,
         )
-        if missing is not None:
-            self._request_mission_item(missing)
+        self._reset_mission_download()
+        if task_number is not None:
+            # Keep last_mission_parameter_value unchanged until PARAM_VALUE=0
+            # arrives, so a stale non-zero echo cannot immediately retrigger.
+            self._set_mission_parameter(MISSION_IDLE)
 
     def _reset_mission_download(self):
         self.mission_download_task = None
@@ -1513,6 +1608,39 @@ class OrangeCubeBridgeNode(Node):
                 battery_msg.current = float(self.current_a)
             battery_msg.percentage = battery_percentage_from_voltage(self.voltage_v)
             self.topics.battery_pub.publish(battery_msg)
+
+        telemetry_values = (
+            self.gps_lat,
+            self.gps_lon,
+            self.ground_speed_m_s,
+            self.roll,
+            self.pitch,
+            self.heading_deg,
+        )
+        if link_ready and all(
+            value is not None and math.isfinite(float(value))
+            for value in telemetry_values
+        ):
+            telemetry_msg = String()
+            telemetry_msg.data = json.dumps(
+                {
+                    "latitude_deg": float(self.gps_lat),
+                    "longitude_deg": float(self.gps_lon),
+                    "ground_speed_m_s": float(self.ground_speed_m_s),
+                    "roll_deg": math.degrees(float(self.roll)),
+                    "pitch_deg": math.degrees(float(self.pitch)),
+                    "heading_deg": float(self.heading_deg) % 360.0,
+                    "speed_setpoint_m_s": float(self.speed_setpoint_m_s),
+                    "heading_setpoint_deg": (
+                        float(self.heading_setpoint_deg) % 360.0
+                        if self.heading_setpoint_deg is not None
+                        else float(self.heading_deg) % 360.0
+                    ),
+                },
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            self.telemetry_pub.publish(telemetry_msg)
 
         state_msg = String()
         state_msg.data = (
@@ -1766,6 +1894,13 @@ class OrangeCubeBridgeNode(Node):
         try:
             set_position(self.master, (lat, lon), self.boot_time)
             self.last_position_target_time = time.time()
+            if self.gps_lat is not None and self.gps_lon is not None:
+                self.heading_setpoint_deg = gps_bearing_deg(
+                    self.gps_lat,
+                    self.gps_lon,
+                    lat,
+                    lon,
+                )
             self.get_logger().info(
                 "MAVLink TX SET_POSITION_TARGET_GLOBAL_INT: "
                 f"lat={lat:.7f}, lon={lon:.7f}, armed={self.armed}, mode={self.mode}",
@@ -1798,6 +1933,8 @@ class OrangeCubeBridgeNode(Node):
         target_yaw_rad = (self.yaw if self.yaw is not None else 0.0) + angular_z
         self.last_target_q = self._yaw_to_mavlink_quaternion(target_yaw_rad)
         self.last_thrust = linear_x
+        self.speed_setpoint_m_s = linear_x
+        self.heading_setpoint_deg = math.degrees(target_yaw_rad) % 360.0
 
         self.last_cmd_vel_time = time.time()
 

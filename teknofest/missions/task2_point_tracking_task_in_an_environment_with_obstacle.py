@@ -33,8 +33,10 @@ from enum import Enum, auto
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_TEXT = str(REPO_ROOT)
+while REPO_ROOT_TEXT in sys.path:
+    sys.path.remove(REPO_ROOT_TEXT)
+sys.path.insert(0, REPO_ROOT_TEXT)
 
 import rclpy
 from mavros_msgs.srv import SetMode
@@ -42,6 +44,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
 
+from teknofest.config.mission_config import WAYPOINT_DIRECTORY
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
     calculate_bearing,
@@ -62,14 +65,13 @@ from teknofest.missions.utils.yellow_buoy_course_keeper import (
     YellowBuoyCourseKeeper,
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-WAYPOINT_PATH = BASE_DIR.parent / "waypoints" / "teknofest_task2.waypoints"
+WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task2.waypoints"
 
 # ============================================================
 # ROS / VISION PARAMETRELERİ
 # ============================================================
 DETECTION_TOPIC = "/vision/detections"
-DETECTION_STALE_SEC = 3.00
+VISION_DETECTION_TIMEOUT_SEC = 3.00
 
 # Görev 2 parkurundaki bütün engeller sarı dubadır. Mevcut buoy.pt modelinin
 # class adı dışında hiçbir tespit engel kaçınmasını tetiklemez.
@@ -85,11 +87,17 @@ BRIDGE_STATE_TIMEOUT_SEC = 10.0
 HOLD_MODE_NAME = "HOLD"
 GEOFENCE_RADIUS_M = 150.0
 MIN_VALID_ABS_COORD = 1e-6
-WAYPOINT_SETTLE_SEC = 0.75
-WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 
 # ============================================================
-# SARI DUBA PARKUR / KAÇINMA PARAMETRELERİ
+# NAVİGASYON PARAMETRELERİ
+# ============================================================
+WAYPOINT_TOLERANCE_M = 1.0
+WAYPOINT_SETTLE_SEC = 0.75
+WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
+EARTH_RADIUS_M = 6378137.0
+
+# ============================================================
+# SARI DUBA PARKUR PARAMETRELERİ
 # ============================================================
 # Gorev basinda iki sari duba bulunamazsa bu sure boyunca ana GPS hedefine git.
 INITIAL_YELLOW_SEARCH_GRACE_SEC = 3.0
@@ -100,25 +108,33 @@ YELLOW_COURSE_LOOKAHEAD_M = 5.0
 # Sari parkur bir kez bulunduktan sonra tespit kaybinda son yonu koruma suresi.
 YELLOW_TARGET_MEMORY_SEC = 1.0
 
-# Sari duba bu mesafeden daha yakina geldiginde GPS hedefli kacinmayi baslat.
-AVOID_ENTER_DIST_M = 3.0
+# ============================================================
+# KAÇINMA PARAMETRELERİ
+# ============================================================
+# Sarı duba bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
+AVOIDANCE_START_DISTANCE_M = 3.0
+AVOIDANCE_EXIT_DISTANCE_M = 4.0
+AVOIDANCE_PASS_CLEARANCE_M = 2.5
+AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M = 0.25
+AVOIDANCE_WAYPOINT_TOLERANCE_M = 0.5
+AVOIDANCE_EXIT_FORWARD_DISTANCE_M = 3.0
+AVOIDANCE_BEHIND_MARGIN_M = 1.0
+AVOIDANCE_TIMEOUT_SEC = 20.0
+AVOIDANCE_RETRIGGER_COOLDOWN_SEC = 6.0
+AVOIDANCE_RETRIGGER_RADIUS_M = 2.0
 
-# Aktif kacinmada vision ile izlenecek sari duba icin en uzak kabul mesafesi.
-AVOID_EXIT_DIST_M = 4.0
-
-# Kacinma GPS hedefini sari dubanin sagina/soluna bu kadar metre aciklikla koy.
-AVOID_PASS_CLEARANCE_M = 2.0
-
-# Vision gurultusunu elemek icin GPS hedefini ancak bu kadar kayarsa yenile.
-AVOID_TARGET_REFRESH_MIN_SHIFT_M = 0.25
-
-# Kacinma GPS hedefine bu mesafeden daha yakin olunca gecisi tamamlanmis say.
-AVOID_WAYPOINT_TOLERANCE_M = 0.5
+# ============================================================
+# ENGEL EŞLEŞTİRME / FİLTRE PARAMETRELERİ
+# ============================================================
+OBSTACLE_CONFIRMATION_MAX_GAP_SEC = 0.75
+OBSTACLE_FILTER_ALPHA = 0.40
+OBSTACLE_MATCH_MAX_ANGLE_DELTA_DEG = 25.0
+OBSTACLE_MATCH_MAX_DISTANCE_DELTA_M = 2.0
+OBSTACLE_BBOX_MIN_IOU = 0.05
 
 # Duba kameranın tam ortasındaysa seçilecek kaçış yönü.
 DEFAULT_CENTER_AVOIDANCE_SIDE = "right"
 
-EARTH_RADIUS_M = 6378137.0
 
 
 class MissionState(Enum):
@@ -141,7 +157,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.logger.info(f"[INIT] Waypoint sayısı: {len(self.waypoints)}")
 
         self.current_target_index = 0
-        self.waypoint_tolerance = 1.0
+        self.waypoint_tolerance = WAYPOINT_TOLERANCE_M
 
         self.current_lat = None
         self.current_lon = None
@@ -170,6 +186,14 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.avoidance_target = None
         self.avoidance_side = None
         self.avoided_obstacle_side = None
+        self.avoidance_phase = None
+        self.avoidance_started_time = None
+        self.avoiding_track_id = None
+        self.active_obstacle_reference = None
+        self.pending_obstacle = None
+        self.pending_obstacle_time = None
+        self.pending_obstacle_count = 0
+        self.recently_avoided_obstacles = []
         self.obstacle_data_uncertain = False
         self.bridge_connected = False
         self.bridge_armed = False
@@ -203,6 +227,14 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.state = MissionState.FAILSAFE
         stop_vehicle(self.topics.cmd_vel_pub)
         self._request_hold_mode()
+
+    def reset_geofence_origin(self, lat, lon):
+        self.home_lat = float(lat)
+        self.home_lon = float(lon)
+        self.logger.info(
+            f"Task 2 geofence merkezi yenilendi: "
+            f"{self.home_lat:.7f}, {self.home_lon:.7f}"
+        )
 
     # ========================================================
     # VERİ GÜNCELLEME
@@ -423,12 +455,159 @@ class Task2PointTrackingWithObstacleAvoidance:
             "side": side,
             "angle": angle,
             "bbox": bbox,
+            "track_id": obj.get("track_id"),
             "raw": obj,
         }
 
-    def _nearest_relevant_obstacle(self, detections):
+    @staticmethod
+    def _bbox_iou(first, second):
+        if not (
+                isinstance(first, (list, tuple))
+                and isinstance(second, (list, tuple))
+                and len(first) >= 4
+                and len(second) >= 4
+        ):
+            return None
+        try:
+            ax1, ay1, ax2, ay2 = map(float, first[:4])
+            bx1, by1, bx2, by2 = map(float, second[:4])
+        except (TypeError, ValueError):
+            return None
+        intersection = (
+            max(0.0, min(ax2, bx2) - max(ax1, bx1))
+            * max(0.0, min(ay2, by2) - max(ay1, by1))
+        )
+        union = (
+            max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            + max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            - intersection
+        )
+        return intersection / union if union > 0.0 else None
+
+    def _same_obstacle(self, candidate, reference):
+        if reference is None or candidate.get("class") != reference.get("class"):
+            return reference is None
+        candidate_track = candidate.get("track_id")
+        reference_track = reference.get("track_id")
+        if candidate_track is not None and reference_track is not None:
+            return candidate_track == reference_track
+
+        bbox_iou = self._bbox_iou(
+            candidate.get("bbox"),
+            reference.get("bbox"),
+        )
+        bbox_match = bbox_iou is not None and bbox_iou >= OBSTACLE_BBOX_MIN_IOU
+        angle = self._safe_float(candidate.get("angle"))
+        reference_angle = self._safe_float(reference.get("angle"))
+        distance = self._safe_float(candidate.get("distance"))
+        reference_distance = self._safe_float(reference.get("distance"))
+        motion_match = (
+            angle is not None
+            and reference_angle is not None
+            and distance is not None
+            and reference_distance is not None
+            and abs(angle - reference_angle) <= OBSTACLE_MATCH_MAX_ANGLE_DELTA_DEG
+            and abs(distance - reference_distance)
+            <= OBSTACLE_MATCH_MAX_DISTANCE_DELTA_M
+        )
+        return bbox_match or motion_match
+
+    def _obstacle_match_score(self, candidate, reference):
+        if reference is None:
+            return float(candidate["distance"])
+        candidate_track = candidate.get("track_id")
+        reference_track = reference.get("track_id")
+        if candidate_track is not None and reference_track is not None:
+            return 0.0 if candidate_track == reference_track else math.inf
+
+        bbox_iou = self._bbox_iou(
+            candidate.get("bbox"),
+            reference.get("bbox"),
+        )
+        bbox_penalty = 1.0 if bbox_iou is None else 1.0 - bbox_iou
+        angle = self._safe_float(candidate.get("angle"))
+        reference_angle = self._safe_float(reference.get("angle"))
+        angle_penalty = (
+            1.0
+            if angle is None or reference_angle is None
+            else abs(angle - reference_angle) / OBSTACLE_MATCH_MAX_ANGLE_DELTA_DEG
+        )
+        distance_penalty = (
+            abs(float(candidate["distance"]) - float(reference["distance"]))
+            / OBSTACLE_MATCH_MAX_DISTANCE_DELTA_M
+        )
+        return bbox_penalty + angle_penalty + distance_penalty
+
+    def _filter_obstacle(self, obstacle, reference):
+        filtered = dict(obstacle)
+        if reference is None:
+            return filtered
+        distance = self._safe_float(obstacle.get("distance"))
+        reference_distance = self._safe_float(reference.get("distance"))
+        if distance is not None and reference_distance is not None:
+            filtered["distance"] = (
+                OBSTACLE_FILTER_ALPHA * distance
+                + (1.0 - OBSTACLE_FILTER_ALPHA) * reference_distance
+            )
+        angle = self._safe_float(obstacle.get("angle"))
+        reference_angle = self._safe_float(reference.get("angle"))
+        if angle is not None and reference_angle is not None:
+            filtered["angle"] = (
+                OBSTACLE_FILTER_ALPHA * angle
+                + (1.0 - OBSTACLE_FILTER_ALPHA) * reference_angle
+            )
+        return filtered
+
+    def _estimated_marker_gps(self, obstacle):
+        if (
+                self.current_lat is None
+                or self.current_lon is None
+                or self.current_heading is None
+                or obstacle.get("distance") is None
+        ):
+            return None
+        angle = obstacle.get("angle")
+        angle = 0.0 if angle is None else float(angle)
+        bearing = math.radians((float(self.current_heading) + angle) % 360.0)
+        return self._offset_gps(
+            self.current_lat,
+            self.current_lon,
+            north_m=float(obstacle["distance"]) * math.cos(bearing),
+            east_m=float(obstacle["distance"]) * math.sin(bearing),
+        )
+
+    def _is_recently_avoided(self, obstacle):
+        marker = self._estimated_marker_gps(obstacle)
+        for item in self.recently_avoided_obstacles:
+            if (
+                    obstacle.get("track_id") is not None
+                    and item.get("track_id") is not None
+                    and obstacle["track_id"] == item["track_id"]
+            ):
+                return True
+            if (
+                    marker is not None
+                    and item.get("marker_lat") is not None
+                    and item.get("marker_lon") is not None
+                    and self._gps_target_shift_m(
+                        marker,
+                        {
+                            "lat": item["marker_lat"],
+                            "lon": item["marker_lon"],
+                        },
+                    ) <= AVOIDANCE_RETRIGGER_RADIUS_M
+            ):
+                return True
+        return False
+
+    def _nearest_relevant_obstacle(self, detections, now=None):
         candidates = []
         self.obstacle_data_uncertain = False
+        now = time.monotonic() if now is None else float(now)
+        self.recently_avoided_obstacles = [
+            item for item in getattr(self, "recently_avoided_obstacles", [])
+            if item["expires_at"] > now
+        ]
 
         for raw_detection in detections or []:
             obstacle = self._normalize_detection(raw_detection)
@@ -445,12 +624,14 @@ class Task2PointTrackingWithObstacleAvoidance:
             if distance is None or distance <= 0.0:
                 self.obstacle_data_uncertain = True
                 continue
-            if distance >= AVOID_EXIT_DIST_M:
+            if distance >= AVOIDANCE_EXIT_DISTANCE_M:
                 continue
 
             # Yakın sarı dubanın sağ/sol bilgisi yoksa ilerlemek güvenli değildir.
             if obstacle["side"] is None:
                 self.obstacle_data_uncertain = True
+                continue
+            if self._is_recently_avoided(obstacle):
                 continue
 
             candidates.append(obstacle)
@@ -459,6 +640,66 @@ class Task2PointTrackingWithObstacleAvoidance:
             return None
 
         return min(candidates, key=lambda item: item["distance"])
+
+    def _confirmed_obstacle(self, obstacle, now):
+        if obstacle is None:
+            self.pending_obstacle = None
+            self.pending_obstacle_count = 0
+            return None
+        previous = getattr(self, "pending_obstacle", None)
+        pending_time = getattr(self, "pending_obstacle_time", None)
+        continuous = (
+            previous is not None
+            and pending_time is not None
+            and now - pending_time <= OBSTACLE_CONFIRMATION_MAX_GAP_SEC
+            and self._same_obstacle(obstacle, previous)
+        )
+        if continuous:
+            obstacle = self._filter_obstacle(obstacle, previous)
+        self.pending_obstacle_count = self.pending_obstacle_count + 1 if continuous else 1
+        self.pending_obstacle = obstacle
+        self.pending_obstacle_time = now
+        if self.pending_obstacle_count < 2:
+            return None
+        self.pending_obstacle = None
+        self.pending_obstacle_count = 0
+        return obstacle
+
+    def _matching_avoidance_obstacle(self, detections):
+        reference = getattr(self, "active_obstacle_reference", None)
+        candidates = []
+        for raw in detections or []:
+            obstacle = self._normalize_detection(raw)
+            if (
+                    obstacle is None
+                    or obstacle["class"] not in OBSTACLE_CLASS_NAMES
+                    or obstacle["confidence"] < MIN_OBSTACLE_CONFIDENCE
+            ):
+                continue
+            if obstacle["distance"] is None or not 0 < obstacle["distance"] < AVOIDANCE_EXIT_DISTANCE_M:
+                continue
+            avoiding_track_id = getattr(self, "avoiding_track_id", None)
+            if (avoiding_track_id is not None and
+                    obstacle.get("track_id") != avoiding_track_id):
+                continue
+            if avoiding_track_id is None and not self._same_obstacle(
+                    obstacle,
+                    reference,
+            ):
+                continue
+            score = self._obstacle_match_score(obstacle, reference)
+            candidates.append((score, obstacle))
+        if not candidates:
+            return None
+        obstacle = min(candidates, key=lambda item: item[0])[1]
+        filtered = self._filter_obstacle(obstacle, reference)
+        self.active_obstacle_reference = filtered
+        if (
+                getattr(self, "avoiding_track_id", None) is None
+                and obstacle.get("track_id") is not None
+        ):
+            self.avoiding_track_id = obstacle["track_id"]
+        return filtered
 
     # ========================================================
     # KAÇINMA HEDEFİ
@@ -526,15 +767,57 @@ class Task2PointTrackingWithObstacleAvoidance:
         target = self._offset_gps(
             marker_gps["lat"],
             marker_gps["lon"],
-            north_m=AVOID_PASS_CLEARANCE_M * math.cos(lateral_bearing_rad),
-            east_m=AVOID_PASS_CLEARANCE_M * math.sin(lateral_bearing_rad),
+            north_m=AVOIDANCE_PASS_CLEARANCE_M * math.cos(lateral_bearing_rad),
+            east_m=AVOIDANCE_PASS_CLEARANCE_M * math.sin(lateral_bearing_rad),
         )
         target.update({
             "marker_lat": marker_gps["lat"],
             "marker_lon": marker_gps["lon"],
             "reference_heading": float(reference_heading),
+            "phase": "pass",
         })
         return target
+
+    def _create_exit_target(self, target):
+        heading = math.radians(float(target["reference_heading"]))
+        coordinates = self._offset_gps(
+            target["lat"], target["lon"],
+            AVOIDANCE_EXIT_FORWARD_DISTANCE_M * math.cos(heading),
+            AVOIDANCE_EXIT_FORWARD_DISTANCE_M * math.sin(heading),
+        )
+        result = dict(target)
+        result.update(coordinates)
+        result["phase"] = "exit"
+        return result
+
+    def _obstacle_is_behind(self, target):
+        north = math.radians(self.current_lat - target["marker_lat"]) * EARTH_RADIUS_M
+        east = math.radians(self.current_lon - target["marker_lon"]) * EARTH_RADIUS_M
+        heading = math.radians(float(target["reference_heading"]))
+        return north * math.cos(heading) + east * math.sin(heading) >= AVOIDANCE_BEHIND_MARGIN_M
+
+    def _extend_exit_target(self, target):
+        north = math.radians(self.current_lat - target["marker_lat"]) * EARTH_RADIUS_M
+        east = (
+            math.radians(self.current_lon - target["marker_lon"])
+            * EARTH_RADIUS_M
+            * math.cos(math.radians(self.current_lat))
+        )
+        heading = math.radians(float(target["reference_heading"]))
+        along_track_m = north * math.cos(heading) + east * math.sin(heading)
+        forward_m = max(
+            1.0,
+            AVOIDANCE_BEHIND_MARGIN_M - along_track_m + AVOIDANCE_WAYPOINT_TOLERANCE_M,
+        )
+        coordinates = self._offset_gps(
+            self.current_lat,
+            self.current_lon,
+            north_m=forward_m * math.cos(heading),
+            east_m=forward_m * math.sin(heading),
+        )
+        extended = dict(target)
+        extended.update(coordinates)
+        return extended
 
     @staticmethod
     def _gps_target_shift_m(old_target, new_target):
@@ -552,7 +835,11 @@ class Task2PointTrackingWithObstacleAvoidance:
 
     def _refresh_avoidance_target(self, obstacle, main_target_lat, main_target_lon):
         """Aktif kacis GPS hedefini her vision dongusunde kontrol edip gunceller."""
-        if obstacle is None or self.avoidance_target is None:
+        if (
+                obstacle is None
+                or self.avoidance_target is None
+                or self.avoidance_target.get("phase", "pass") != "pass"
+        ):
             return
 
         refreshed_target = self._create_avoidance_target(
@@ -566,7 +853,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             self.avoidance_target,
             refreshed_target,
         )
-        if target_shift_m < AVOID_TARGET_REFRESH_MIN_SHIFT_M:
+        if target_shift_m < AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M:
             return
 
         self.avoidance_target = refreshed_target
@@ -576,7 +863,17 @@ class Task2PointTrackingWithObstacleAvoidance:
             throttle_duration_sec=0.5,
         )
 
-    def _start_avoidance(self, obstacle, main_target_lat, main_target_lon):
+    def _start_avoidance(
+            self,
+            obstacle,
+            main_target_lat,
+            main_target_lon,
+            now=None,
+    ):
+        obstacle = self._normalize_detection(obstacle)
+        if obstacle is None or obstacle["distance"] is None or obstacle["side"] is None:
+            self._enter_failsafe("Invalid obstacle detection while starting avoidance.")
+            return
         avoidance_side = self._choose_avoidance_side(obstacle["side"])
         target = self._create_avoidance_target(
             obstacle,
@@ -588,6 +885,12 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.avoided_obstacle_side = obstacle["side"]
         self.avoidance_side = avoidance_side
         self.avoidance_target = target
+        self.avoidance_phase = "pass"
+        self.avoidance_started_time = (
+            time.monotonic() if now is None else float(now)
+        )
+        self.avoiding_track_id = obstacle.get("track_id")
+        self.active_obstacle_reference = obstacle
         self.state = MissionState.AVOIDING
         self.last_angular_z = 0.0
 
@@ -604,21 +907,31 @@ class Task2PointTrackingWithObstacleAvoidance:
             f"camera_side={obstacle['side']}, vehicle_position={vehicle_side_text}. "
             f"Kaçınma yönü={avoidance_side}; geçici WP="
             f"{target['lat']:.7f}, {target['lon']:.7f}; "
-            f"duba açıklığı={AVOID_PASS_CLEARANCE_M:.1f} m"
+            f"duba açıklığı={AVOIDANCE_PASS_CLEARANCE_M:.1f} m"
         )
 
     def _finish_avoidance(self):
-        completed_name = f"kaçınma WP ({self.avoidance_side})"
+        completed_name = f"kaçınma çıkış WP ({self.avoidance_side})"
         self.logger.info(
-            f"Kaçınma WP'sine ulaşıldı. {self.avoidance_side} taraftan geçiş tamamlandı; "
-            "ana rotaya dönülüyor."
+            f"Kaçınma çıkış WP'sine ulaşıldı ve duba arkada kaldı. "
+            f"{self.avoidance_side} taraftan geçiş tamamlandı; ana rotaya dönülüyor."
         )
         self.avoidance_target = None
         self.avoidance_side = None
         self.avoided_obstacle_side = None
+        self.avoidance_phase = None
+        self.avoidance_started_time = None
+        self.avoiding_track_id = None
+        self.active_obstacle_reference = None
         self.last_angular_z = 0.0
         self.state = MissionState.NAVIGATING
         self._begin_waypoint_hold(completed_name)
+
+    def _avoidance_timed_out(self, now=None):
+        if self.avoidance_started_time is None:
+            return False
+        now = time.monotonic() if now is None else float(now)
+        return now - self.avoidance_started_time >= AVOIDANCE_TIMEOUT_SEC
 
     # ========================================================
     # GPS HEDEF TAKİBİ
@@ -823,8 +1136,12 @@ class Task2PointTrackingWithObstacleAvoidance:
                 stop_vehicle(self.topics.cmd_vel_pub)
                 return
 
+            if self._avoidance_timed_out():
+                self._enter_failsafe("Kaçınma zaman aşımı; FAILSAFE + HOLD.")
+                return
+
             self._refresh_avoidance_target(
-                nearest_obstacle,
+                self._matching_avoidance_obstacle(detections),
                 target_lat,
                 target_lon,
             )
@@ -833,13 +1150,30 @@ class Task2PointTrackingWithObstacleAvoidance:
                 self.avoidance_target["lat"],
                 self.avoidance_target["lon"],
                 f"kaçınma WP ({self.avoidance_side})",
-                AVOID_WAYPOINT_TOLERANCE_M,
+                AVOIDANCE_WAYPOINT_TOLERANCE_M,
                 detections,
                 follow_yellow_course=False,
             )
 
             if reached_avoidance_wp:
-                self._finish_avoidance()
+                if self.avoidance_target.get("phase", "pass") == "pass":
+                    self.avoidance_target = self._create_exit_target(self.avoidance_target)
+                    self.avoidance_phase = "exit"
+                    self.aligned_target_key = None
+                elif self._obstacle_is_behind(self.avoidance_target):
+                    self.recently_avoided_obstacles.append({
+                        "class": OBSTACLE_CLASS_NAMES[0],
+                        "track_id": self.avoiding_track_id,
+                        "marker_lat": self.avoidance_target["marker_lat"],
+                        "marker_lon": self.avoidance_target["marker_lon"],
+                        "expires_at": time.monotonic() + AVOIDANCE_RETRIGGER_COOLDOWN_SEC,
+                    })
+                    self._finish_avoidance()
+                else:
+                    self.avoidance_target = self._extend_exit_target(
+                        self.avoidance_target
+                    )
+                    self.aligned_target_key = None
             return
 
         # ----------------------------------------------------
@@ -847,12 +1181,16 @@ class Task2PointTrackingWithObstacleAvoidance:
         # ----------------------------------------------------
         if (
                 nearest_obstacle is not None
-                and nearest_obstacle["distance"] < AVOID_ENTER_DIST_M
+                and nearest_obstacle["distance"] <= AVOIDANCE_START_DISTANCE_M
         ):
+            confirmed = self._confirmed_obstacle(nearest_obstacle, time.monotonic())
+            if confirmed is None:
+                return
             self._start_avoidance(
-                nearest_obstacle,
+                confirmed,
                 target_lat,
                 target_lon,
+                now=time.monotonic(),
             )
 
             # State değiştiği tick'te ilk kaçınma komutunu hemen gönder.
@@ -860,11 +1198,13 @@ class Task2PointTrackingWithObstacleAvoidance:
                 self.avoidance_target["lat"],
                 self.avoidance_target["lon"],
                 f"kaçınma WP ({self.avoidance_side})",
-                AVOID_WAYPOINT_TOLERANCE_M,
+                AVOIDANCE_WAYPOINT_TOLERANCE_M,
                 detections,
                 follow_yellow_course=False,
             )
             return
+        else:
+            self._confirmed_obstacle(None, time.monotonic())
 
         # ----------------------------------------------------
         # 4. NORMAL WAYPOINT TAKİBİ
@@ -1019,7 +1359,7 @@ class Task2Node(Node):
             return []
 
         age = time.monotonic() - self.last_detection_message_time
-        if age > DETECTION_STALE_SEC:
+        if age > VISION_DETECTION_TIMEOUT_SEC:
             return []
 
         return list(self.latest_detections)
@@ -1089,7 +1429,7 @@ class Task2Node(Node):
             if (
                     self.last_detection_message_time is not None
                     and time.monotonic() - self.last_detection_message_time
-                    <= DETECTION_STALE_SEC
+                    <= VISION_DETECTION_TIMEOUT_SEC
             ):
                 return True
 
@@ -1113,7 +1453,7 @@ class Task2Node(Node):
             if self.last_detection_message_time is None
             else time.monotonic() - self.last_detection_message_time
         )
-        if vision_age is None or vision_age > DETECTION_STALE_SEC:
+        if vision_age is None or vision_age > VISION_DETECTION_TIMEOUT_SEC:
             stop_vehicle(self.mission_topics.cmd_vel_pub)
             self.task.state = MissionState.FAILSAFE
             age_text = "hiç gelmedi" if vision_age is None else f"{vision_age:.2f}s eski"

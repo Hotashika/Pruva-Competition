@@ -12,34 +12,26 @@ from multiprocessing import get_context
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 COMPETITION_ROOT = os.path.dirname(PROJECT_ROOT)
-if COMPETITION_ROOT not in sys.path:
-    sys.path.insert(0, COMPETITION_ROOT)
+while COMPETITION_ROOT in sys.path:
+    sys.path.remove(COMPETITION_ROOT)
+sys.path.insert(0, COMPETITION_ROOT)
 
 from teknofest.core import capture_proc
 from teknofest.core import data_writer
+from teknofest.config.mission_config import (
+    MAVLINK_BRIDGE_DEFAULTS,
+    MAVLINK_BRIDGE_OVERRIDES,
+    MISSION_SPECS,
+    WAYPOINT_DIRECTORY,
+)
 from teknofest.servers import data_server
 from utils import waypoint_server
 
-
-MISSION_SPECS = {
-    "mission-planner": ("Mission Planner", None),
-    "competition": ("Full Competition", "competition_mission.py"),
-    "task1": ("Mission 1", "task1_point_tracking.py"),
-    "task2": ("Mission 2", "task2_point_tracking_task_in_an_environment_with_obstacle.py"),
-    "task3": ("Mission 3", "task3_kamikaze_engagement.py"),
-}
-
+os.environ.setdefault("YOLO_OFFLINE", "true")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Start the selected TEKNOFEST mission.")
     task_group = parser.add_mutually_exclusive_group()
-    task_group.add_argument(
-        "--mission-planner",
-        dest="task",
-        action="store_const",
-        const="mission-planner",
-        help="Wait for SCR_USER2=1, then run Task 1 -> Task 2 -> Task 3.",
-    )
     task_group.add_argument(
         "--competition",
         dest="task",
@@ -59,28 +51,28 @@ def parse_args(argv=None):
                 f"teknofest_task{task_number}.waypoints route where applicable."
             ),
         )
-    parser.set_defaults(task="mission-planner")
+    parser.epilog = (
+        "Bir gorev secenegi verilmezse arayuz modu acilir: "
+        "1=task1->task2->task3, "
+        "2=yalniz task1, 3=yalniz task2, 4=yalniz task3."
+    )
     return parser.parse_args(argv)
 
 
-def configure_mavlink_bridge_environment(mission_planner_mode=False):
-    defaults = {
-        "MAVLINK20": "1",
-        "MAVLINK_CONNECTION_STRING": "/dev/ttyACM0",
-        "MAVLINK_BAUD": "921600",
-        "MAVLINK_SOURCE_SYSTEM": "1",
-        "MAVLINK_SOURCE_COMPONENT": "191",
-        "MAVLINK_MISSION_START_TOPIC": "/mission_start",
-    }
-    for key, value in defaults.items():
-        os.environ.setdefault(key, value)
-
-    if mission_planner_mode:
-        # These select the competition-specific control contract and must not
-        # inherit Njord values from a parent shell.
-        os.environ["MAVLINK_MISSION_PARAM_NAME"] = "SCR_USER2"
-        # Competition GN points are managed by the TEKNOFEST waypoint file.
-        os.environ["MAVLINK_MISSION_DOWNLOAD_COMMANDS"] = ""
+def build_mission_launch_command(
+        ros2_setup,
+        python_path_setup,
+        python_executable,
+        mission_filename,
+):
+    """Build a package-module launch command for a TEKNOFEST mission."""
+    mission_module = (
+        f"teknofest.missions.{os.path.splitext(mission_filename)[0]}"
+    )
+    return (
+        f"{ros2_setup} && {python_path_setup} && "
+        f"{shlex.quote(python_executable)} -m {shlex.quote(mission_module)}"
+    )
 
 
 def launch_child_process(command):
@@ -138,6 +130,22 @@ def run_startup_cleanup():
     subprocess.run(["/bin/bash", cleanup_script], check=True)
 
 
+def configure_mavlink_bridge_environment():
+    for key, value in MAVLINK_BRIDGE_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+    os.environ.update(MAVLINK_BRIDGE_OVERRIDES)
+
+    print(
+        "[SYSTEM] TEKNOFEST mission interface: "
+        "1=task1->task2->task3, "
+        "2=yalniz task1, 3=yalniz task2, 4=yalniz task3; "
+        f"mission_param={os.environ['MAVLINK_MISSION_PARAM_NAME']}, "
+        f"topic={os.environ['MAVLINK_MISSION_START_TOPIC']}, "
+        f"waypoint_directory={os.environ['MAVLINK_MISSION_WAYPOINT_DIRECTORY']}, "
+        f"waypoints={os.environ['MAVLINK_MISSION_WAYPOINT_FILES']}"
+    )
+
+
 def start_capture_process():
     mp_context = get_context("spawn")
     frame_lock = mp_context.Lock()
@@ -181,7 +189,11 @@ def start_capture_process():
 
 if __name__ == "__main__":
     args = parse_args()
-    mission_name, mission_filename = MISSION_SPECS[args.task]
+    interface_mode = args.task is None
+    mission_name = None
+    mission_filename = None
+    if not interface_mode:
+        mission_name, mission_filename = MISSION_SPECS[args.task]
 
     fx = None
     cx = None
@@ -192,10 +204,15 @@ if __name__ == "__main__":
     p_bridge = None
     p_vision = None
     p_teknofest_mission = None
+    p_mission_manager = None
 
     try:
         run_startup_cleanup()
-        threading.Thread(target=waypoint_server.start, args=(8000,), daemon=True).start()
+        threading.Thread(
+            target=waypoint_server.start,
+            args=(8000, WAYPOINT_DIRECTORY),
+            daemon=True,
+        ).start()
         print("[SYSTEM] Waypoint upload -> http://0.0.0.0:8000/api/mission/upload_txt")
 
         (
@@ -215,9 +232,7 @@ if __name__ == "__main__":
 
         print("\n[SYSTEM] Vision and bridge node launch in ROS2...")
         time.sleep(1)
-        configure_mavlink_bridge_environment(
-            mission_planner_mode=args.task == "mission-planner"
-        )
+        configure_mavlink_bridge_environment()
 
         if os.path.isfile("/opt/ros/kilted/setup.bash"):
             ros2_setup = "source /opt/ros/kilted/setup.bash"
@@ -225,21 +240,18 @@ if __name__ == "__main__":
             ros2_setup = "source /opt/ros/foxy/setup.bash"
 
         python_path_setup = (
-            f"export PYTHONPATH={shlex.quote(PROJECT_ROOT)}:"
-            f"{shlex.quote(COMPETITION_ROOT)}:${{PYTHONPATH:-}}"
+            f"export PYTHONPATH={shlex.quote(COMPETITION_ROOT)}:"
+            "${PYTHONPATH:-}"
         )
 
-        vision_path = os.path.join(PROJECT_ROOT, "vision", "vision_node.py")
+        vision_path = os.path.join(COMPETITION_ROOT, "vision", "vision_node.py")
         bridge_path = os.path.join(COMPETITION_ROOT, "bridge", "bridge_node.py")
-
-        vision_args_setup = f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
-
-        mission_path = (
-            None
-            if mission_filename is None
-            else os.path.join(PROJECT_ROOT, "missions", mission_filename)
-        )
         mission_manager_path = os.path.join(PROJECT_ROOT, "mission_manager.py")
+
+        vision_args_setup = (
+            f"--competition teknofest "
+            f"--fx {shlex.quote(str(fx))} --cx {shlex.quote(str(cx))}"
+        )
 
         cmd_vision = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(vision_path)} {vision_args_setup}"
@@ -247,13 +259,19 @@ if __name__ == "__main__":
         cmd_bridge = (
             f"{ros2_setup} && {python_path_setup} && {shlex.quote(sys.executable)} {shlex.quote(bridge_path)}"
         )
-        selected_mission_path = (
-            mission_manager_path if args.task == "mission-planner" else mission_path
-        )
-        cmd_teknofest_mission = (
+        cmd_mission_manager = (
             f"{ros2_setup} && {python_path_setup} && "
-            f"{shlex.quote(sys.executable)} {shlex.quote(selected_mission_path)}"
+            f"{shlex.quote(sys.executable)} {shlex.quote(mission_manager_path)}"
         )
+
+        cmd_teknofest_mission = None
+        if not interface_mode:
+            cmd_teknofest_mission = build_mission_launch_command(
+                ros2_setup,
+                python_path_setup,
+                sys.executable,
+                mission_filename,
+            )
 
         p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
@@ -263,18 +281,21 @@ if __name__ == "__main__":
 
         time.sleep(2)
 
-        p_teknofest_mission = launch_child_process(cmd_teknofest_mission)
-        print(
-            f" -> TEKNOFEST {mission_name} Node launched "
-            f"(PID: {p_teknofest_mission.pid})\n"
-        )
+        if interface_mode:
+            p_mission_manager = launch_child_process(cmd_mission_manager)
+            print(f" -> TEKNOFEST Mission Manager launched (PID: {p_mission_manager.pid})")
+            print(
+                " -> Mission Planner secimi bekleniyor: "
+                "1=task1->task2->task3; 2/3/4=tek gorev\n"
+            )
+        else:
+            p_teknofest_mission = launch_child_process(cmd_teknofest_mission)
+            print(
+                f" -> TEKNOFEST {mission_name} Node launched "
+                f"(PID: {p_teknofest_mission.pid})\n"
+            )
 
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
-        if args.task == "mission-planner":
-            print(
-                "[SYSTEM] Mission Planner: set SCR_USER2=1 to start "
-                "Task 1 -> Task 2 -> Task 3."
-            )
 
         data_writer.run(frame_lock, frame_ready_event, capture_stop_event)
 
@@ -288,8 +309,14 @@ if __name__ == "__main__":
 
         # Mission once kapanir; SIGINT handler'i bridge hâlâ ayaktayken araci
         # durdurup DISARM eder. Ardindan vision, en son bridge kapatilir.
+        mission_process_name = (
+            "TEKNOFEST Mission Manager"
+            if interface_mode
+            else f"TEKNOFEST {mission_name} Node"
+        )
+        mission_process = p_mission_manager if interface_mode else p_teknofest_mission
         subprocesses = (
-            (f"TEKNOFEST {mission_name} Node", p_teknofest_mission, 7.0),
+            (mission_process_name, mission_process, 7.0),
             ("Vision Node", p_vision, 3.0),
             ("Bridge Node", p_bridge, 5.0),
         )

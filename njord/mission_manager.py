@@ -15,20 +15,22 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Int32, String
 
+from njord.config.mission_config import MAVLINK_BRIDGE_DEFAULTS, MISSION_COMMANDS
 from utils.mavlink_utilities import parse_bridge_state
 from utils.task_selection_state import (
     clear_task_selection,
-    default_task_selection_file,
     read_task_selection,
     write_task_selection,
 )
 
 
 MISSION_PATHS = {
-    1: os.path.join(PROJECT_ROOT, "missions", "task1_maneuvering_and_path_finding.py"),
-    2: os.path.join(PROJECT_ROOT, "missions", "task2_collision_avoidance.py"),
-    3: os.path.join(PROJECT_ROOT, "missions", "task3_docking.py"),
-    4: os.path.join(PROJECT_ROOT, "missions", "task4_surprise.py"),
+    command: os.path.join(PROJECT_ROOT, "missions", mission_filename)
+    for command, (_, _, mission_filename) in MISSION_COMMANDS.items()
+}
+MISSION_NAMES = {
+    command: display_name
+    for command, (_, display_name, _) in MISSION_COMMANDS.items()
 }
 
 
@@ -45,15 +47,24 @@ class MissionManager(Node):
 
         self.declare_parameter(
             "mission_start_topic",
-            os.getenv("MAVLINK_MISSION_START_TOPIC", "/mission_start"),
+            os.getenv(
+                "MAVLINK_MISSION_START_TOPIC",
+                MAVLINK_BRIDGE_DEFAULTS["MAVLINK_MISSION_START_TOPIC"],
+            ),
         )
         self.declare_parameter(
             "task_selection_file",
-            os.getenv("MISSION_SELECTION_FILE", default_task_selection_file()),
+            os.getenv(
+                "MISSION_SELECTION_FILE",
+                MAVLINK_BRIDGE_DEFAULTS["MISSION_SELECTION_FILE"],
+            ),
         )
         self.declare_parameter(
             "mission_start_ack_topic",
-            os.getenv("MAVLINK_MISSION_START_ACK_TOPIC", "/mission_start_ack"),
+            os.getenv(
+                "MAVLINK_MISSION_START_ACK_TOPIC",
+                MAVLINK_BRIDGE_DEFAULTS["MAVLINK_MISSION_START_ACK_TOPIC"],
+            ),
         )
 
         self.mission_start_topic = str(self.get_parameter("mission_start_topic").value)
@@ -91,9 +102,17 @@ class MissionManager(Node):
             self._publish_status(f"Invalid mission_start payload ignored: {msg.data}")
             return
 
+        started_new_mission = False
         if command in MISSION_PATHS:
-            if not self._start_mission(command):
-                return
+            if self._mission_is_running(command):
+                self._publish_status(
+                    f"Mission M{command} is already active; ACK will be "
+                    "republished without restarting the process."
+                )
+            else:
+                if not self._start_mission(command):
+                    return
+                started_new_mission = True
         elif command in (90, 99):
             self._stop_active_mission()
 
@@ -101,7 +120,7 @@ class MissionManager(Node):
             state = write_task_selection(self.task_selection_file, command)
         except Exception as exc:
             self._publish_status(f"Task selection JSON write failed: {exc}")
-            if command in MISSION_PATHS:
+            if started_new_mission:
                 self._stop_active_mission()
             return
 
@@ -113,6 +132,14 @@ class MissionManager(Node):
             f"{self.mission_start_topic} received: command={command}, "
             f"selected_task={state.get('selected_task')}, status={state.get('status')}; "
             f"{self.mission_start_ack_topic}={command} published"
+        )
+
+    def _mission_is_running(self, command):
+        process = self.active_mission_process
+        return (
+            self.active_mission_number == command
+            and process is not None
+            and process.poll() is None
         )
 
     def _start_mission(self, command):
@@ -169,6 +196,7 @@ class MissionManager(Node):
         return super().destroy_node()
 
     def _status_loop(self):
+        self._reap_finished_mission()
         selection = read_task_selection(self.task_selection_file)
         current_state = {
             "selected_task": selection.get("selected_task"),
@@ -190,6 +218,30 @@ class MissionManager(Node):
             f"armed={current_state['armed']}, "
             f"mode={current_state['mode']}"
         )
+
+    def _reap_finished_mission(self):
+        process = self.active_mission_process
+        if process is None:
+            return False
+
+        return_code = process.poll()
+        if return_code is None:
+            return False
+
+        mission_number = self.active_mission_number
+        self.active_mission_process = None
+        self.active_mission_number = None
+        try:
+            clear_task_selection(self.task_selection_file)
+        except Exception as exc:
+            self._publish_status(
+                f"Task selection state could not be cleared after process exit: {exc}"
+            )
+        self._publish_status(
+            f"Mission M{mission_number} process exited: pid={process.pid}, "
+            f"return_code={return_code}; active mission cleared"
+        )
+        return True
 
     def _publish_status(self, text):
         self.get_logger().info(text)
