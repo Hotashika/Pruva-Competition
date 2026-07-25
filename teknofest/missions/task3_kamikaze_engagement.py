@@ -51,7 +51,7 @@ class Task3Config:
     gps_timeout_sec: float = 2.0
     heading_timeout_sec: float = 2.0
     bridge_state_timeout_sec: float = 10.0
-    vision_detection_timeout_sec: float = 1.0
+    vision_detection_timeout_sec: float = 3.0
     geofence_radius_m: float = 25.0
     mission_timeout_sec: float = 240.0
 

@@ -1,22 +1,48 @@
-# Python 3.12 is required for TEKNOFEST/ZED integration.
+# Pruva Competition Python dependencies
 #
-# ZED Camera SDK
-# run: python /usr/local/zed/get_python_api.py
+# Target runtime:
+#   - NVIDIA Jetson Orin NX
+#   - JetPack 7.2 / Ubuntu 24.04 / CUDA 13
+#   - Python 3.12
+#   - ROS 2 Kilted
+#
+# Install JetPack, ROS 2 and the ZED SDK before this file.  They provide
+# CUDA/cuDNN/TensorRT, rclpy and ROS message/service packages.  These system
+# prerequisites therefore remain outside pip, for example:
+#
+#   sudo apt install libopenblas-dev ros-kilted-ros-base ros-kilted-mavros-msgs
+#
+# The ZED Python API is tied to the installed ZED SDK, JetPack and Python
+# versions, so install it separately inside the active virtual environment:
+#
+#   python3 /usr/local/zed/get_python_api.py
+#
+# The CUDA 13.0 index supplies Python 3.12 ARM64 wheels compatible with the
+# JetPack 7.2 PyTorch installation path.  Do not use this index unchanged on
+# JetPack 5/6; select the PyTorch build matching that JetPack release.
+--extra-index-url https://download.pytorch.org/whl/cu130
 
-# Core dependencies
-numpy>=1.24.0
-Flask>=2.3.0
-opencv-python>=4.8.0
-Pillow>=9.5.0
+# ZED/OpenCV frame processing
+# pyzed 5.x requires NumPy 2.x and Cython 3.x.
+numpy==2.5.1
+Cython==3.2.8
+opencv-python==5.0.0.93
+Pillow==10.2.0
 
-# YOLOv8 Object Detection
-ultralytics>=8.0.0
-torch>=2.0.0
-torchvision>=0.15.0
+# CUDA inference and YOLO
+torch==2.12.1
+torchvision==0.27.1
+ultralytics==8.4.90
 
-# Additional utilities
-Werkzeug>=2.3.0
-psutil
+# HTTP waypoint, video and telemetry services
+Flask==3.1.3
 
-# MAVLink bridge
-pymavlink>=2.4.49
+# Orange Cube MAVLink serial bridge
+pymavlink==2.4.49
+pyserial==3.5
+
+# Runtime diagnostics used by the Jetson manual checks and Ultralytics
+psutil==7.2.2
+
+# Automated regression tests
+pytest>=7.4,<10
