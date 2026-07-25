@@ -1,6 +1,5 @@
 import json
 
-import numpy as np
 from flask import Flask, Response
 
 from teknofest.core import shared_state
@@ -8,31 +7,34 @@ from teknofest.core import shared_state
 app = Flask(__name__)
 
 
-def generate():
-    while True:
-        shared_state.data_event.wait(timeout=1.0)
-        with shared_state.data_lock:
-            if shared_state.latest_imu is None:
-                continue
-            imu = shared_state.latest_imu.copy()
-            timestamp = shared_state.latest_timestamp
-            depth_array = shared_state.latest_depth_array
-
-        if depth_array is not None:
-            h, w = depth_array.shape[:2]
-            center_depth = float(depth_array[h // 2, w // 2])
-            if not np.isfinite(center_depth):
-                center_depth = None
-        else:
-            center_depth = None
-
-        payload = {
-            "timestamp": timestamp,
-            "imu": imu,
-            "center_depth": center_depth
+def _wait_for_data(last_data_id, timeout=1.0):
+    with shared_state.data_condition:
+        ready = shared_state.data_condition.wait_for(
+            lambda: (
+                shared_state.latest_imu is not None
+                and shared_state.latest_data_id != last_data_id
+            ),
+            timeout=timeout,
+        )
+        if not ready:
+            return None
+        return {
+            "data_id": shared_state.latest_data_id,
+            "timestamp": shared_state.latest_timestamp,
+            "imu": shared_state.latest_imu.copy(),
+            "center_depth": shared_state.latest_center_depth,
         }
 
-        yield f"data: {json.dumps(payload)}\n\n"
+
+def generate():
+    last_data_id = 0
+    while True:
+        snapshot = _wait_for_data(last_data_id)
+        if snapshot is None:
+            continue
+        last_data_id = snapshot.pop("data_id")
+
+        yield f"data: {json.dumps(snapshot)}\n\n"
 
 
 @app.route('/data/stream')

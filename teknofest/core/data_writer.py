@@ -2,22 +2,20 @@
 import os
 import time
 import logging
+import threading
 from multiprocessing import shared_memory
 
 import cv2
 import numpy as np
+import rclpy
 
-from teknofest.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
-from teknofest.config.camera_config import CAMERA_WIDTH
-from teknofest.config.vision_config import (
-    BUOY_MODEL_PATH,
-    DEVICE,
-    TOLERANCE_DEG,
-    TOLERANCE_RATIO,
-)
+from teknofest.config.camera_config import RGB_SHAPE
 from teknofest.core import shared_state
+from utils.frame_cadence import FrameCadence
 from utils.video_writer import QueuedVideoWriter, close_video_writers
-from vision.detector import BuoyDetector
+from vision.detection_cache import VisionDetectionCache
+from vision.detection_distance import nearest_bbox_median_distance
+from vision.render import draw_detections
 
 OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")
@@ -29,12 +27,8 @@ DEPTH_BIN_PATH = os.path.join(OUTPUT_DIR, "depth_stream.bin")  # single append-o
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
 
 # Şartname için en az 1 Hz yeterli.
-VIDEO_FPS = 5
+VIDEO_FPS = 10
 VIDEO_WRITER_CLOSE_TIMEOUT_SEC = 30.0
-
-# Takip ID istersen True yap.
-# True yapılırsa YOLO track() kullanılır ve mümkünse ID bilgisi videoda görünür.
-ENABLE_TRACKING = False
 
 logger = logging.getLogger("zed_capture")
 
@@ -141,56 +135,38 @@ def run(
     dropped_frames = 0
 
     video_recorder = None
+    detection_node = None
+    detection_spin_thread = None
+    owns_rclpy_context = False
 
     rgb_shm = None
-    depth_shm = None
     meta_shm = None
     imu_shm = None
 
     # Preallocated reusable buffers -> avoids per-frame np/cv2 allocation churn.
     bgra_buf = np.empty(RGB_SHAPE, dtype=np.uint8)
-    depth_buf = np.empty(DEPTH_SHAPE, dtype=np.float32)
 
     h, w = RGB_SHAPE[:2]
 
     frame_bgr_buf = np.empty((h, w, 3), dtype=np.uint8)
 
-    dh, dw = h // 2, w // 2
-    downsampled_depth_buf = np.empty((dh, dw), dtype=np.float32)
-
     last_drop_log = 0.0
     last_frame_id = 0
-
-    # Video gerçek zamanlı aksın diye sadece VIDEO_FPS kadar frame kaydediyoruz.
-    # Örneğin kamera 15 FPS, VIDEO_FPS 5 ise her frame değil, yaklaşık 5 Hz kayıt yapılır.
-    record_interval_ms = max(1, int(1000 / VIDEO_FPS))
-    last_record_time_ms = None
-
-    # YOLO detector burada bir kere oluşturulur.
-    # Döngünün içinde oluşturulmaz; yoksa her frame'de model tekrar yüklenir.
-    try:
-        buoy_detector = BuoyDetector(
-            model_path=BUOY_MODEL_PATH,
-            device=DEVICE,
-            camera_width=CAMERA_WIDTH,
-            tolerance_ratio=TOLERANCE_RATIO,
-            tolerance_deg=TOLERANCE_DEG,
-            use_tracking=ENABLE_TRACKING,
-        )
-    except Exception:
-        # Model yüklenemezse (yanlış model yolu, CUDA bulunamadı, vb.)
-        # önceki kodda bu hata try/except olmadan yukarı fırlıyordu ve
-        # log basılmadan process çöküyordu -> "kamera açılmıyor" gibi
-        # yanlış anlaşılabiliyordu. Artık sebep açıkça loglanıyor.
-        logger.exception(
-            "BuoyDetector (YOLO modeli) yüklenemedi. BUOY_MODEL_PATH doğru mu, "
-            "DEVICE ('cuda'/'cpu') sistemde mevcut mu kontrol et."
-        )
-        raise
+    record_cadence = FrameCadence(VIDEO_FPS)
 
     try:
+        if not rclpy.ok():
+            rclpy.init()
+            owns_rclpy_context = True
+        detection_node = VisionDetectionCache("teknofest_video_detection_cache")
+        detection_spin_thread = threading.Thread(
+            target=rclpy.spin,
+            args=(detection_node,),
+            daemon=True,
+        )
+        detection_spin_thread.start()
+
         rgb_shm = attach_shared_memory(shared_state.RGB_SHM_NAME)
-        depth_shm = attach_shared_memory(shared_state.DEPTH_SHM_NAME)
         meta_shm = attach_shared_memory(shared_state.META_SHM_NAME)
         imu_shm = attach_shared_memory(shared_state.IMU_SHM_NAME)
 
@@ -198,12 +174,6 @@ def run(
             RGB_SHAPE,
             dtype=np.uint8,
             buffer=rgb_shm.buf,
-        )
-
-        shm_depth = np.ndarray(
-            DEPTH_SHAPE,
-            dtype=np.float32,
-            buffer=depth_shm.buf,
         )
 
         shm_meta = np.ndarray(
@@ -236,42 +206,27 @@ def run(
 
             if frame_lock is None:
                 current_frame_id = int(shm_meta[0])
+                if current_frame_id == 0 or current_frame_id == last_frame_id:
+                    continue
+                should_record = record_cadence.due(time.monotonic() * 1000.0)
                 timestamp_ms = int(shm_meta[1])
                 pitch, yaw, roll = shm_imu.tolist()
-
-                np.copyto(bgra_buf, shm_rgb)
-                np.copyto(depth_buf, shm_depth)
+                if should_record:
+                    np.copyto(bgra_buf, shm_rgb)
+                if int(shm_meta[0]) != current_frame_id:
+                    continue
             else:
                 with frame_lock:
                     current_frame_id = int(shm_meta[0])
+                    if current_frame_id == 0 or current_frame_id == last_frame_id:
+                        continue
+                    should_record = record_cadence.due(time.monotonic() * 1000.0)
                     timestamp_ms = int(shm_meta[1])
                     pitch, yaw, roll = shm_imu.tolist()
-
-                    np.copyto(bgra_buf, shm_rgb)
-                    np.copyto(depth_buf, shm_depth)
-
-            if current_frame_id == 0 or current_frame_id == last_frame_id:
-                continue
+                    if should_record:
+                        np.copyto(bgra_buf, shm_rgb)
 
             last_frame_id = current_frame_id
-
-            # BGRA -> BGR
-            cv2.cvtColor(
-                bgra_buf,
-                cv2.COLOR_BGRA2BGR,
-                dst=frame_bgr_buf,
-            )
-
-            # Depth verisini sistemin diğer tarafları için küçültüyoruz.
-            # Tespit için aşağıda full depth_buf kullanıyoruz.
-            cv2.resize(
-                depth_buf,
-                (0, 0),
-                dst=downsampled_depth_buf,
-                fx=0.5,
-                fy=0.5,
-                interpolation=cv2.INTER_AREA,
-            )
 
             # ------------------------------------------------------------
             # MP4 KAYDI: İşlenmiş kamera verisi
@@ -280,74 +235,62 @@ def run(
             # - Her frame zaman etiketli
             # - Obje bbox + sınıf + güven + mesafe + varsa takip ID
             # ------------------------------------------------------------
-            now_record_time_ms = int(time.monotonic() * 1000)
-
-            should_record = (
-                    last_record_time_ms is None
-                    or now_record_time_ms - last_record_time_ms >= record_interval_ms
-            )
-
             if should_record:
+                detections = detection_node.latest(current_frame_id)
+                bbox_median_depth = nearest_bbox_median_distance(detections)
+                cv2.cvtColor(
+                    bgra_buf,
+                    cv2.COLOR_BGRA2BGR,
+                    dst=frame_bgr_buf,
+                )
                 try:
-                    # 1) Tespit / takip yap
-                    detections = buoy_detector.detect(
-                        frame_bgr_buf,
-                        depth_buf,
-                    )
-
-                    # 2) Bbox, sınıf, güven, mesafe, ID bilgilerini çiz
-                    processed_frame = buoy_detector.draw_detections(
+                    processed_frame = draw_detections(
                         frame_bgr_buf,
                         detections,
                     )
-
                 except Exception:
-                    logger.exception("Tespit/çizim sırasında hata oluştu. Ham frame kaydedilecek.")
+                    logger.exception(
+                        "Detection annotation failed. Raw frame will be recorded."
+                    )
                     processed_frame = frame_bgr_buf.copy()
 
-                # 3) Her kaydedilen frame üzerine zaman etiketi ekle
                 draw_frame_timestamp(
                     processed_frame,
                     timestamp_ms=timestamp_ms,
                     frame_index=current_frame_id,
                 )
 
-                # 4) MP4'e işlenmiş frame'i yaz
-                if video_recorder.enqueue(processed_frame):
-                    last_record_time_ms = now_record_time_ms
+                with shared_state.frame_condition:
+                    shared_state.latest_frame = processed_frame.copy()
+                    shared_state.latest_frame_id = current_frame_id
+                    shared_state.frame_condition.notify_all()
 
-                else:
+                if not video_recorder.enqueue(processed_frame):
                     dropped_frames += 1
                     now = time.monotonic()
-
                     if now - last_drop_log > 1.0:
                         logger.warning(
                             "Disk write speed is lagging, number of dropped frames: %d",
                             dropped_frames,
                         )
                         last_drop_log = now
+            else:
+                bbox_median_depth = (
+                    detection_node.nearest_bbox_median_distance(current_frame_id)
+                )
 
-            # ------------------------------------------------------------
-            # Paylaşılan state güncelleme
-            # Diğer modüllerin bozulmaması için latest_frame ham frame olarak bırakıldı.
-            # GUI'de de kutulu görüntü görmek istersen:
-            # shared_state.latest_frame = processed_frame.copy()
-            # yapabilirsin; ama processed_frame sadece kayıt yapılan frame'lerde oluşur.
-            # ------------------------------------------------------------
-            with shared_state.data_lock:
-                shared_state.latest_depth_array = downsampled_depth_buf.copy()
+            with shared_state.data_condition:
+                # Kept for API compatibility; this is the nearest detection's
+                # already-computed bbox median depth, not the center pixel.
+                shared_state.latest_center_depth = bbox_median_depth
                 shared_state.latest_imu = {
                     "pitch": pitch,
                     "yaw": yaw,
                     "roll": roll,
                 }
                 shared_state.latest_timestamp = timestamp_ms
-
-            with shared_state.frame_lock:
-                shared_state.latest_frame = frame_bgr_buf.copy()
-
-            shared_state.data_event.set()
-            shared_state.frame_event.set()
+                shared_state.latest_data_id = current_frame_id
+                shared_state.data_condition.notify_all()
 
             frame_index += 1
 
@@ -372,6 +315,13 @@ def run(
                     result.error,
                 )
 
-        for shm in (rgb_shm, depth_shm, meta_shm, imu_shm):
+        for shm in (rgb_shm, meta_shm, imu_shm):
             if shm is not None:
                 shm.close()
+
+        if detection_node is not None:
+            detection_node.destroy_node()
+        if owns_rclpy_context and rclpy.ok():
+            rclpy.shutdown()
+        if detection_spin_thread is not None:
+            detection_spin_thread.join(timeout=2.0)

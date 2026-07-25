@@ -1,4 +1,5 @@
 import signal
+import time
 from multiprocessing import shared_memory
 
 import numpy as np
@@ -15,6 +16,7 @@ from njord.config.camera_config import (
 )
 from njord.core import shared_state
 from njord.core.capture_dataset import CaptureDatasetSession
+from utils.retry_backoff import exponential_backoff_delay
 
 
 def _enum_text(value):
@@ -221,6 +223,8 @@ def run_capture(
             imu_buf[:] = 0.0
             calib_buf[:] = (fx, fy, cx, cy)
         frame_index = 0
+        consecutive_grab_failures = 0
+        last_grab_failure_log = 0.0
 
         if ready_queue is not None:
             ready_payload = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
@@ -235,8 +239,24 @@ def run_capture(
         # Capture Loop
         # ------------------------------------------------------------------
         while stop_event is None or not stop_event.is_set():
-            if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            grab_status = zed.grab(runtime)
+            if grab_status != sl.ERROR_CODE.SUCCESS:
+                consecutive_grab_failures += 1
+                retry_delay = exponential_backoff_delay(
+                    consecutive_grab_failures
+                )
+                now = time.monotonic()
+                if now - last_grab_failure_log >= 2.0:
+                    print(
+                        "[CAMERA] ZED grab failed: "
+                        f"status={grab_status}, "
+                        f"consecutive={consecutive_grab_failures}, "
+                        f"retry_in={retry_delay:.3f}s"
+                    )
+                    last_grab_failure_log = now
+                time.sleep(retry_delay)
                 continue
+            consecutive_grab_failures = 0
 
             zed.retrieve_image(rgb_mat, sl.VIEW.LEFT)
             zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)

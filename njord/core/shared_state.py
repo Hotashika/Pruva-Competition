@@ -1,14 +1,16 @@
 import threading
 
 latest_frame = None
+latest_frame_id = 0
 frame_lock = threading.Lock()
-frame_event = threading.Event()
+frame_condition = threading.Condition(frame_lock)
 
-latest_depth_array = None  # np array
+latest_center_depth = None  # nearest detection bbox median, metres
 latest_imu = None  # roll, pitch, yaw
 latest_timestamp = None  # ms
+latest_data_id = 0
 data_lock = threading.Lock()
-data_event = threading.Event()
+data_condition = threading.Condition(data_lock)
 
 RGB_SHM_NAME = "RGB_DATA"
 DEPTH_SHM_NAME = "DEPTH_DATA"
