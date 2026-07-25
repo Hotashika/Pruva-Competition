@@ -127,19 +127,19 @@ def test_interface_command_mapping_matches_requested_order(monkeypatch):
     manager = _load_mission_manager(monkeypatch)
 
     assert manager.MISSION_NAMES == {
-        1: "task1->task2->task3",
-        2: "task1 (standalone)",
-        3: "task2 (standalone)",
-        4: "task3 (standalone)",
+        1: "task1",
+        2: "task2",
+        3: "task3",
+        4: "task1->task2->task3",
     }
     assert {
         command: Path(path).name
         for command, path in manager.MISSION_PATHS.items()
     } == {
-        1: "competition_mission.py",
-        2: "task1_point_tracking.py",
-        3: "task2_point_tracking_task_in_an_environment_with_obstacle.py",
-        4: "task3_kamikaze_engagement.py",
+        1: "task1_point_tracking.py",
+        2: "task2_point_tracking_task_in_an_environment_with_obstacle.py",
+        3: "task3_kamikaze_engagement.py",
+        4: "competition_mission.py",
     }
 
 
@@ -159,7 +159,7 @@ def test_manager_starts_competition_as_package_module(monkeypatch):
 
     monkeypatch.setattr(manager_module.subprocess, "Popen", fake_popen)
 
-    assert manager._start_mission(1) is True
+    assert manager._start_mission(4) is True
     assert popen_calls == [
         (
             [
@@ -173,7 +173,7 @@ def test_manager_starts_competition_as_package_module(monkeypatch):
             },
         )
     ]
-    assert manager.active_command == 1
+    assert manager.active_command == 4
     assert manager.active_task_key == "competition"
 
 
@@ -182,9 +182,10 @@ def test_interface_waypoint_sync_uses_teknofest_files(monkeypatch):
     from teknofest.config import mission_config
 
     assert mission_config.MISSION_WAYPOINT_FILES == {
-        1: "teknofest.waypoints",
-        2: "teknofest_task1.waypoints",
-        3: "teknofest_task2.waypoints",
+        1: "teknofest_task1.waypoints",
+        2: "teknofest_task2.waypoints",
+        3: "teknofest_task3.waypoints",
+        4: "teknofest.waypoints",
     }
     assert mission_config.WAYPOINT_DIRECTORY == (
         Path(__file__).resolve().parents[2] / "waypoints" / "teknofest"
@@ -193,6 +194,7 @@ def test_interface_waypoint_sync_uses_teknofest_files(monkeypatch):
         "teknofest.waypoints",
         "teknofest_task1.waypoints",
         "teknofest_task2.waypoints",
+        "teknofest_task3.waypoints",
     } == {
         path.name for path in mission_config.WAYPOINT_DIRECTORY.glob("*.waypoints")
     }
@@ -202,21 +204,17 @@ def test_teknofest_config_owns_cli_and_interface_mission_specs():
     from teknofest.config.mission_config import MISSION_COMMANDS, MISSION_SPECS
 
     assert MISSION_COMMANDS == {
-        1: (
+        1: ("task1", "task1", "task1_point_tracking.py"),
+        2: (
+            "task2",
+            "task2",
+            "task2_point_tracking_task_in_an_environment_with_obstacle.py",
+        ),
+        3: ("task3", "task3", "task3_kamikaze_engagement.py"),
+        4: (
             "competition",
             "task1->task2->task3",
             "competition_mission.py",
-        ),
-        2: ("task1", "task1 (standalone)", "task1_point_tracking.py"),
-        3: (
-            "task2",
-            "task2 (standalone)",
-            "task2_point_tracking_task_in_an_environment_with_obstacle.py",
-        ),
-        4: (
-            "task3",
-            "task3 (standalone)",
-            "task3_kamikaze_engagement.py",
         ),
     }
     assert MISSION_SPECS["competition"] == (
@@ -241,9 +239,10 @@ def test_teknofest_profile_replaces_stale_njord_waypoint_mapping(monkeypatch):
 
     assert main.os.environ["MAVLINK_MISSION_PARAM_NAME"] == "SCR_USER2"
     assert main.os.environ["MAVLINK_MISSION_WAYPOINT_FILES"] == (
-        "1:teknofest.waypoints,"
-        "2:teknofest_task1.waypoints,"
-        "3:teknofest_task2.waypoints"
+        "1:teknofest_task1.waypoints,"
+        "2:teknofest_task2.waypoints,"
+        "3:teknofest_task3.waypoints,"
+        "4:teknofest.waypoints"
     )
     assert Path(main.os.environ["MAVLINK_MISSION_WAYPOINT_DIRECTORY"]) == (
         Path(__file__).resolve().parents[2] / "waypoints" / "teknofest"

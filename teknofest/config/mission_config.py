@@ -10,20 +10,19 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WAYPOINT_DIRECTORY = REPOSITORY_ROOT / "waypoints" / "teknofest"
 
 
-# Mission Planner'da SCR_USER2=1 seçildiğinde ayrı Task 1 süreci yerine
-# Task 1 -> Task 2 -> Task 3 zincirini tek ARM/GUIDED oturumunda çalıştır.
-# Diğer komutlar görevleri bakım/test amacıyla tek başına başlatır.
+# Mission Planner görev seçimi:
+# 1=Task 1, 2=Task 2, 3=Task 3, 4=Task 1 -> Task 2 -> Task 3.
 #
 # command: (task_key, display_name, mission_filename)
 MISSION_COMMANDS = {
-    1: ("competition", "task1->task2->task3", "competition_mission.py"),
-    2: ("task1", "task1 (standalone)", "task1_point_tracking.py"),
-    3: (
+    1: ("task1", "task1", "task1_point_tracking.py"),
+    2: (
         "task2",
-        "task2 (standalone)",
+        "task2",
         "task2_point_tracking_task_in_an_environment_with_obstacle.py",
     ),
-    4: ("task3", "task3 (standalone)", "task3_kamikaze_engagement.py"),
+    3: ("task3", "task3", "task3_kamikaze_engagement.py"),
+    4: ("competition", "task1->task2->task3", "competition_mission.py"),
 }
 
 MISSION_SPECS = {
@@ -32,9 +31,10 @@ MISSION_SPECS = {
 }
 
 MISSION_WAYPOINT_FILES = {
-    1: "teknofest.waypoints",
-    2: "teknofest_task1.waypoints",
-    3: "teknofest_task2.waypoints",
+    1: "teknofest_task1.waypoints",
+    2: "teknofest_task2.waypoints",
+    3: "teknofest_task3.waypoints",
+    4: "teknofest.waypoints",
 }
 
 MAVLINK_BRIDGE_DEFAULTS = {

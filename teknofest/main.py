@@ -53,8 +53,8 @@ def parse_args(argv=None):
         )
     parser.epilog = (
         "Bir gorev secenegi verilmezse arayuz modu acilir: "
-        "1=task1->task2->task3, "
-        "2=yalniz task1, 3=yalniz task2, 4=yalniz task3."
+        "1=task1, 2=task2, 3=task3, "
+        "4=task1->task2->task3."
     )
     return parser.parse_args(argv)
 
@@ -137,8 +137,8 @@ def configure_mavlink_bridge_environment():
 
     print(
         "[SYSTEM] TEKNOFEST mission interface: "
-        "1=task1->task2->task3, "
-        "2=yalniz task1, 3=yalniz task2, 4=yalniz task3; "
+        "1=task1, 2=task2, 3=task3, "
+        "4=task1->task2->task3; "
         f"mission_param={os.environ['MAVLINK_MISSION_PARAM_NAME']}, "
         f"topic={os.environ['MAVLINK_MISSION_START_TOPIC']}, "
         f"waypoint_directory={os.environ['MAVLINK_MISSION_WAYPOINT_DIRECTORY']}, "
@@ -286,7 +286,8 @@ if __name__ == "__main__":
             print(f" -> TEKNOFEST Mission Manager launched (PID: {p_mission_manager.pid})")
             print(
                 " -> Mission Planner secimi bekleniyor: "
-                "1=task1->task2->task3; 2/3/4=tek gorev\n"
+                "1=task1; 2=task2; 3=task3; "
+                "4=task1->task2->task3\n"
             )
         else:
             p_teknofest_mission = launch_child_process(cmd_teknofest_mission)
