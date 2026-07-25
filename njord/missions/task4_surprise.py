@@ -1,5 +1,3 @@
-"""NJORD Task 4: optimize unordered GPS points and avoid detected buoys."""
-
 from __future__ import annotations
 
 import json
