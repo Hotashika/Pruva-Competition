@@ -1,8 +1,6 @@
 # import csv  # IMU CSV logging is disabled for now.
 import os
 import time
-import queue
-import threading
 import logging
 from multiprocessing import shared_memory
 
@@ -18,6 +16,7 @@ from teknofest.config.vision_config import (
     TOLERANCE_RATIO,
 )
 from teknofest.core import shared_state
+from utils.video_writer import QueuedVideoWriter, close_video_writers
 from vision.detector import BuoyDetector
 
 OUTPUT_DIR = "logs"
@@ -31,6 +30,7 @@ VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
 
 # Şartname için en az 1 Hz yeterli.
 VIDEO_FPS = 5
+VIDEO_WRITER_CLOSE_TIMEOUT_SEC = 30.0
 
 # Takip ID istersen True yap.
 # True yapılırsa YOLO track() kullanılır ve mümkünse ID bilgisi videoda görünür.
@@ -77,105 +77,6 @@ def attach_shared_memory(name, retries=200, delay=0.1):
         f"{name} shared memory not found after {retries * delay:.1f}s. "
         f"Kamerayı/üretici process'i (ZED capture) bu script'ten önce başlattığından emin ol."
     ) from last_error
-
-
-def open_video_writer(video_path, frame_size):
-    """
-    mp4v codec'i bazı OpenCV kurulumlarında (özellikle pip'ten kurulan
-    opencv-python, FFMPEG/H264 desteği olmadan derlendiyse) sessizce
-    açılamayabiliyor. Bu durumda video_writer.isOpened() False dönüyor
-    ve önceki kodda video hiç yazılmadan process "çalışıyor" gibi
-    devam ediyordu. Burada birkaç codec deniyoruz ve hangisinin
-    çalıştığını logluyoruz.
-    """
-    candidates = [
-        ("mp4v", video_path),
-        ("avc1", video_path),
-        ("XVID", os.path.splitext(video_path)[0] + ".avi"),
-    ]
-
-    for fourcc_name, path in candidates:
-        writer = cv2.VideoWriter(
-            path,
-            cv2.VideoWriter_fourcc(*fourcc_name),
-            VIDEO_FPS,
-            frame_size,
-        )
-
-        if writer.isOpened():
-            if path != video_path:
-                logger.warning(
-                    "mp4v/avc1 codec açılamadı, %s codec ile %s dosyasına yazılıyor.",
-                    fourcc_name,
-                    path,
-                )
-            return writer, path
-
-        writer.release()
-
-    return None, None
-
-
-def disk_writer_worker(q, video_path, frame_size):
-    """
-    İşlenmiş BGR frame'leri MP4 olarak kaydeder.
-    """
-
-    video_writer, opened_path = open_video_writer(video_path, frame_size)
-
-    if video_writer is None:
-        logger.error(
-            "VideoWriter hiçbir codec ile açılamadı (mp4v/avc1/XVID hepsi başarısız): %s. "
-            "OpenCV kurulumunun FFMPEG desteğiyle derlendiğinden emin ol "
-            "(örn. 'pip install opencv-python' yerine ffmpeg destekli bir build, "
-            "ya da sistemde ffmpeg kurulu olmalı).",
-            video_path,
-        )
-
-        # Thread kilitlenmesin diye kuyruk kapanana kadar boşalt.
-        while True:
-            item = q.get()
-
-            if item is None:
-                q.task_done()
-                break
-
-            q.task_done()
-
-        return
-
-    logger.info(
-        "Video kaydı başladı: %s | FPS: %s | Boyut: %s",
-        opened_path,
-        VIDEO_FPS,
-        frame_size,
-    )
-
-    written_frames = 0
-
-    try:
-        while True:
-            item = q.get()
-
-            if item is None:
-                q.task_done()
-                break
-
-            video_writer.write(item)
-            written_frames += 1
-            q.task_done()
-
-    except Exception:
-        logger.exception("Video yazma sırasında hata oluştu.")
-
-    finally:
-        video_writer.release()
-
-        logger.info(
-            "Video kaydı tamamlandı: %s | Yazılan frame: %d",
-            opened_path,
-            written_frames,
-        )
 
 
 def draw_frame_timestamp(frame, timestamp_ms, frame_index):
@@ -228,14 +129,18 @@ def draw_frame_timestamp(frame, timestamp_ms, frame_index):
 
 
 # noinspection D
-def run(frame_lock=None, frame_ready_event=None, stop_event=None):
+def run(
+    frame_lock=None,
+    frame_ready_event=None,
+    stop_event=None,
+    on_shutdown_started=None,
+):
     setup_output_dirs()
 
     frame_index = 0
     dropped_frames = 0
 
-    write_queue = queue.Queue(maxsize=100)
-    writer_thread = None
+    video_recorder = None
 
     rgb_shm = None
     depth_shm = None
@@ -315,13 +220,14 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
 
         video_path = VIDEO_PATH_TEMPLATE.format(ts=int(time.time()))
 
-        writer_thread = threading.Thread(
-            target=disk_writer_worker,
-            args=(write_queue, video_path, (w, h)),
-            daemon=True,
+        video_recorder = QueuedVideoWriter(
+            video_path,
+            (w, h),
+            VIDEO_FPS,
+            queue_size=100,
+            logger=logger,
+            label="TEKNOFEST RGB",
         )
-
-        writer_thread.start()
 
         while stop_event is None or not stop_event.is_set():
             if frame_ready_event is not None:
@@ -407,11 +313,10 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
                 )
 
                 # 4) MP4'e işlenmiş frame'i yaz
-                try:
-                    write_queue.put_nowait(processed_frame)
+                if video_recorder.enqueue(processed_frame):
                     last_record_time_ms = now_record_time_ms
 
-                except queue.Full:
+                else:
                     dropped_frames += 1
                     now = time.monotonic()
 
@@ -447,11 +352,25 @@ def run(frame_lock=None, frame_ready_event=None, stop_event=None):
             frame_index += 1
 
     finally:
+        if on_shutdown_started is not None:
+            try:
+                on_shutdown_started()
+            except Exception:
+                logger.exception("Could not notify launcher that video shutdown started.")
         print("System shutting down, writing remaining data to disk...")
 
-        if writer_thread is not None:
-            write_queue.put(None)
-            writer_thread.join()
+        writer_results = close_video_writers(
+            (video_recorder,),
+            timeout=VIDEO_WRITER_CLOSE_TIMEOUT_SEC,
+        )
+        for result in writer_results:
+            if not result.finalized:
+                logger.error(
+                    "Video close incomplete: requested=%s partial=%s error=%s",
+                    result.requested_path,
+                    result.partial_path,
+                    result.error,
+                )
 
         for shm in (rgb_shm, depth_shm, meta_shm, imu_shm):
             if shm is not None:

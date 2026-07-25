@@ -25,6 +25,7 @@ from teknofest.config.mission_config import (
     WAYPOINT_DIRECTORY,
 )
 from teknofest.servers import data_server
+from utils.shutdown_signals import GracefulShutdown
 from utils import waypoint_server
 
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -100,8 +101,11 @@ def stop_child_process(name, process, timeout_sec=5.0, sig=signal.SIGINT):
     if process is None or process.poll() is not None:
         return
 
-    print(f"[SYSTEM] Stopping {name}...")
-    signal_child_process(process, sig)
+    if sig is None:
+        print(f"[SYSTEM] Waiting for {name} safe stop...")
+    else:
+        print(f"[SYSTEM] Stopping {name}...")
+        signal_child_process(process, sig)
 
     try:
         process.wait(timeout=timeout_sec)
@@ -205,6 +209,20 @@ if __name__ == "__main__":
     p_vision = None
     p_teknofest_mission = None
     p_mission_manager = None
+    shutdown_controller = None
+    mission_stop_requested = threading.Event()
+
+    def selected_mission_process():
+        return p_mission_manager if interface_mode else p_teknofest_mission
+
+    def request_mission_shutdown(_signum=None):
+        if mission_stop_requested.is_set():
+            return
+        mission_stop_requested.set()
+        mission_process = selected_mission_process()
+        if mission_process is not None and mission_process.poll() is None:
+            print("[SYSTEM] Requesting TEKNOFEST mission safe stop...")
+            signal_child_process(mission_process, signal.SIGINT)
 
     try:
         run_startup_cleanup()
@@ -295,9 +313,19 @@ if __name__ == "__main__":
                 f"(PID: {p_teknofest_mission.pid})\n"
             )
 
+        shutdown_controller = GracefulShutdown(
+            stop_event=capture_stop_event,
+            on_first_signal=request_mission_shutdown,
+        )
+        shutdown_controller.install()
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
-        data_writer.run(frame_lock, frame_ready_event, capture_stop_event)
+        data_writer.run(
+            frame_lock,
+            frame_ready_event,
+            capture_stop_event,
+            on_shutdown_started=request_mission_shutdown,
+        )
 
     except KeyboardInterrupt:
         print("\n[SYSTEM] Stopped by the user (Ctrl+C)...")
@@ -314,15 +342,25 @@ if __name__ == "__main__":
             if interface_mode
             else f"TEKNOFEST {mission_name} Node"
         )
-        mission_process = p_mission_manager if interface_mode else p_teknofest_mission
+        mission_process = selected_mission_process()
         subprocesses = (
-            (mission_process_name, mission_process, 7.0),
-            ("Vision Node", p_vision, 3.0),
-            ("Bridge Node", p_bridge, 5.0),
+            (
+                mission_process_name,
+                mission_process,
+                7.0,
+                None if mission_stop_requested.is_set() else signal.SIGINT,
+            ),
+            ("Vision Node", p_vision, 3.0, signal.SIGINT),
+            ("Bridge Node", p_bridge, 5.0, signal.SIGINT),
         )
-        for process_name, process, timeout_sec in subprocesses:
+        for process_name, process, timeout_sec, initial_signal in subprocesses:
             try:
-                stop_child_process(process_name, process, timeout_sec=timeout_sec)
+                stop_child_process(
+                    process_name,
+                    process,
+                    timeout_sec=timeout_sec,
+                    sig=initial_signal,
+                )
             except Exception as exc:
                 print(f"[SYSTEM] Error while stopping {process_name}: {exc}")
 
@@ -339,3 +377,5 @@ if __name__ == "__main__":
             print("[SYSTEM] ZED capture process closed.")
 
         print("[SYSTEM] The entire system was safely stopped.")
+        if shutdown_controller is not None:
+            shutdown_controller.restore()

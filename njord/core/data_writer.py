@@ -2,7 +2,6 @@
 import logging
 import json
 import os
-import queue
 import threading
 import time
 
@@ -15,6 +14,7 @@ from std_msgs.msg import String
 from njord.config.camera_config import DEPTH_SHAPE, RGB_SHAPE
 from njord.core import shared_state
 from njord.core.shared_memory_utils import attach_existing_shared_memory
+from utils.video_writer import QueuedVideoWriter, close_video_writers
 from vision.detector import BaseYOLODetector
 
 OUTPUT_DIR = "logs"
@@ -23,6 +23,7 @@ VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
 DEPTH_VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "depth_run_{ts}.mp4")
 VIDEO_FPS = 5
+VIDEO_WRITER_CLOSE_TIMEOUT_SEC = 30.0
 
 logger = logging.getLogger("zed_capture")
 
@@ -64,37 +65,6 @@ class VisionDetectionCache(Node):
             if self._frame_id is None or abs(int(frame_id) - self._frame_id) > max_frame_lag:
                 return []
             return [dict(item) for item in self._detections if isinstance(item, dict)]
-
-def disk_writer_worker(q, video_path, frame_size):
-    """
-    Writes the captured BGR frames to an .mp4 video file.
-
-    IMU CSV logging is disabled for now (see the commented block below).
-    """
-    video_writer = cv2.VideoWriter(
-        video_path, cv2.VideoWriter_fourcc(*"mp4v"), VIDEO_FPS, frame_size
-    )
-
-    # --- IMU-to-CSV temporarily disabled ---
-    # with open(csv_path, "w", newline="") as csvfile:
-    #     writer = csv.writer(csvfile)
-    #     writer.writerow(["timestamp", "pitch", "yaw", "roll", "frame_index"])
-
-    while True:
-        item = q.get()
-        if item is None:
-            break
-
-        frame_bgr = item
-        video_writer.write(frame_bgr)
-
-        # --- IMU-to-CSV temporarily disabled ---
-        # writer.writerow([timestamp_ms, roll, pitch, yaw, frame_index])
-
-        q.task_done()
-
-    video_writer.release()
-
 
 def draw_frame_timestamp(frame, timestamp_ms, frame_index):
     timestamp_seconds = timestamp_ms / 1000.0
@@ -153,16 +123,15 @@ def run(
     active_task="task1",
     fx=None,
     cx=None,
+    on_shutdown_started=None,
 ):
     setup_output_dirs()
     frame_index = 0
     dropped_frames = 0
     dropped_depth_frames = 0
 
-    write_queue = queue.Queue(maxsize=100)
-    depth_write_queue = queue.Queue(maxsize=100)
-    writer_thread = None  # started lazily once we know frame size (see below)
-    depth_writer_thread = None
+    video_recorder = None
+    depth_video_recorder = None
     rgb_shm = None
     depth_shm = None
     depth_vision_shm = None
@@ -219,18 +188,22 @@ def run(
         run_timestamp = int(time.time())
         video_path = VIDEO_PATH_TEMPLATE.format(ts=run_timestamp)
         depth_video_path = DEPTH_VIDEO_PATH_TEMPLATE.format(ts=run_timestamp)
-        writer_thread = threading.Thread(
-            target=disk_writer_worker,
-            args=(write_queue, video_path, (w, h)),
-            daemon=True,
+        video_recorder = QueuedVideoWriter(
+            video_path,
+            (w, h),
+            VIDEO_FPS,
+            queue_size=100,
+            logger=logger,
+            label="NJORD RGB",
         )
-        writer_thread.start()
-        depth_writer_thread = threading.Thread(
-            target=disk_writer_worker,
-            args=(depth_write_queue, depth_video_path, (w, h)),
-            daemon=True,
+        depth_video_recorder = QueuedVideoWriter(
+            depth_video_path,
+            (w, h),
+            VIDEO_FPS,
+            queue_size=100,
+            logger=logger,
+            label="NJORD depth",
         )
-        depth_writer_thread.start()
 
         while stop_event is None or not stop_event.is_set():
             if frame_ready_event is not None:
@@ -301,9 +274,7 @@ def run(
 
                 shared_state.frame_event.set()
 
-                try:
-                    write_queue.put_nowait(processed_frame)
-                except queue.Full:
+                if not video_recorder.enqueue(processed_frame):
                     dropped_frames += 1
                     now = time.monotonic()
                     if now - last_drop_log > 1.0:  # rate-limit logging, don't block hot path
@@ -313,9 +284,7 @@ def run(
                         )
                         last_drop_log = now
 
-                try:
-                    depth_write_queue.put_nowait(depth_record_frame)
-                except queue.Full:
+                if not depth_video_recorder.enqueue(depth_record_frame):
                     dropped_depth_frames += 1
                     now = time.monotonic()
                     if now - last_drop_log > 1.0:
@@ -336,13 +305,24 @@ def run(
             shared_state.data_event.set()
             frame_index += 1
     finally:
+        if on_shutdown_started is not None:
+            try:
+                on_shutdown_started()
+            except Exception:
+                logger.exception("Could not notify launcher that video shutdown started.")
         print("System shutting down, writing remaining data to disk...")
-        if writer_thread is not None:
-            write_queue.put(None)
-            writer_thread.join()
-        if depth_writer_thread is not None:
-            depth_write_queue.put(None)
-            depth_writer_thread.join()
+        writer_results = close_video_writers(
+            (video_recorder, depth_video_recorder),
+            timeout=VIDEO_WRITER_CLOSE_TIMEOUT_SEC,
+        )
+        for result in writer_results:
+            if not result.finalized:
+                logger.error(
+                    "Video close incomplete: requested=%s partial=%s error=%s",
+                    result.requested_path,
+                    result.partial_path,
+                    result.error,
+                )
 
         shm_rgb = None
         shm_depth = None
