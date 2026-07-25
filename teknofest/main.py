@@ -137,9 +137,10 @@ def configure_mavlink_bridge_environment():
 
     print(
         "[SYSTEM] TEKNOFEST mission interface: "
-        "1=task1, 2=task2, 3=task3, "
-        "4=task1->task2->task3; "
-        f"mission_param={os.environ['MAVLINK_MISSION_PARAM_NAME']}, "
+        "SCR_USER2 gorev baslatma, SCR_USER3 waypoint indirme; "
+        "1=task1, 2=task2, 3=task3, 4=task1->task2->task3; "
+        f"start_param={os.environ['MAVLINK_MISSION_PARAM_NAME']}, "
+        f"waypoint_param={os.environ['MAVLINK_MISSION_WAYPOINT_PARAM_NAME']}, "
         f"topic={os.environ['MAVLINK_MISSION_START_TOPIC']}, "
         f"waypoint_directory={os.environ['MAVLINK_MISSION_WAYPOINT_DIRECTORY']}, "
         f"waypoints={os.environ['MAVLINK_MISSION_WAYPOINT_FILES']}"
@@ -286,8 +287,8 @@ if __name__ == "__main__":
             print(f" -> TEKNOFEST Mission Manager launched (PID: {p_mission_manager.pid})")
             print(
                 " -> Mission Planner secimi bekleniyor: "
-                "1=task1; 2=task2; 3=task3; "
-                "4=task1->task2->task3\n"
+                "SCR_USER3 waypoint indirir, SCR_USER2 gorevi baslatir; "
+                "1=task1; 2=task2; 3=task3; 4=competition\n"
             )
         else:
             p_teknofest_mission = launch_child_process(cmd_teknofest_mission)

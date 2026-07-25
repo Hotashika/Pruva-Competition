@@ -50,6 +50,7 @@ MAVLINK_BRIDGE_DEFAULTS = {
 # Profil sahibi bu değerleri eski shell environment değerlerinin üzerine yazar.
 MAVLINK_BRIDGE_OVERRIDES = {
     "MAVLINK_MISSION_PARAM_NAME": "SCR_USER2",
+    "MAVLINK_MISSION_WAYPOINT_PARAM_NAME": "SCR_USER3",
     "MAVLINK_MISSION_WAYPOINT_DIRECTORY": str(WAYPOINT_DIRECTORY),
     "MAVLINK_MISSION_WAYPOINT_FILES": format_mission_waypoint_files(
         MISSION_WAYPOINT_FILES

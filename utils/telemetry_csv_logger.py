@@ -48,7 +48,9 @@ CSV_HEADER = (
 )
 
 
-@dataclass(frozen=True, slots=True)
+# ``slots`` was added to dataclasses in Python 3.10. Jetson deployments still
+# using Python 3.8 must be able to import the competition mission.
+@dataclass(frozen=True)
 class TelemetrySample:
     """One vehicle telemetry sample; angles are in degrees."""
 

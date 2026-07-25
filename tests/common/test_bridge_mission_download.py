@@ -86,10 +86,12 @@ def _load_bridge(monkeypatch):
 
 def test_bridge_reads_profile_mission_parameter_name(monkeypatch):
     monkeypatch.setenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER2")
+    monkeypatch.setenv("MAVLINK_MISSION_WAYPOINT_PARAM_NAME", "SCR_USER3")
 
     bridge_module = _load_bridge(monkeypatch)
 
     assert bridge_module.MISSION_PARAM_NAME == "SCR_USER2"
+    assert bridge_module.MISSION_WAYPOINT_PARAM_NAME == "SCR_USER3"
 
 
 class _Logger:
@@ -121,6 +123,7 @@ def _download_node(bridge_module):
     node.mission_download_last_request_time = 0.0
     node.mission_download_retry_count = 0
     node.last_mission_parameter_value = 2
+    node.last_waypoint_parameter_value = 2
     node.pending_mission_command = None
     node.pending_mission_command_first_publish_time = 0.0
     node.pending_mission_command_last_publish_time = 0.0
@@ -146,14 +149,15 @@ def test_bridge_writes_download_to_configured_profile_directory(monkeypatch, tmp
         target_component=1,
         mav=mav,
     )
-    published = []
-    node._publish_downloaded_mission_start = published.append
+    reset_values = []
+    node._set_waypoint_parameter = reset_values.append
 
     node._handle_mission_item(types.SimpleNamespace(seq=0))
 
     destination = node.mission_waypoint_directory / "teknofest_task1.waypoints"
     assert destination.read_text(encoding="utf-8") == MISSION_CONTENT
-    assert published == [2]
+    assert reset_values == [bridge_module.MISSION_IDLE]
+    assert node.last_waypoint_parameter_value == 2
     assert len(mav.acks) == 1
     assert node.mission_download_task is None
 
@@ -170,7 +174,7 @@ def test_bridge_download_timeout_resets_command_for_operator_retry(
     node.mission_waypoint_directory = tmp_path
     node.master = object()
     reset_values = []
-    node._set_mission_parameter = reset_values.append
+    node._set_waypoint_parameter = reset_values.append
 
     node._mission_download_watchdog()
 
@@ -184,7 +188,7 @@ def test_bridge_empty_mission_resets_command(monkeypatch):
     node = _download_node(bridge_module)
     node.master = object()
     reset_values = []
-    node._set_mission_parameter = reset_values.append
+    node._set_waypoint_parameter = reset_values.append
 
     node._handle_mission_count(types.SimpleNamespace(count=0))
 

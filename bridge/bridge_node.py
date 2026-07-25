@@ -48,6 +48,10 @@ from utils.battery import battery_percentage_from_voltage
 MISSION_PARAM_NAME = (
     os.getenv("MAVLINK_MISSION_PARAM_NAME", "SCR_USER1").strip() or "SCR_USER1"
 )
+MISSION_WAYPOINT_PARAM_NAME = (
+    os.getenv("MAVLINK_MISSION_WAYPOINT_PARAM_NAME", "SCR_USER3").strip()
+    or "SCR_USER3"
+)
 MISSION_IDLE = 0
 MISSION_1 = 1
 MISSION_2 = 2
@@ -232,6 +236,9 @@ class OrangeCubeBridgeNode(Node):
         self.mission_parameter_initialized = False
         self.mission_parameter_startup_reset_pending = False
         self.last_mission_parameter_value = MISSION_IDLE
+        self.waypoint_parameter_initialized = False
+        self.waypoint_parameter_startup_reset_pending = False
+        self.last_waypoint_parameter_value = MISSION_IDLE
         self.pending_mission_command = None
         self.pending_mission_command_first_publish_time = 0.0
         self.pending_mission_command_last_publish_time = 0.0
@@ -328,7 +335,8 @@ class OrangeCubeBridgeNode(Node):
         self.create_timer(0.5, self._mission_download_watchdog)
 
         self.get_logger().info(
-            f"MAVLink Bridge aktif. {MISSION_PARAM_NAME}=1..4/90/99 okunup "
+            f"MAVLink Bridge aktif. {MISSION_PARAM_NAME}=1..4/90/99 gorev baslatir; "
+            f"{MISSION_WAYPOINT_PARAM_NAME}=1..4 Pixhawk waypoint listesini indirir. "
             f"{self.mission_start_topic} topic'ine Int32 olarak yayinlanacak; "
             f"{self.mission_start_ack_topic} ack geldikten sonra {MISSION_PARAM_NAME}=0 yapilacak."
         )
@@ -1038,15 +1046,16 @@ class OrangeCubeBridgeNode(Node):
         if self.master is None or not self.connected:
             return
 
-        try:
-            self.master.mav.param_request_read_send(
-                self.master.target_system,
-                self.master.target_component,
-                MISSION_PARAM_NAME.encode("ascii"),
-                -1,
-            )
-        except Exception as exc:
-            self.get_logger().warn(f"{MISSION_PARAM_NAME} okunamadi: {exc}")
+        for param_name in (MISSION_PARAM_NAME, MISSION_WAYPOINT_PARAM_NAME):
+            try:
+                self.master.mav.param_request_read_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    param_name.encode("ascii"),
+                    -1,
+                )
+            except Exception as exc:
+                self.get_logger().warn(f"{param_name} okunamadi: {exc}")
 
     # noinspection D
     def _read_mavlink_messages(self):
@@ -1073,6 +1082,7 @@ class OrangeCubeBridgeNode(Node):
 
                 elif msg_type == "PARAM_VALUE":
                     self._handle_mission_parameter_value(msg)
+                    self._handle_waypoint_parameter_value(msg)
 
                 elif msg_type == "COMMAND_ACK":
                     self._log_command_ack(msg)
@@ -1238,23 +1248,72 @@ class OrangeCubeBridgeNode(Node):
             self._acknowledge_mission_parameter()
             return
 
-        mission_number = command
-        mission_name = f"M{mission_number}"
+        self._publish_downloaded_mission_start(command)
 
-        if mission_number in self.mission_waypoint_files:
-            if not self._start_mission_download(mission_number):
-                return
-            self._send_status_text(
-                f"{MISSION_PARAM_NAME} received: {mission_name}, downloading mission",
-                mavutil.mavlink.MAV_SEVERITY_INFO,
-            )
-            self.get_logger().info(
-                f"{MISSION_PARAM_NAME} mission command received: {mission_name}; "
-                "waypoint dosyasi yazildiktan sonra mission_start yayinlanacak."
-            )
+    def _handle_waypoint_parameter_value(self, msg):
+        param_name = getattr(msg, "param_id", "")
+        if isinstance(param_name, bytes):
+            param_name = param_name.decode("utf-8", errors="ignore")
+        param_name = str(param_name).rstrip("\x00")
+        if param_name != MISSION_WAYPOINT_PARAM_NAME:
             return
 
-        self._publish_downloaded_mission_start(mission_number)
+        try:
+            command = int(round(float(getattr(msg, "param_value", MISSION_IDLE))))
+        except (TypeError, ValueError):
+            return
+
+        if self.waypoint_parameter_startup_reset_pending:
+            if command == MISSION_IDLE:
+                self.waypoint_parameter_startup_reset_pending = False
+                self.last_waypoint_parameter_value = MISSION_IDLE
+                self.get_logger().info(
+                    f"Baslangic {MISSION_WAYPOINT_PARAM_NAME} sifirlamasi dogrulandi; "
+                    "yeni waypoint indirme komutu bekleniyor."
+                )
+            return
+
+        if not self.waypoint_parameter_initialized:
+            self.waypoint_parameter_initialized = True
+            self.last_waypoint_parameter_value = command
+            if command != MISSION_IDLE:
+                self.get_logger().warn(
+                    f"Baslangicta {MISSION_WAYPOINT_PARAM_NAME}={command} bulundu; "
+                    "eski komut kabul edilip 0'a sifirlaniyor."
+                )
+                self.waypoint_parameter_startup_reset_pending = True
+                self._set_waypoint_parameter(MISSION_IDLE)
+            return
+
+        if command == self.last_waypoint_parameter_value:
+            return
+
+        self.get_logger().info(
+            f"{MISSION_WAYPOINT_PARAM_NAME} degisti: "
+            f"{self.last_waypoint_parameter_value} -> {command}"
+        )
+        self.last_waypoint_parameter_value = command
+        if command == MISSION_IDLE:
+            return
+
+        if command not in self.mission_waypoint_files:
+            self.get_logger().warn(
+                f"Gecersiz {MISSION_WAYPOINT_PARAM_NAME} waypoint komutu: {command}"
+            )
+            self._acknowledge_waypoint_parameter()
+            return
+
+        if not self._start_mission_download(command):
+            return
+        self._send_status_text(
+            f"{MISSION_WAYPOINT_PARAM_NAME} received: M{command}, downloading mission",
+            mavutil.mavlink.MAV_SEVERITY_INFO,
+        )
+        self.get_logger().info(
+            f"{MISSION_WAYPOINT_PARAM_NAME}={command}; Pixhawk mission listesi "
+            f"{self.mission_waypoint_files[command]} dosyasina indiriliyor. "
+            "Bu komut gorevi baslatmaz."
+        )
 
     def _publish_downloaded_mission_start(self, mission_number):
         self._publish_mission_start(mission_number, track_ack=True)
@@ -1378,7 +1437,11 @@ class OrangeCubeBridgeNode(Node):
                     self.master.target_component,
                     mavutil.mavlink.MAV_MISSION_ACCEPTED,
                 )
-            self._publish_downloaded_mission_start(task_number)
+            self._send_status_text(
+                f"waypoint sync M{task_number} completed",
+                mavutil.mavlink.MAV_SEVERITY_INFO,
+            )
+            self._acknowledge_waypoint_parameter()
         except Exception as exc:
             self._abort_mission_download(
                 f"Pixhawk waypoint dosyasi yazilamadi: {exc}"
@@ -1423,9 +1486,9 @@ class OrangeCubeBridgeNode(Node):
         )
         self._reset_mission_download()
         if task_number is not None:
-            # Keep last_mission_parameter_value unchanged until PARAM_VALUE=0
-            # arrives, so a stale non-zero echo cannot immediately retrigger.
-            self._set_mission_parameter(MISSION_IDLE)
+            # Keep the last value unchanged until PARAM_VALUE=0 arrives, so a
+            # stale non-zero echo cannot immediately retrigger.
+            self._set_waypoint_parameter(MISSION_IDLE)
 
     def _reset_mission_download(self):
         self.mission_download_task = None
@@ -1496,7 +1559,16 @@ class OrangeCubeBridgeNode(Node):
         self.pending_mission_command_first_publish_time = 0.0
         self.pending_mission_command_last_publish_time = 0.0
 
+    def _acknowledge_waypoint_parameter(self):
+        self._set_waypoint_parameter(MISSION_IDLE)
+
     def _set_mission_parameter(self, value):
+        self._set_parameter(MISSION_PARAM_NAME, value)
+
+    def _set_waypoint_parameter(self, value):
+        self._set_parameter(MISSION_WAYPOINT_PARAM_NAME, value)
+
+    def _set_parameter(self, param_name, value):
         if self.master is None:
             return
 
@@ -1504,13 +1576,13 @@ class OrangeCubeBridgeNode(Node):
             self.master.mav.param_set_send(
                 self.master.target_system,
                 self.master.target_component,
-                MISSION_PARAM_NAME.encode("ascii"),
+                param_name.encode("ascii"),
                 float(value),
                 mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
             )
-            self.get_logger().info(f"{MISSION_PARAM_NAME} = {value} gonderildi.")
+            self.get_logger().info(f"{param_name} = {value} gonderildi.")
         except Exception as exc:
-            self.get_logger().warn(f"{MISSION_PARAM_NAME} sifirlanamadi: {exc}")
+            self.get_logger().warn(f"{param_name} sifirlanamadi: {exc}")
 
     def _log_statustext(self, msg):
         text = getattr(msg, "text", "")
