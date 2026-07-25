@@ -23,6 +23,7 @@ from njord.core import capture_proc
 from njord.core import data_writer
 from njord.servers import data_server
 from njord.servers import video_server
+from utils.shutdown_signals import GracefulShutdown
 
 os.environ.setdefault("YOLO_OFFLINE", "true")
 
@@ -51,8 +52,11 @@ def stop_child_process(name, process, timeout_sec=5.0, sig=signal.SIGINT):
     if process is None or process.poll() is not None:
         return
 
-    print(f"[SYSTEM] Stopping {name}...")
-    signal_child_process(process, sig)
+    if sig is None:
+        print(f"[SYSTEM] Waiting for {name} safe stop...")
+    else:
+        print(f"[SYSTEM] Stopping {name}...")
+        signal_child_process(process, sig)
 
     try:
         process.wait(timeout=timeout_sec)
@@ -157,6 +161,16 @@ if __name__ == "__main__":
     p_bridge = None
     p_vision = None
     p_mission_manager = None
+    shutdown_controller = None
+    mission_stop_requested = threading.Event()
+
+    def request_mission_shutdown(_signum=None):
+        if mission_stop_requested.is_set():
+            return
+        mission_stop_requested.set()
+        if p_mission_manager is not None and p_mission_manager.poll() is None:
+            print("[SYSTEM] Requesting Mission Manager safe stop...")
+            signal_child_process(p_mission_manager, signal.SIGINT)
 
     try:
         run_startup_cleanup()
@@ -241,16 +255,22 @@ if __name__ == "__main__":
         print(" -> Mission Manager starts the selected task process after waypoint sync.")
         print(" -> Mission selection and process state are written to JSON.\n")
 
+        shutdown_controller = GracefulShutdown(
+            stop_event=capture_stop_event,
+            on_first_signal=request_mission_shutdown,
+        )
+        shutdown_controller.install()
         print("[SYSTEM] System active. Ctrl+C at the terminal to close.")
 
         if bridge_only:
-            while True:
-                time.sleep(1)
+            while not shutdown_controller.wait(timeout=1.0):
+                pass
         else:
             data_writer.run(
                 frame_lock,
                 frame_ready_event,
                 capture_stop_event,
+                on_shutdown_started=request_mission_shutdown,
             )
 
     except KeyboardInterrupt:
@@ -261,12 +281,26 @@ if __name__ == "__main__":
     finally:
         print("[SYSTEM] Cleaning process was started...")
 
-        try:
-            stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
-            stop_child_process("Mission Manager", p_mission_manager, timeout_sec=5.0)
-            stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
-        except Exception as exc:
-            print(f"[SYSTEM] Error while sub-process shut down: {exc}")
+        subprocesses = (
+            (
+                "Mission Manager",
+                p_mission_manager,
+                5.0,
+                None if mission_stop_requested.is_set() else signal.SIGINT,
+            ),
+            ("Vision Node", p_vision, 3.0, signal.SIGINT),
+            ("Bridge Node", p_bridge, 5.0, signal.SIGINT),
+        )
+        for process_name, process, timeout_sec, initial_signal in subprocesses:
+            try:
+                stop_child_process(
+                    process_name,
+                    process,
+                    timeout_sec=timeout_sec,
+                    sig=initial_signal,
+                )
+            except Exception as exc:
+                print(f"[SYSTEM] Error while stopping {process_name}: {exc}")
 
         print("[SYSTEM] Sub-processes closed.")
 
@@ -281,3 +315,5 @@ if __name__ == "__main__":
             print("[SYSTEM] ZED capture process closed.")
 
         print("[SYSTEM] The entire system was safely stopped.")
+        if shutdown_controller is not None:
+            shutdown_controller.restore()
