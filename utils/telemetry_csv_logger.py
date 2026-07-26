@@ -12,6 +12,7 @@ Example:
             ground_speed_m_s=vehicle.ground_speed,
             roll_deg=vehicle.roll,
             pitch_deg=vehicle.pitch,
+            yaw_deg=vehicle.yaw,
             heading_deg=vehicle.heading,
             speed_setpoint_m_s=controller.speed_setpoint,
             heading_setpoint_deg=controller.heading_setpoint,
@@ -42,6 +43,7 @@ CSV_HEADER = (
     "ground_speed_m_s",
     "roll_deg",
     "pitch_deg",
+    "yaw_deg",
     "heading_deg",
     "speed_setpoint_m_s",
     "heading_setpoint_deg",
@@ -59,6 +61,7 @@ class TelemetrySample:
     ground_speed_m_s: float
     roll_deg: float
     pitch_deg: float
+    yaw_deg: float
     heading_deg: float
     speed_setpoint_m_s: float
     heading_setpoint_deg: float
@@ -135,6 +138,7 @@ class TelemetryCsvLogger:
             "ground_speed_m_s": sample.ground_speed_m_s,
             "roll_deg": sample.roll_deg,
             "pitch_deg": sample.pitch_deg,
+            "yaw_deg": sample.yaw_deg,
             "heading_deg": sample.heading_deg,
             "speed_setpoint_m_s": sample.speed_setpoint_m_s,
             "heading_setpoint_deg": sample.heading_setpoint_deg,
@@ -168,6 +172,7 @@ class TelemetryCsvLogger:
             ground_speed_m_s=values["ground_speed_m_s"],
             roll_deg=values["roll_deg"],
             pitch_deg=values["pitch_deg"],
+            yaw_deg=values["yaw_deg"] % 360.0,
             heading_deg=values["heading_deg"] % 360.0,
             speed_setpoint_m_s=values["speed_setpoint_m_s"],
             heading_setpoint_deg=values["heading_setpoint_deg"] % 360.0,
@@ -205,6 +210,7 @@ class TelemetryCsvLogger:
             f"{validated.ground_speed_m_s:.3f}",
             f"{validated.roll_deg:.3f}",
             f"{validated.pitch_deg:.3f}",
+            f"{validated.yaw_deg:.3f}",
             f"{validated.heading_deg:.3f}",
             f"{validated.speed_setpoint_m_s:.3f}",
             f"{validated.heading_setpoint_deg:.3f}",
@@ -225,6 +231,7 @@ class TelemetryCsvLogger:
         ground_speed_m_s: float,
         roll_deg: float,
         pitch_deg: float,
+        yaw_deg: float,
         heading_deg: float,
         speed_setpoint_m_s: float,
         heading_setpoint_deg: float,
@@ -239,6 +246,7 @@ class TelemetryCsvLogger:
                 ground_speed_m_s=ground_speed_m_s,
                 roll_deg=roll_deg,
                 pitch_deg=pitch_deg,
+                yaw_deg=yaw_deg,
                 heading_deg=heading_deg,
                 speed_setpoint_m_s=speed_setpoint_m_s,
                 heading_setpoint_deg=heading_setpoint_deg,

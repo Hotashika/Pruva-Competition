@@ -12,7 +12,6 @@ Kamera koordinatlari:
 
 from __future__ import annotations
 
-import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from math import acos, degrees
@@ -47,8 +46,6 @@ class DetectorConfig:
     plane_smoothing_alpha: float = 0.40
     plane_prior_angle_sigma_deg: float = 12.0
     plane_prior_distance_sigma_m: float = 0.08
-    plane_full_ransac_interval: int = 1
-    plane_tracking_min_confidence: float = 0.35
 
     min_obstacle_height_m: float = 0.08
     water_noise_multiplier: float = 2.5
@@ -165,16 +162,9 @@ class USV3DDetector:
         self.config = config or DetectorConfig()
         self._rng = np.random.default_rng(self.config.random_seed)
         self._previous_plane: PlaneEstimate | None = None
-        self._tracked_frames_since_ransac = 0
-        self._ray_cache_shape: tuple[int, int] | None = None
-        self._ray_x: np.ndarray | None = None
-        self._ray_y: np.ndarray | None = None
-        self._pixel_rows: np.ndarray | None = None
-        self._pixel_columns: np.ndarray | None = None
 
     def reset(self) -> None:
         self._previous_plane = None
-        self._tracked_frames_since_ransac = 0
 
     def detect(self, depth: np.ndarray) -> FrameResult:
         if depth.ndim != 2:
@@ -258,40 +248,18 @@ class USV3DDetector:
         cx = width / 2.0 if self.config.cx is None else self.config.cx
         cy = height / 2.0 if self.config.cy is None else self.config.cy
 
-        if self._ray_cache_shape != depth.shape:
-            rows = np.repeat(
-                np.arange(height, dtype=np.int32),
-                width,
-            )
-            columns = np.tile(
-                np.arange(width, dtype=np.int32),
-                height,
-            )
-            self._ray_cache_shape = depth.shape
-            self._pixel_rows = rows
-            self._pixel_columns = columns
-            self._ray_x = (
-                columns.astype(np.float64) - cx
-            ) / self.config.fx
-            self._ray_y = (
-                rows.astype(np.float64) - cy
-            ) / self.config.fy
-
-        z_image = np.asarray(depth).reshape(-1)
+        rows, columns = np.indices(depth.shape)
+        z_image = depth.astype(np.float64, copy=False)
         valid = (
             np.isfinite(z_image)
             & (z_image > self.config.min_depth_m)
             & (z_image < self.config.max_depth_m)
         )
 
-        z = z_image[valid].astype(np.float64, copy=False)
-        x = self._ray_x[valid] * z
-        y = self._ray_y[valid] * z
-        return (
-            np.column_stack((x, y, z)),
-            self._pixel_rows[valid],
-            self._pixel_columns[valid],
-        )
+        z = z_image[valid]
+        x = (columns[valid] - cx) * z / self.config.fx
+        y = (rows[valid] - cy) * z / self.config.fy
+        return np.column_stack((x, y, z)), rows[valid], columns[valid]
 
     def _plane_roi_points(
         self,
@@ -307,27 +275,6 @@ class USV3DDetector:
         return roi
 
     def _estimate_water_plane(self, roi_points: np.ndarray) -> PlaneEstimate:
-        interval = max(1, int(self.config.plane_full_ransac_interval))
-        can_track = (
-            self._previous_plane is not None
-            and self._previous_plane.confidence
-            >= self.config.plane_tracking_min_confidence
-            and self._tracked_frames_since_ransac < interval - 1
-        )
-        if can_track:
-            tracked = self._track_water_plane(roi_points)
-            if tracked is not None:
-                self._tracked_frames_since_ransac += 1
-                return tracked
-
-        plane = self._estimate_water_plane_ransac(roi_points)
-        self._tracked_frames_since_ransac = 0
-        return plane
-
-    def _estimate_water_plane_ransac(
-        self,
-        roi_points: np.ndarray,
-    ) -> PlaneEstimate:
         sample_size = min(len(roi_points), self.config.plane_fit_max_points)
         sample_indices = self._rng.choice(
             len(roi_points),
@@ -427,86 +374,6 @@ class USV3DDetector:
             residual_sigma,
             height_error,
         )
-
-        return PlaneEstimate(
-            normal=normal,
-            d=float(d),
-            inlier_ratio=inlier_ratio,
-            residual_sigma_m=residual_sigma,
-            camera_distance_m=abs(float(d)),
-            confidence=confidence,
-        )
-
-    def _track_water_plane(
-        self,
-        roi_points: np.ndarray,
-    ) -> PlaneEstimate | None:
-        previous = self._previous_plane
-        if previous is None:
-            return None
-
-        tracking_threshold = 1.5 * self.config.plane_inlier_threshold_m
-        prior_residuals = previous.signed_height(roi_points)
-        tracking_inliers = np.abs(prior_residuals) < tracking_threshold
-        if (
-            np.count_nonzero(tracking_inliers) < 100
-            or float(np.mean(tracking_inliers))
-            < self.config.plane_min_inlier_ratio
-        ):
-            return None
-
-        refine_points = roi_points[tracking_inliers]
-        max_points = max(3, int(self.config.plane_fit_max_points))
-        if len(refine_points) > max_points:
-            refine_points = refine_points[
-                self._rng.choice(
-                    len(refine_points),
-                    size=max_points,
-                    replace=False,
-                )
-            ]
-
-        normal, d = self._least_squares_plane(
-            refine_points,
-            previous.normal,
-        )
-        min_vertical_component = np.cos(
-            np.deg2rad(self.config.plane_max_tilt_deg)
-        )
-        if abs(normal[1]) < min_vertical_component or d <= 0.0:
-            return None
-
-        height_error = abs(abs(d) - self.config.camera_height_m)
-        if height_error > self.config.plane_height_tolerance_m:
-            return None
-
-        weight = float(
-            np.clip(self.config.plane_height_prior_weight, 0.0, 1.0)
-        )
-        d = (1.0 - weight) * d + weight * self.config.camera_height_m
-
-        residuals = roi_points @ normal + d
-        inliers = (
-            np.abs(residuals)
-            < self.config.plane_inlier_threshold_m
-        )
-        inlier_ratio = float(np.mean(inliers))
-        if (
-            not np.any(inliers)
-            or inlier_ratio < self.config.plane_min_inlier_ratio
-        ):
-            return None
-
-        residual_sigma = _robust_sigma(residuals[inliers])
-        normal, d = self._smooth_with_previous(normal, d)
-        height_error = abs(abs(d) - self.config.camera_height_m)
-        confidence = self._plane_confidence(
-            inlier_ratio,
-            residual_sigma,
-            height_error,
-        )
-        if confidence < self.config.plane_tracking_min_confidence:
-            return None
 
         return PlaneEstimate(
             normal=normal,
@@ -821,31 +688,14 @@ class USV3DObstacleDetector:
         camera_height_m=0.25,
         detection_max_range_m=8.0,
         plane_ransac_iterations=350,
-        plane_full_ransac_interval=1,
-        plane_tracking_min_confidence=0.35,
-        depth_downsample_factor=1,
-        geometry_hz=None,
     ):
         # VisionNode ile ortak kurucu sozlesmesi icin tutulur. Olcekleme,
         # gercek RGB ve depth kare boyutlarindan dinamik hesaplanir.
         _ = camera_width
-        self.depth_downsample_factor = max(
-            1,
-            int(depth_downsample_factor),
-        )
         resolved_fx = self._positive_float(fx, 700.0)
         resolved_fy = self._positive_float(fy, resolved_fx)
         resolved_cx = self._optional_float(cx)
         resolved_cy = self._optional_float(cy)
-        intrinsics_scale = 1.0 / self.depth_downsample_factor
-        resolved_fx *= intrinsics_scale
-        resolved_fy *= intrinsics_scale
-        if resolved_cx is not None:
-            resolved_cx *= intrinsics_scale
-        if resolved_cy is not None:
-            resolved_cy *= intrinsics_scale
-
-        point_density_scale = intrinsics_scale**2
         self.geometry_detector = USV3DDetector(
             DetectorConfig(
                 fx=resolved_fx,
@@ -855,37 +705,8 @@ class USV3DObstacleDetector:
                 camera_height_m=float(camera_height_m),
                 detection_max_range_m=float(detection_max_range_m),
                 plane_ransac_iterations=int(plane_ransac_iterations),
-                plane_full_ransac_interval=max(
-                    1,
-                    int(plane_full_ransac_interval),
-                ),
-                plane_tracking_min_confidence=float(
-                    plane_tracking_min_confidence
-                ),
-                min_cluster_points=max(
-                    5,
-                    round(
-                        DetectorConfig.min_cluster_points
-                        * point_density_scale
-                    ),
-                ),
-                min_cluster_mean_points_per_cell=max(
-                    2.0,
-                    (
-                        DetectorConfig.min_cluster_mean_points_per_cell
-                        * point_density_scale
-                    ),
-                ),
             )
         )
-        resolved_geometry_hz = self._positive_float(geometry_hz, 0.0)
-        self.geometry_interval_sec = (
-            None
-            if resolved_geometry_hz <= 0.0
-            else 1.0 / resolved_geometry_hz
-        )
-        self._last_geometry_run_time: float | None = None
-        self._cached_live_detections: list[dict] | None = None
         self.last_geometry_error: str | None = None
         self.last_result: FrameResult | None = None
 
@@ -976,30 +797,13 @@ class USV3DObstacleDetector:
         if depth_array is None or getattr(depth_array, "ndim", None) != 2:
             self.last_geometry_error = "Gecerli bir metrik depth karesi yok."
             self.last_result = None
-            self._cached_live_detections = None
             return []
 
-        now = time.monotonic()
-        if (
-            self.geometry_interval_sec is not None
-            and self._last_geometry_run_time is not None
-            and self._cached_live_detections is not None
-            and now - self._last_geometry_run_time
-            < self.geometry_interval_sec
-        ):
-            return [dict(item) for item in self._cached_live_detections]
-
-        self._last_geometry_run_time = now
-        processing_depth = depth_array[
-            :: self.depth_downsample_factor,
-            :: self.depth_downsample_factor,
-        ]
         try:
-            result = self.geometry_detector.detect(processing_depth)
+            result = self.geometry_detector.detect(depth_array)
         except (RuntimeError, TypeError, ValueError) as exc:
             self.last_geometry_error = str(exc)
             self.last_result = None
-            self._cached_live_detections = []
             return []
 
         self.last_geometry_error = None
@@ -1009,7 +813,7 @@ class USV3DObstacleDetector:
         for item in result.detections:
             bbox = self._scaled_bbox(
                 item.pixel_bbox_xyxy,
-                processing_depth.shape,
+                depth_array.shape,
                 image_shape,
             )
             detections.append(
@@ -1019,5 +823,4 @@ class USV3DObstacleDetector:
                     bbox,
                 )
             )
-        self._cached_live_detections = [dict(item) for item in detections]
         return detections

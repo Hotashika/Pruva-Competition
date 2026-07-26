@@ -45,6 +45,7 @@ from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
 
 from teknofest.config.mission_config import WAYPOINT_DIRECTORY
+from teknofest.missions.utils.mission_data_recorder import MissionDataRecorder
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
     calculate_bearing,
@@ -1276,6 +1277,7 @@ class Task2Node(Node):
         self.active_task_timer = self.create_timer(1.0, self._publish_active_task)
         self._publish_active_task()
 
+        self.data_recorder = MissionDataRecorder(self, "task2")
         self.control_timer = self.create_timer(0.1, self.timer_callback)
 
     # ========================================================
@@ -1323,6 +1325,15 @@ class Task2Node(Node):
         msg = String()
         msg.data = "task2"
         self.active_task_pub.publish(msg)
+
+    def wait_for_complete_telemetry(self, timeout_sec=10.0):
+        return self.data_recorder.wait_for_complete_telemetry(timeout_sec)
+
+    def start_telemetry_recording(self):
+        self.data_recorder.start()
+
+    def stop_telemetry_recording(self):
+        self.data_recorder.stop()
 
     @staticmethod
     def _parse_detections_payload(payload):
@@ -1492,6 +1503,12 @@ def main(args=None):
             )
             return
 
+        if not node.wait_for_complete_telemetry(timeout_sec=10.0):
+            node.get_logger().error(
+                "Roll/pitch/yaw ve araç telemetrisi hazır değil. Görev başlatılmadı."
+            )
+            return
+
         if not node.wait_for_vision(timeout_sec=30.0):
             node.get_logger().error(
                 "Vision heartbeat yok. Görev başlatılmadı."
@@ -1524,6 +1541,17 @@ def main(args=None):
             )
             return
 
+        try:
+            node.start_telemetry_recording()
+        except (OSError, RuntimeError, ValueError) as exc:
+            node.get_logger().error(f"Görev veri kaydı başlatılamadı: {exc}")
+            stop_vehicle(node.mission_topics.cmd_vel_pub)
+            call_trigger_service(
+                node,
+                node.mission_clients.disarm_client,
+                "DISARM",
+            )
+            return
         node.mission_active = True
         node.get_logger().info("Görev 2 kontrol döngüsü başladı.")
 
@@ -1535,6 +1563,7 @@ def main(args=None):
             rclpy.spin_once(node, timeout_sec=0.1)
 
         node.mission_active = False
+        node.stop_telemetry_recording()
         stop_vehicle(node.mission_topics.cmd_vel_pub)
 
         if node.task.state == MissionState.FAILSAFE:
@@ -1552,6 +1581,7 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("Görev kullanıcı tarafından durduruldu.")
         node.mission_active = False
+        node.stop_telemetry_recording()
         stop_vehicle(node.mission_topics.cmd_vel_pub)
         try:
             call_trigger_service(
@@ -1563,6 +1593,7 @@ def main(args=None):
             pass
 
     finally:
+        node.stop_telemetry_recording()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

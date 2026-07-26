@@ -81,26 +81,8 @@ def _build_parser():
     parser.add_argument(
         "--ransac-iterations",
         type=int,
-        default=100,
+        default=350,
         help="Su duzlemi RANSAC tekrar sayisi.",
-    )
-    parser.add_argument(
-        "--full-ransac-interval",
-        type=int,
-        default=5,
-        help="Tam RANSAC calistirilacak geometri karesi araligi.",
-    )
-    parser.add_argument(
-        "--downsample-factor",
-        type=int,
-        default=2,
-        help="Depth boyutlarini bu tam sayi katsayisiyla kucultur.",
-    )
-    parser.add_argument(
-        "--geometry-hz",
-        type=float,
-        default=7.5,
-        help="3B geometrinin calisma hizi; ara karelerde son sonuc kullanilir.",
     )
     parser.add_argument(
         "--status-interval-sec",
@@ -120,12 +102,6 @@ def _validate_args(args):
         raise ValueError("max-range-m pozitif olmali.")
     if args.ransac_iterations < 1:
         raise ValueError("ransac-iterations en az 1 olmali.")
-    if args.full_ransac_interval < 1:
-        raise ValueError("full-ransac-interval en az 1 olmali.")
-    if args.downsample_factor < 1:
-        raise ValueError("downsample-factor en az 1 olmali.")
-    if args.geometry_hz <= 0.0:
-        raise ValueError("geometry-hz pozitif olmali.")
     if args.status_interval_sec <= 0.0:
         raise ValueError("status-interval-sec pozitif olmali.")
 
@@ -176,9 +152,6 @@ def run_check(args):
             camera_height_m=args.camera_height_m,
             detection_max_range_m=args.max_range_m,
             plane_ransac_iterations=args.ransac_iterations,
-            plane_full_ransac_interval=args.full_ransac_interval,
-            depth_downsample_factor=args.downsample_factor,
-            geometry_hz=args.geometry_hz,
         )
 
         rclpy.init(args=[])
@@ -193,11 +166,7 @@ def run_check(args):
         print(
             "[USV3D] Test started. "
             f"source={source_mode}, topic={TEST_TOPIC}, "
-            f"intrinsics=({fx:.2f}, {fy:.2f}, {cx:.2f}, {cy:.2f}), "
-            f"geometry_hz={args.geometry_hz:.1f}, "
-            f"downsample={args.downsample_factor}x, "
-            f"ransac={args.ransac_iterations}/"
-            f"{args.full_ransac_interval}-frame"
+            f"intrinsics=({fx:.2f}, {fy:.2f}, {cx:.2f}, {cy:.2f})"
         )
         print("[USV3D] GPS/MAVLink/vehicle movement commands are disabled.")
 

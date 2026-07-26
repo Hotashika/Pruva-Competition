@@ -9,7 +9,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from njord.core.dataset_recorder import DatasetRecorder, DatasetRecorderError
+from njord.core.dataset_recorder import (
+    DatasetRecorder,
+    DatasetRecorderError,
+    Task2TestRecorder,
+)
 
 
 def image(value, shape=(24, 32, 3)):
@@ -21,6 +25,103 @@ def depth(value, shape=(24, 32)):
 
 
 class DatasetRecorderTests(unittest.TestCase):
+    def test_task2_test_recorder_keeps_sensor_streams_in_separate_files(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:
+            with Task2TestRecorder(
+                temporary_dir,
+                run_name="task2_test",
+                calibration={"left": {"fx": 700.0}},
+            ) as recorder:
+                recorder.record_frame(
+                    frame_id=10,
+                    camera_timestamp_ms=5000,
+                    system_timestamp_utc="2026-07-25T10:00:00+00:00",
+                    left_image=image(50),
+                    right_image=None,
+                    depth_map=depth(3.5),
+                    roll=0.1,
+                    pitch=0.2,
+                    yaw=0.3,
+                )
+                recorder.record_gps(
+                    latitude_deg=41.0123,
+                    longitude_deg=29.0456,
+                    altitude_m=2.5,
+                    ros_timestamp_ns=123456789,
+                    frame_id=10,
+                    camera_timestamp_ms=5000,
+                    position_covariance_type=2,
+                )
+                recorder.record_imu_sample(
+                    source="pixhawk",
+                    ros_timestamp_ns=123456790,
+                    roll_rad=0.4,
+                    pitch_rad=0.5,
+                    yaw_rad=0.6,
+                    angular_velocity_x_rad_s=0.01,
+                    linear_acceleration_x_m_s2=9.81,
+                )
+                recorder.record_kinematics(
+                    {
+                        "frame_id": 10,
+                        "camera_timestamp_ms": 5000,
+                        "detected": 1,
+                        "track_id": 7,
+                        "distance_m": 3.5,
+                        "bearing_deg": -4.0,
+                        "relative_speed_mps": 0.8,
+                        "collision_risk": 1,
+                        "collision_reason": "unsafe_cpa",
+                    }
+                )
+                run_dir = recorder.run_dir
+
+            with (run_dir / "frames.csv").open(
+                newline="", encoding="utf-8"
+            ) as frames_file:
+                frame_rows = list(csv.DictReader(frames_file))
+            self.assertEqual(1, len(frame_rows))
+            self.assertEqual("10", frame_rows[0]["frame_id"])
+            self.assertNotIn("roll_rad", frame_rows[0])
+            self.assertEqual("depth/00000010.npy", frame_rows[0]["depth_file"])
+
+            with (run_dir / "imu.csv").open(
+                newline="", encoding="utf-8"
+            ) as imu_file:
+                imu_rows = list(csv.DictReader(imu_file))
+            self.assertEqual(["pixhawk", "zed"], sorted(row["source"] for row in imu_rows))
+            zed_row = next(row for row in imu_rows if row["source"] == "zed")
+            self.assertEqual("10", zed_row["frame_id"])
+            self.assertEqual("5000", zed_row["camera_timestamp_ms"])
+            pixhawk_row = next(
+                row for row in imu_rows if row["source"] == "pixhawk"
+            )
+            self.assertEqual("123456790", pixhawk_row["ros_timestamp_ns"])
+            self.assertEqual("0.010000000", pixhawk_row["angular_velocity_x_rad_s"])
+
+            with (run_dir / "gps.csv").open(
+                newline="", encoding="utf-8"
+            ) as gps_file:
+                gps_rows = list(csv.DictReader(gps_file))
+            self.assertEqual("41.012300000", gps_rows[0]["latitude_deg"])
+            self.assertEqual("29.045600000", gps_rows[0]["longitude_deg"])
+            self.assertEqual("10", gps_rows[0]["frame_id"])
+            self.assertEqual("5000", gps_rows[0]["camera_timestamp_ms"])
+
+            with (run_dir / "kinematics.csv").open(
+                newline="", encoding="utf-8"
+            ) as kinematics_file:
+                kinematics_rows = list(csv.DictReader(kinematics_file))
+            self.assertEqual("7", kinematics_rows[0]["track_id"])
+            self.assertEqual("unsafe_cpa", kinematics_rows[0]["collision_reason"])
+
+            with (run_dir / "manifest.json").open(encoding="utf-8") as file:
+                manifest = json.load(file)
+            self.assertEqual("frames.csv", manifest["metadata_file"])
+            self.assertEqual("imu.csv", manifest["imu_file"])
+            self.assertEqual("gps.csv", manifest["gps_file"])
+            self.assertEqual("kinematics.csv", manifest["kinematics_file"])
+
     def test_writes_stereo_images_metadata_calibration_and_manifest(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_dir:
             calibration = {
