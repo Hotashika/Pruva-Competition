@@ -1,4 +1,3 @@
-# import csv  # IMU CSV logging is disabled for now.
 import os
 import time
 import logging
@@ -8,9 +7,15 @@ from multiprocessing import shared_memory
 import cv2
 import numpy as np
 import rclpy
+from std_msgs.msg import String
 
 from teknofest.config.camera_config import RGB_SHAPE
 from teknofest.core import shared_state
+from teknofest.core.imu_csv_writer import (
+    MISSION_RECORDING_TOPIC,
+    MissionRecordingState,
+    ZedImuCsvWriter,
+)
 from utils.frame_cadence import FrameCadence
 from utils.video_writer import QueuedVideoWriter, close_video_writers
 from vision.detection_cache import VisionDetectionCache
@@ -21,7 +26,6 @@ OUTPUT_DIR = "logs"
 DEPTH_DIR = os.path.join(OUTPUT_DIR, "depth_frames")
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 
-# CSV_PATH = os.path.join(OUTPUT_DIR, "imu_log.csv")  # IMU CSV logging is disabled for now.
 DEPTH_BIN_PATH = os.path.join(OUTPUT_DIR, "depth_stream.bin")  # single append-only file (disabled for now)
 
 VIDEO_PATH_TEMPLATE = os.path.join(VIDEO_DIR, "run_{ts}.mp4")
@@ -135,6 +139,9 @@ def run(
     dropped_frames = 0
 
     video_recorder = None
+    imu_csv_writer = None
+    active_imu_session = ""
+    recording_state = MissionRecordingState()
     detection_node = None
     detection_spin_thread = None
     owns_rclpy_context = False
@@ -159,6 +166,12 @@ def run(
             rclpy.init()
             owns_rclpy_context = True
         detection_node = VisionDetectionCache("teknofest_video_detection_cache")
+        detection_node.create_subscription(
+            String,
+            MISSION_RECORDING_TOPIC,
+            lambda message: recording_state.update(message.data),
+            10,
+        )
         detection_spin_thread = threading.Thread(
             target=rclpy.spin,
             args=(detection_node,),
@@ -210,7 +223,7 @@ def run(
                     continue
                 should_record = record_cadence.due(time.monotonic() * 1000.0)
                 timestamp_ms = int(shm_meta[1])
-                pitch, yaw, roll = shm_imu.tolist()
+                roll, pitch, yaw = shm_imu.tolist()
                 if should_record:
                     np.copyto(bgra_buf, shm_rgb)
                 if int(shm_meta[0]) != current_frame_id:
@@ -222,11 +235,58 @@ def run(
                         continue
                     should_record = record_cadence.due(time.monotonic() * 1000.0)
                     timestamp_ms = int(shm_meta[1])
-                    pitch, yaw, roll = shm_imu.tolist()
+                    roll, pitch, yaw = shm_imu.tolist()
                     if should_record:
                         np.copyto(bgra_buf, shm_rgb)
 
             last_frame_id = current_frame_id
+
+            requested_imu_session = recording_state.active_session()
+            if requested_imu_session != active_imu_session:
+                if imu_csv_writer is not None:
+                    logger.info(
+                        "ZED IMU recording stopped: %s",
+                        imu_csv_writer.csv_path,
+                    )
+                    try:
+                        imu_csv_writer.close()
+                    except Exception:
+                        logger.exception("ZED IMU CSV could not be closed.")
+                    imu_csv_writer = None
+
+                active_imu_session = requested_imu_session
+                if active_imu_session:
+                    try:
+                        imu_csv_writer = ZedImuCsvWriter(active_imu_session)
+                        logger.info(
+                            "ZED IMU recording started: %s",
+                            imu_csv_writer.csv_path,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "ZED IMU recording could not be started for %s.",
+                            active_imu_session,
+                        )
+
+            if imu_csv_writer is not None:
+                try:
+                    imu_csv_writer.write(
+                        frame_id=current_frame_id,
+                        camera_timestamp_ms=timestamp_ms,
+                        roll_rad=roll,
+                        pitch_rad=pitch,
+                        yaw_rad=yaw,
+                    )
+                except Exception:
+                    logger.exception(
+                        "ZED IMU sample could not be recorded; "
+                        "this mission's IMU writer is being closed."
+                    )
+                    try:
+                        imu_csv_writer.close()
+                    except Exception:
+                        logger.exception("ZED IMU CSV could not be closed.")
+                    imu_csv_writer = None
 
             # ------------------------------------------------------------
             # MP4 KAYDI: İşlenmiş kamera verisi
@@ -314,6 +374,16 @@ def run(
                     result.partial_path,
                     result.error,
                 )
+
+        if imu_csv_writer is not None:
+            logger.info(
+                "ZED IMU recording stopped during shutdown: %s",
+                imu_csv_writer.csv_path,
+            )
+            try:
+                imu_csv_writer.close()
+            except Exception:
+                logger.exception("ZED IMU CSV could not be closed during shutdown.")
 
         for shm in (rgb_shm, meta_shm, imu_shm):
             if shm is not None:

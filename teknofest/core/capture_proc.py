@@ -175,19 +175,24 @@ def run_capture(
             timestamp_ms = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_milliseconds()
 
             imu_pose = sensors_data.get_imu_data().get_pose()
-            pitch, yaw, roll = imu_pose.get_euler_angles()
+            try:
+                roll, pitch, yaw = imu_pose.get_euler_angles(radian=True)
+            except TypeError:
+                # Older ZED Python bindings use radians by default but do not
+                # expose the ``radian`` keyword.
+                roll, pitch, yaw = imu_pose.get_euler_angles()
 
             frame_index += 1
             if lock is None:
                 rgb_buf[:] = rgb_mat.get_data()
                 depth_buf[:] = depth_mat.get_data()
-                imu_buf[:] = (pitch, yaw, roll)
+                imu_buf[:] = (roll, pitch, yaw)
                 meta_buf[:] = (frame_index, timestamp_ms)
             else:
                 with lock:
                     rgb_buf[:] = rgb_mat.get_data()
                     depth_buf[:] = depth_mat.get_data()
-                    imu_buf[:] = (pitch, yaw, roll)
+                    imu_buf[:] = (roll, pitch, yaw)
                     meta_buf[:] = (frame_index, timestamp_ms)
 
             if frame_ready_event is not None:
