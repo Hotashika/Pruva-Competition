@@ -196,6 +196,37 @@ The Njord launcher:
 If ZED capture cannot start, Njord continues in bridge-only mode. Vision,
 video, and data writing are disabled in that mode.
 
+### Manual Njord Task 2 Test Recording
+
+Start the normal Njord stack first:
+
+```bash
+python njord/main.py
+```
+
+In a second terminal, start and stop the test recording independently from the
+Task 2 mission:
+
+```bash
+python -m njord.collect_dataset --attach --name task2_water_test --fps 5
+```
+
+Use `--duration 120` for a fixed two-minute recording, or press `Ctrl+C` for a
+safe manual stop. `--attach` reuses the running Njord shared-memory capture and
+does not try to open the ZED camera a second time.
+
+Each run is written below
+`njord/logs/datasets/<name>/run_<timestamp>_<pid>/` with separate outputs:
+
+- `frames.csv`, `left/`, and `depth/` for camera-aligned RGB and metric depth.
+- `gps.csv` for Pixhawk GPS fixes.
+- `imu.csv` for ZED and Pixhawk IMU samples, distinguished by `source`.
+- `kinematics.csv` for Task 2 obstacle motion and collision-risk estimates.
+
+The files remain separate but carry `frame_id`, camera timestamps, ROS
+timestamps, or UTC timestamps so samples from the same test moment can be
+matched during analysis.
+
 ### TEKNOFEST
 
 Start Mission Planner interface mode:

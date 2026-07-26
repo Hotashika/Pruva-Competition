@@ -245,6 +245,53 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertEqual("GUIDED", node.bridge_mode)
         self.assertEqual((True, False, "GUIDED"), node._last_logged_bridge_state)
 
+    def test_task2_node_publishes_kinematics_without_starting_a_csv(self):
+        node = task2.Task2Node()
+
+        self.assertIsNone(node.kinematics_recorder)
+        self.assertIsNotNone(node.task.kinematics_callback)
+
+    def test_builds_manual_recorder_kinematics_payload(self):
+        observation = task2.VesselObservation(
+            timestamp=10.0,
+            camera_timestamp_ms=5000,
+            frame_id=42,
+            track_id=7,
+            distance_m=4.2,
+            angle_deg=-3.0,
+            forward_m=4.19,
+            starboard_m=-0.22,
+            latitude=41.0123,
+            longitude=29.0456,
+            heading_deg=90.0,
+        )
+        kinematics = task2.VesselKinematics(
+            relative_course_deg=180.0,
+            relative_speed_mps=0.8,
+            true_course_deg=175.0,
+            true_speed_mps=0.6,
+        )
+        assessment = task2.CollisionAssessment(
+            True,
+            "unsafe_cpa",
+            closing_rate_mps=0.5,
+            tcpa_sec=3.0,
+            dcpa_m=1.2,
+        )
+
+        payload = task2.build_kinematics_payload(
+            observation,
+            kinematics,
+            assessment,
+        )
+
+        self.assertEqual(42, payload["frame_id"])
+        self.assertEqual(5000, payload["camera_timestamp_ms"])
+        self.assertEqual(41.0123, payload["latitude_deg"])
+        self.assertEqual(0.8, payload["relative_speed_mps"])
+        self.assertEqual(1, payload["collision_risk"])
+        self.assertEqual("unsafe_cpa", payload["collision_reason"])
+
     def test_receding_vessel_does_not_trigger_avoidance(self):
         self._update(6.0, 0.0, 10.0)
         self._update(6.5, 0.0, 10.3)
