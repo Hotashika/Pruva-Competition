@@ -36,7 +36,6 @@ def task3_module(monkeypatch):
         "create_mission_topics",
         "parse_bridge_state",
         "publish_cmd_vel",
-        "publish_set_position",
         "stop_vehicle",
         "wait_for_mission_services",
     )
@@ -165,7 +164,7 @@ def _complete_one_impact(mission, task3_module, now):
     return now
 
 
-def test_search_moves_forward_for_wrong_class_and_stops_for_invalid_target_data(
+def test_search_pivots_for_wrong_class_and_stops_for_invalid_target_data(
         task3_module,
 ):
     commands = []
@@ -180,9 +179,8 @@ def test_search_moves_forward_for_wrong_class_and_stops_for_invalid_target_data(
     commands.clear()
 
     mission.update([_target(class_name="yellow_buoy")], now=0.1)
-    assert commands[-1] == pytest.approx(
-        (mission.config.search_linear_x, mission.config.search_angular_z)
-    )
+    assert commands[-1][0] == pytest.approx(0.0)
+    assert commands[-1][1] < 0.0
 
     mission.update([_target(distance=-1.0)], now=0.2)
     assert commands[-1] == (0.0, 0.0)
@@ -196,9 +194,8 @@ def test_search_moves_forward_for_wrong_class_and_stops_for_invalid_target_data(
     mission.update([_target(confidence=None)], now=0.5)
 
     assert mission.state is task3_module.MissionState.SEARCH
-    assert commands[-1][0] == pytest.approx(
-        mission.config.search_linear_x
-    )
+    assert commands[-1][0] == pytest.approx(0.0)
+    assert commands[-1][1] < 0.0
 
 
 @pytest.mark.parametrize(
@@ -410,57 +407,60 @@ def test_lost_target_stops_and_enters_reacquire(task3_module):
     assert mission.state is task3_module.MissionState.SEARCH
 
 
-def test_s_search_alternates_forward_legs_then_relocates(task3_module):
+def test_centered_arc_returns_to_saved_heading_then_advances(task3_module):
     commands = []
-    gps_targets = []
     task3_module.publish_cmd_vel = (
         lambda publisher, linear_x, angular_z:
         commands.append((linear_x, angular_z))
     )
-    task3_module.publish_set_position = (
-        lambda publisher, lat, lon:
-        gps_targets.append((lat, lon))
-    )
-    mission = _mission(
-        task3_module,
-        search_leg_timeout_sec=0.1,
-        search_legs_per_cycle=4,
-    )
+    mission = _mission(task3_module)
     commands.clear()
 
     mission.update([], now=0.01)
-    mission.update([], now=0.11)
-    mission.update([], now=0.22)
-    mission.update([], now=0.33)
-    mission.update([], now=0.44)
+    assert commands[-1][0] == pytest.approx(0.0)
+    assert commands[-1][1] < 0.0
 
-    assert mission.state is task3_module.MissionState.SEARCH_RELOCATE
-    assert [command[0] for command in commands] == pytest.approx(
-        [mission.config.search_linear_x] * 4
+    mission.update_heading(5.0, now=0.02)
+    mission.update([], now=0.02)
+    assert mission.search_controller.phase is task3_module.SearchPhase.SWEEP_ARC
+
+    mission.update([], now=0.03)
+    assert commands[-1] == pytest.approx(
+        (0.0, mission.config.search_angular_z)
     )
-    assert [1 if command[1] > 0.0 else -1 for command in commands] == [
-        1, -1, 1, -1,
-    ]
-    assert _gps_distance_m(
-        mission.home_lat,
-        mission.home_lon,
-        mission.search_target["lat"],
-        mission.search_target["lon"],
-    ) == pytest.approx(mission.config.search_radius_step_m, abs=0.02)
 
-    mission.update([], now=0.45)
-    assert gps_targets == [
-        (
-            mission.search_target["lat"],
-            mission.search_target["lon"],
-        )
-    ]
+    mission.update_heading(25.0, now=0.04)
+    mission.update([], now=0.04)
+    assert (
+        mission.search_controller.phase
+        is task3_module.SearchPhase.RETURN_TO_BASE_HEADING
+    )
 
-    mission._enter_search(now=0.5, reason="next search cycle")
-    assert mission.search_direction == -1.0
+    mission.update([], now=0.05)
+    assert commands[-1][0] == pytest.approx(0.0)
+    assert commands[-1][1] < 0.0
+
+    mission.update_heading(15.0, now=0.06)
+    mission.update([], now=0.06)
+    assert mission.search_controller.phase is task3_module.SearchPhase.ADVANCE
+
+    mission.update_heading(12.0, now=0.07)
+    mission.update([], now=0.07)
+    assert commands[-1][0] == pytest.approx(mission.config.search_linear_x)
+    assert commands[-1][1] > 0.0
+
+    mission.update_heading(15.0, now=2.57)
+    mission.update([], now=2.57)
+    assert (
+        mission.search_controller.phase
+        is task3_module.SearchPhase.MOVE_TO_ARC_START
+    )
+    assert mission.search_controller.sweep_deg == pytest.approx(30.0)
+    assert mission.search_controller.base_heading == pytest.approx(15.0)
+    assert mission.state is task3_module.MissionState.SEARCH
 
 
-def test_invalid_target_data_pauses_search_leg_timeout(task3_module):
+def test_invalid_target_data_pauses_search_phase_timeout(task3_module):
     commands = []
     task3_module.publish_cmd_vel = (
         lambda publisher, linear_x, angular_z:
@@ -469,34 +469,55 @@ def test_invalid_target_data_pauses_search_leg_timeout(task3_module):
     task3_module.stop_vehicle = (
         lambda publisher: commands.append((0.0, 0.0))
     )
-    mission = _mission(
-        task3_module,
-        search_leg_timeout_sec=1.0,
-    )
+    mission = _mission(task3_module)
     commands.clear()
 
     mission.update([], now=0.4)
-    mission.update([_target(distance=None)], now=1.4)
-    mission.update([_target(distance=None)], now=2.4)
-    mission.update([], now=2.5)
+    mission.update([_target(distance=None)], now=10.4)
+    mission.update([_target(distance=None)], now=20.4)
+    mission.update([], now=20.5)
 
     assert mission.state is task3_module.MissionState.SEARCH
-    assert mission.search_leg_index == 0
-    assert commands[-1][0] == pytest.approx(
-        mission.config.search_linear_x
+    assert (
+        mission.search_controller.phase
+        is task3_module.SearchPhase.MOVE_TO_ARC_START
     )
+    assert commands[-1][0] == pytest.approx(0.0)
+    assert commands[-1][1] < 0.0
 
 
-def test_target_interrupts_search_relocation_without_gps_publish(task3_module):
+def test_target_interrupts_heading_held_search_advance(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
     mission = _mission(task3_module)
-    mission._enter_search_relocate(now=0.1)
-    task3_module.publish_set_position = lambda *args, **kwargs: pytest.fail(
-        "visible target must interrupt GPS search relocation"
-    )
+    mission.search_controller.phase = task3_module.SearchPhase.ADVANCE
+    mission.search_controller.base_heading = mission.current_heading
+    mission.search_controller.phase_started_at = 0.1
+    commands.clear()
 
     mission.update([_target(class_name="red_buoys")], now=0.2)
 
     assert mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
+    assert commands == []
+
+
+def test_search_heading_watchdog_enters_failsafe(task3_module):
+    stopped = []
+    task3_module.stop_vehicle = lambda publisher: stopped.append(publisher)
+    mission = _mission(
+        task3_module,
+        gps_timeout_sec=200.0,
+        heading_timeout_sec=200.0,
+        mission_timeout_sec=200.0,
+    )
+
+    mission.update([], now=100.0)
+
+    assert mission.state is task3_module.MissionState.FAILSAFE
+    assert stopped[-1] == "cmd_vel"
 
 
 def test_final_confirmation_rejects_unstable_distance(task3_module):

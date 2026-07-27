@@ -26,7 +26,6 @@ from utils.mavlink_utilities import (
     create_mission_topics,
     parse_bridge_state,
     publish_cmd_vel,
-    publish_set_position,
     stop_vehicle,
     wait_for_mission_services,
 )
@@ -35,6 +34,7 @@ from teknofest.missions.utils.task3_impact_controller import (
     Task3ImpactController,
 )
 from teknofest.missions.utils.task3_search_controller import (
+    SearchPhase,
     Task3SearchController,
     angle_error_deg,
 )
@@ -79,14 +79,12 @@ class Task3Config:
     entry_settle_sec: float = 1.0
     search_linear_x: float = 0.25
     search_angular_z: float = 0.18
-    search_leg_sweep_deg: float = 70.0
-    search_leg_timeout_sec: float = 6.0
-    search_legs_per_cycle: int = 4
-    search_radius_step_m: float = 2.0
-    search_max_radius_m: float = 6.0
-    search_points_per_ring: int = 4
-    search_relocate_tolerance_m: float = 0.8
-    search_relocate_timeout_sec: float = 20.0
+    search_initial_sweep_deg: float = 20.0
+    search_sweep_increment_deg: float = 10.0
+    search_max_sweep_deg: float = 180.0
+    search_forward_duration_sec: float = 2.5
+    search_heading_tolerance_deg: float = 2.0
+    search_turn_timeout_min_sec: float = 6.0
 
     # Hedef doğrulama parametreleri
     confirmation_window_size: int = 2
@@ -135,27 +133,34 @@ class Task3Config:
             raise ValueError(
                 "confirmation_required cannot exceed confirmation_window_size"
             )
-        if self.search_points_per_ring < 1:
-            raise ValueError("search_points_per_ring must be at least 1")
-        if self.search_legs_per_cycle < 1:
-            raise ValueError("search_legs_per_cycle must be at least 1")
-        if self.search_leg_sweep_deg <= 0.0:
-            raise ValueError("search_leg_sweep_deg must be positive")
-        if self.search_leg_timeout_sec <= 0.0:
-            raise ValueError("search_leg_timeout_sec must be positive")
-        if self.search_radius_step_m <= 0.0:
-            raise ValueError("search_radius_step_m must be positive")
-        if self.search_max_radius_m < self.search_radius_step_m:
+        if self.search_linear_x <= 0.0:
+            raise ValueError("search_linear_x must be positive")
+        if self.search_angular_z <= 0.0:
+            raise ValueError("search_angular_z must be positive")
+        if self.search_initial_sweep_deg <= 0.0:
+            raise ValueError("search_initial_sweep_deg must be positive")
+        if self.search_sweep_increment_deg <= 0.0:
+            raise ValueError("search_sweep_increment_deg must be positive")
+        if (
+                self.search_max_sweep_deg < self.search_initial_sweep_deg
+                or self.search_max_sweep_deg > 180.0
+        ):
             raise ValueError(
-                "search_max_radius_m cannot be smaller than search_radius_step_m"
+                "search_max_sweep_deg must be between "
+                "search_initial_sweep_deg and 180"
             )
+        if self.search_forward_duration_sec <= 0.0:
+            raise ValueError("search_forward_duration_sec must be positive")
+        if self.search_heading_tolerance_deg <= 0.0:
+            raise ValueError("search_heading_tolerance_deg must be positive")
+        if self.search_turn_timeout_min_sec <= 0.0:
+            raise ValueError("search_turn_timeout_min_sec must be positive")
 
 
 class MissionState(Enum):
     INIT = auto()
     ENTRY_SETTLE = auto()
     SEARCH = auto()
-    SEARCH_RELOCATE = auto()
     ACQUIRE_CONFIRM = auto()
     ALIGN = auto()
     APPROACH = auto()
@@ -217,15 +222,6 @@ class Task3KamikazeEngagement:
             maxlen=self.config.final_confirmation_required
         )
 
-        self.search_last_heading = None
-        self.search_last_update_at = None
-        self.search_accumulated_degrees = 0.0
-        self.search_leg_started_at = None
-        self.search_leg_index = 0
-        self.search_direction = 1.0
-        self.search_cycle_index = 0
-        self.search_point_index = 0
-        self.search_target = None
         self.retreat_heading = None
 
         self.target_data_uncertain = False
@@ -248,78 +244,6 @@ class Task3KamikazeEngagement:
     @retreat_heading.setter
     def retreat_heading(self, value):
         self.impact_controller.retreat_heading = value
-
-    @property
-    def search_last_heading(self):
-        return self.search_controller.last_heading
-
-    @search_last_heading.setter
-    def search_last_heading(self, value):
-        self.search_controller.last_heading = value
-
-    @property
-    def search_last_update_at(self):
-        return self.search_controller.last_update_at
-
-    @search_last_update_at.setter
-    def search_last_update_at(self, value):
-        self.search_controller.last_update_at = value
-
-    @property
-    def search_accumulated_degrees(self):
-        return self.search_controller.accumulated_degrees
-
-    @search_accumulated_degrees.setter
-    def search_accumulated_degrees(self, value):
-        self.search_controller.accumulated_degrees = float(value)
-
-    @property
-    def search_leg_started_at(self):
-        return self.search_controller.leg_started_at
-
-    @search_leg_started_at.setter
-    def search_leg_started_at(self, value):
-        self.search_controller.leg_started_at = value
-
-    @property
-    def search_leg_index(self):
-        return self.search_controller.leg_index
-
-    @search_leg_index.setter
-    def search_leg_index(self, value):
-        self.search_controller.leg_index = int(value)
-
-    @property
-    def search_direction(self):
-        return self.search_controller.direction
-
-    @search_direction.setter
-    def search_direction(self, value):
-        self.search_controller.direction = float(value)
-
-    @property
-    def search_cycle_index(self):
-        return self.search_controller.cycle_index
-
-    @search_cycle_index.setter
-    def search_cycle_index(self, value):
-        self.search_controller.cycle_index = int(value)
-
-    @property
-    def search_point_index(self):
-        return self.search_controller.point_index
-
-    @search_point_index.setter
-    def search_point_index(self, value):
-        self.search_controller.point_index = int(value)
-
-    @property
-    def search_target(self):
-        return self.search_controller.target
-
-    @search_target.setter
-    def search_target(self, value):
-        self.search_controller.target = value
 
     @staticmethod
     def _now(now):
@@ -659,22 +583,6 @@ class Task3KamikazeEngagement:
         self.last_target = None
         self._set_state(MissionState.SEARCH, now, reason)
 
-    def _next_search_target(self):
-        return self.search_controller.next_relocation_target(
-            self.home_lat,
-            self.home_lon,
-            self.entry_heading,
-        )
-
-    def _enter_search_relocate(self, now):
-        self._stop()
-        self.search_target = self._next_search_target()
-        self._set_state(
-            MissionState.SEARCH_RELOCATE,
-            now,
-            "ileri S-tarama döngüsünde hedef bulunamadı",
-        )
-
     def _enter_reacquire(self, now, reason):
         self._stop()
         self.retreat_heading = None
@@ -713,54 +621,23 @@ class Task3KamikazeEngagement:
             return
 
         decision = self.search_controller.step(self.current_heading, now)
-        if decision.relocate:
-            self._enter_search_relocate(now)
+        if decision.failed:
+            self._enter_failsafe(
+                f"Task 3 arama denetleyicisi başarısız: {decision.reason}"
+            )
             return
-        if decision.leg_changed:
+        if decision.phase_changed:
             self.logger.info(
-                f"Task3 S-tarama bacağı değişti: "
-                f"{self.search_leg_index + 1}/"
-                f"{self.config.search_legs_per_cycle}, "
-                f"direction="
-                f"{'right' if self.search_direction > 0.0 else 'left'}."
+                f"Task3 arama fazı: "
+                f"{self.search_controller.phase.name}, "
+                f"sweep={self.search_controller.sweep_deg:.1f}deg, "
+                f"cycle={self.search_controller.cycle_index}."
             )
 
         self._publish_motion(
             linear_x=decision.linear_x,
             angular_z=decision.angular_z,
             reason=decision.reason,
-        )
-
-    def _update_search_relocate(self, detections, now):
-        target = self._select_target(detections)
-        if target is not None:
-            self._begin_acquisition(
-                target,
-                now,
-                "arama noktaları arasında hedef adayı",
-            )
-            return
-        if self._wait_for_target_data():
-            return
-
-        distance = calculate_gps_distance(
-            self.current_lat,
-            self.current_lon,
-            self.search_target["lat"],
-            self.search_target["lon"],
-        )
-        if (
-                distance <= self.config.search_relocate_tolerance_m
-                or now - self.state_started_at
-                >= self.config.search_relocate_timeout_sec
-        ):
-            self._enter_search(now, "yeni arama noktasında tarama")
-            return
-
-        publish_set_position(
-            self.topics.position_target_pub,
-            self.search_target["lat"],
-            self.search_target["lon"],
         )
 
     def _update_acquire(self, detections, now):
@@ -1078,9 +955,6 @@ class Task3KamikazeEngagement:
             return
         if self.state == MissionState.SEARCH:
             self._update_search(detections, now)
-            return
-        if self.state == MissionState.SEARCH_RELOCATE:
-            self._update_search_relocate(detections, now)
             return
         if self.state == MissionState.ACQUIRE_CONFIRM:
             self._update_acquire(detections, now)

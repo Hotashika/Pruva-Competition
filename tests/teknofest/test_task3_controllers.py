@@ -7,6 +7,7 @@ from teknofest.missions.utils.task3_impact_controller import (
     Task3ImpactController,
 )
 from teknofest.missions.utils.task3_search_controller import (
+    SearchPhase,
     Task3SearchController,
 )
 from teknofest.missions.utils.task3_targeting import select_target
@@ -16,12 +17,12 @@ def _controller_config(**overrides):
     values = {
         "search_linear_x": 0.25,
         "search_angular_z": 0.18,
-        "search_leg_sweep_deg": 70.0,
-        "search_leg_timeout_sec": 0.1,
-        "search_legs_per_cycle": 4,
-        "search_radius_step_m": 2.0,
-        "search_max_radius_m": 6.0,
-        "search_points_per_ring": 4,
+        "search_initial_sweep_deg": 20.0,
+        "search_sweep_increment_deg": 10.0,
+        "search_max_sweep_deg": 180.0,
+        "search_forward_duration_sec": 2.5,
+        "search_heading_tolerance_deg": 2.0,
+        "search_turn_timeout_min_sec": 6.0,
         "ram_speed": 0.75,
         "ram_duration_sec": 0.2,
         "contact_hold_sec": 0.1,
@@ -77,27 +78,108 @@ def test_targeting_selects_supported_candidate_closest_to_last_target():
     assert result.data_uncertain is False
 
 
-def test_search_controller_alternates_legs_then_requests_relocation():
+def test_search_controller_scans_centered_arc_then_advances_on_saved_heading():
     controller = Task3SearchController(_controller_config())
-    controller.reset_for_entry(current_heading=10.0, now=0.0)
-    controller.enter_search(current_heading=10.0, now=0.0)
+    controller.reset_for_entry(current_heading=100.0, now=0.0)
+    controller.enter_search(current_heading=100.0, now=0.0)
 
-    decisions = [
-        controller.step(current_heading=10.0, now=timestamp)
-        for timestamp in (0.01, 0.11, 0.22, 0.33, 0.44)
-    ]
+    move_left = controller.step(current_heading=100.0, now=0.1)
+    assert controller.phase is SearchPhase.MOVE_TO_ARC_START
+    assert move_left.linear_x == 0.0
+    assert move_left.angular_z < 0.0
 
-    motion_decisions = [
-        decision for decision in decisions if not decision.relocate
-    ]
-    assert [decision.linear_x for decision in motion_decisions] == pytest.approx(
-        [0.25, 0.25, 0.25, 0.25]
+    at_start = controller.step(current_heading=90.0, now=0.2)
+    assert at_start.phase_changed is True
+    assert controller.phase is SearchPhase.SWEEP_ARC
+    assert at_start.linear_x == 0.0
+
+    sweep = controller.step(current_heading=90.0, now=0.3)
+    assert sweep.linear_x == 0.0
+    assert sweep.angular_z > 0.0
+
+    at_end = controller.step(current_heading=110.0, now=0.4)
+    assert at_end.phase_changed is True
+    assert controller.phase is SearchPhase.RETURN_TO_BASE_HEADING
+
+    return_to_base = controller.step(current_heading=110.0, now=0.5)
+    assert return_to_base.linear_x == 0.0
+    assert return_to_base.angular_z < 0.0
+
+    centered = controller.step(current_heading=100.0, now=0.6)
+    assert centered.phase_changed is True
+    assert controller.phase is SearchPhase.ADVANCE
+
+    advance = controller.step(current_heading=95.0, now=0.7)
+    assert advance.linear_x == pytest.approx(0.25)
+    assert advance.angular_z > 0.0
+
+    next_arc = controller.step(current_heading=100.0, now=3.11)
+    assert next_arc.phase_changed is True
+    assert controller.phase is SearchPhase.MOVE_TO_ARC_START
+    assert controller.base_heading == pytest.approx(100.0)
+    assert controller.sweep_deg == pytest.approx(30.0)
+
+
+def test_search_controller_sweeps_across_heading_wraparound():
+    controller = Task3SearchController(_controller_config())
+    controller.reset_for_entry(current_heading=359.0, now=0.0)
+    controller.enter_search(current_heading=359.0, now=0.0)
+
+    controller.step(current_heading=349.0, now=0.1)
+    assert controller.phase is SearchPhase.SWEEP_ARC
+
+    first_half = controller.step(current_heading=1.0, now=0.2)
+    assert first_half.angular_z > 0.0
+    assert controller.sweep_progress_deg == pytest.approx(12.0)
+
+    controller.step(current_heading=9.0, now=0.3)
+    assert controller.phase is SearchPhase.RETURN_TO_BASE_HEADING
+
+
+def test_search_sweep_growth_is_capped_at_180_degrees():
+    controller = Task3SearchController(
+        _controller_config(
+            search_initial_sweep_deg=175.0,
+            search_sweep_increment_deg=10.0,
+        )
     )
-    assert [
-        1 if decision.angular_z > 0.0 else -1
-        for decision in motion_decisions
-    ] == [1, -1, 1, -1]
-    assert decisions[-1].relocate is True
+    controller.reset_for_entry(current_heading=40.0, now=0.0)
+    controller.phase = SearchPhase.ADVANCE
+    controller.base_heading = 40.0
+    controller.phase_started_at = 0.0
+
+    controller.step(current_heading=40.0, now=2.5)
+    assert controller.sweep_deg == pytest.approx(180.0)
+
+    controller.phase = SearchPhase.ADVANCE
+    controller.phase_started_at = 2.5
+    controller.step(current_heading=40.0, now=5.0)
+    assert controller.sweep_deg == pytest.approx(180.0)
+
+
+def test_search_reentry_preserves_sweep_and_fresh_entry_resets_it():
+    controller = Task3SearchController(_controller_config())
+    controller.reset_for_entry(current_heading=20.0, now=0.0)
+    controller.sweep_deg = 60.0
+
+    controller.enter_search(current_heading=25.0, now=1.0)
+    assert controller.sweep_deg == pytest.approx(60.0)
+    assert controller.base_heading == pytest.approx(25.0)
+
+    controller.reset_for_entry(current_heading=30.0, now=2.0)
+    assert controller.sweep_deg == pytest.approx(20.0)
+    assert controller.base_heading == pytest.approx(30.0)
+
+
+def test_search_turn_watchdog_reports_failure():
+    controller = Task3SearchController(_controller_config())
+    controller.reset_for_entry(current_heading=100.0, now=0.0)
+    controller.enter_search(current_heading=100.0, now=0.0)
+
+    decision = controller.step(current_heading=100.0, now=100.0)
+
+    assert decision.failed is True
+    assert "watchdog timeout" in decision.reason
 
 
 def test_impact_controller_owns_ram_hold_and_retreat_decisions():
