@@ -41,6 +41,8 @@ DETECTOR_SPECS = {
     },
 }
 
+STARTUP_DETECTORS = ("buoy", "usv_3d", "ar_tag")
+
 QR_TOPIC = "/njord/task3/qr_detections"
 QR_TASK = "task3"
 AR_CONFIRMED_HZ_ENV = "NJORD_TASK3_AR_CONFIRMED_HZ"

@@ -23,6 +23,7 @@ from vision.ar_tag_utils import (
     normalize_qr_payload,
     track_template,
 )
+from vision.detector_lifecycle import DetectorRegistry
 
 
 def load_profile(competition):
@@ -36,6 +37,7 @@ class VisionNode(Node):
         super().__init__("vision_node")
         self.profile = profile
         self.detectors = {}
+        self.active_detector_names = ()
         self.current_task = None
         self.qr_detector = None
         self.qr_pub = None
@@ -105,6 +107,29 @@ class VisionNode(Node):
             if cy is None
             else float(cy)
         )
+        try:
+            self.detector_registry = DetectorRegistry(
+                profile,
+                fx=self.fx,
+                fy=self.fy,
+                cx=self.cx,
+                cy=self.cy,
+            )
+        except Exception:
+            self._close_shared_memory_handles()
+            raise
+        self.detectors = self.detector_registry.detectors
+        self.active_detector_names = self.detector_registry.active_names
+        self.get_logger().info(
+            "Startup detectors loaded; active before task selection: "
+            f"{self.active_detector_names}"
+        )
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
         self.last_frame_id = -1
         self.pub = self.create_publisher(String, "/vision/detections", 10)
         self.create_subscription(
@@ -120,56 +145,19 @@ class VisionNode(Node):
         if task == self.current_task:
             return
 
-        wanted = self.profile.TASK_DETECTOR_MAP.get(task)
-        if wanted is None:
+        if not self.detector_registry.select_task(task):
             self.get_logger().warn(
                 f"Unknown task: '{task}', detector state unchanged."
             )
             return
 
-        self.current_task = task
+        self.current_task = self.detector_registry.current_task
+        self.active_detector_names = self.detector_registry.active_names
         self._reset_qr_tracking()
         self.get_logger().info(
-            f"Task changed -> '{task}', active detectors: {wanted}"
+            f"Task changed -> '{task}', active detectors: "
+            f"{self.active_detector_names}"
         )
-
-        for name in list(self.detectors):
-            if name not in wanted:
-                self.get_logger().info(f"Closing '{name}' detector...")
-                del self.detectors[name]
-
-        for name in wanted:
-            if name in self.detectors:
-                continue
-            spec = self.profile.DETECTOR_SPECS[name]
-            self.get_logger().info(f"Loading '{name}' detector...")
-            detector_kwargs = {
-                "fx": self.fx,
-                "cx": self.cx,
-                "camera_width": self.profile.CAMERA_WIDTH,
-            }
-            if "model_path" in spec:
-                detector_kwargs.update({
-                    "model_path": spec["model_path"],
-                    "device": self.profile.DEVICE,
-                    "tolerance_ratio": self.profile.TOLERANCE_RATIO,
-                    "tolerance_deg": self.profile.TOLERANCE_DEG,
-                })
-            if spec.get("uses_full_intrinsics"):
-                detector_kwargs.update({
-                    "fy": self.fy,
-                    "cy": self.cy,
-                })
-            detector_kwargs.update(spec.get("kwargs", {}))
-            self.detectors[name] = spec["class"](
-                **detector_kwargs,
-            )
-
-        try:
-            import torch
-            torch.cuda.empty_cache()
-        except ImportError:
-            pass
 
     def _reset_qr_tracking(self):
         self.qr_confirmation_history.clear()
@@ -286,7 +274,7 @@ class VisionNode(Node):
         self.last_frame_id = frame_id
 
         all_detections = []
-        for name, detector in self.detectors.items():
+        for name, detector in self.detector_registry.active_items():
             if (
                     name == "ar_tag"
                     and self.profile.QR_TOPIC
@@ -331,19 +319,24 @@ class VisionNode(Node):
         message.data = json.dumps(payload)
         self.pub.publish(message)
 
-    def destroy_node(self):
+    def _close_shared_memory_handles(self):
         self.rgb = None
         self.depth = None
         self.meta = None
         self.calib = None
-        handles = [self.rgb_shm, self.depth_shm, self.meta_shm]
-        if self.calib_shm is not None:
-            handles.append(self.calib_shm)
-        self.profile.close_shared_memory_handles(*handles)
+        self.profile.close_shared_memory_handles(
+            self.rgb_shm,
+            self.depth_shm,
+            self.meta_shm,
+            self.calib_shm,
+        )
         self.rgb_shm = None
         self.depth_shm = None
         self.meta_shm = None
         self.calib_shm = None
+
+    def destroy_node(self):
+        self._close_shared_memory_handles()
         super().destroy_node()
 
 
