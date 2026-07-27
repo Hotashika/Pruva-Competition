@@ -113,15 +113,24 @@ def _mission(task3_module, **config_overrides):
     return mission
 
 
-def _target(distance=3.0, angle=0.0, class_name="red_buoy", confidence=0.9):
-    return {
+def _target(
+        distance=3.0,
+        angle=0.0,
+        class_name="red_buoy",
+        confidence=0.9,
+        **overrides,
+):
+    detection = {
         "class": class_name,
         "confidence": confidence,
         "distance": distance,
         "bbox": [500, 200, 650, 500],
+        "track_id": 7,
         "Buoy angle: ": angle,
         "Buoy side: ": "across",
     }
+    detection.update(overrides)
+    return detection
 
 
 def _acquire_and_reach_final_confirm(mission, task3_module, now):
@@ -156,21 +165,100 @@ def _complete_one_impact(mission, task3_module, now):
     return now
 
 
-def test_search_rejects_wrong_class_and_invalid_depth(task3_module):
+def test_search_moves_forward_for_wrong_class_and_stops_for_invalid_target_data(
+        task3_module,
+):
     commands = []
     task3_module.publish_cmd_vel = (
         lambda publisher, linear_x, angular_z:
         commands.append((linear_x, angular_z))
     )
+    task3_module.stop_vehicle = (
+        lambda publisher: commands.append((0.0, 0.0))
+    )
     mission = _mission(task3_module)
+    commands.clear()
 
     mission.update([_target(class_name="yellow_buoy")], now=0.1)
+    assert commands[-1] == pytest.approx(
+        (mission.config.search_linear_x, mission.config.search_angular_z)
+    )
+
     mission.update([_target(distance=-1.0)], now=0.2)
+    assert commands[-1] == (0.0, 0.0)
+
     mission.update([_target(distance=float("inf"))], now=0.3)
+    missing_direction = _target(distance=2.0, angle=None)
+    missing_direction.pop("Buoy side: ")
+    mission.update([missing_direction], now=0.4)
+    assert commands[-1] == (0.0, 0.0)
+
+    mission.update([_target(confidence=None)], now=0.5)
 
     assert mission.state is task3_module.MissionState.SEARCH
-    assert all(linear_x == 0.0 for linear_x, _ in commands)
-    assert commands[-1][1] == pytest.approx(mission.config.search_angular_z)
+    assert commands[-1][0] == pytest.approx(
+        mission.config.search_linear_x
+    )
+
+
+def test_target_class_parameter_accepts_plural_and_legacy_fields(task3_module):
+    mission = _mission(task3_module)
+    detection = {
+        "class_name": "red_buoys",
+        "conf": 0.91,
+        "distance_m": 2.2,
+        "angle_from_center": -4.0,
+        "bbox": [500, 200, 650, 500],
+    }
+
+    target = mission._select_target([detection])
+
+    assert task3_module.TASK3_TARGET_BUOY_CLASS == "red_buoy"
+    assert target["class"] == "red_buoys"
+    assert target["distance"] == pytest.approx(2.2)
+    assert target["angle"] == pytest.approx(-4.0)
+
+    alternate_target = mission._select_target(
+        [
+            {
+                "label": "red_buoy",
+                "confidence": 0.92,
+                "depth": 2.0,
+                "angle": 3.0,
+            }
+        ]
+    )
+    assert alternate_target["distance"] == pytest.approx(2.0)
+    assert alternate_target["angle"] == pytest.approx(3.0)
+
+    green_mission = _mission(task3_module, target_class="green_buoy")
+    green_mission.update(
+        [_target(class_name="green_buoys")],
+        now=0.1,
+    )
+    assert green_mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
+
+
+@pytest.mark.parametrize(
+    ("side", "expected_angle"),
+    [
+        ("left", -15.0),
+        ("right", 15.0),
+        ("across", 0.0),
+    ],
+)
+def test_side_fallback_supplies_missing_angle(
+        task3_module,
+        side,
+        expected_angle,
+):
+    mission = _mission(task3_module)
+    detection = _target(angle=None)
+    detection["Buoy side: "] = side
+
+    target = mission._select_target([detection])
+
+    assert target["angle"] == pytest.approx(expected_angle)
 
 
 def test_target_requires_multiple_consistent_frames(task3_module):
@@ -184,10 +272,107 @@ def test_target_requires_multiple_consistent_frames(task3_module):
     assert mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
 
     mission.update(target, now=0.3)
+    assert mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
+
+    mission.update(target, now=0.4)
     assert mission.state is task3_module.MissionState.ALIGN
 
 
+def test_confirmation_gap_over_half_second_resets_counter(task3_module):
+    mission = _mission(task3_module)
+    target = [_target(distance=3.0, angle=2.0)]
+
+    mission.update(target, now=0.1)
+    mission.update(target, now=0.7)
+    assert mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
+
+    mission.update(target, now=0.8)
+    assert mission.state is task3_module.MissionState.ALIGN
+
+
+def test_confirmation_uses_track_continuity_and_ema(task3_module):
+    mission = _mission(task3_module, target_filter_alpha=0.4)
+    first = [_target(distance=3.0, angle=-10.0, track_id=12)]
+    second = [_target(distance=2.0, angle=-6.0, track_id=12)]
+
+    mission.update(first, now=0.1)
+    mission.update(second, now=0.2)
+
+    assert mission.state is task3_module.MissionState.ALIGN
+    assert mission.last_target["distance"] == pytest.approx(2.6)
+    assert mission.last_target["angle"] == pytest.approx(-8.4)
+
+
+def test_confirmation_falls_back_to_bbox_when_track_id_changes(task3_module):
+    mission = _mission(task3_module)
+    first = [
+        _target(
+            distance=3.0,
+            angle=-5.0,
+            track_id=12,
+            bbox=[500, 200, 650, 500],
+        )
+    ]
+    second = [
+        _target(
+            distance=2.9,
+            angle=-4.0,
+            track_id=99,
+            bbox=[510, 205, 660, 505],
+        )
+    ]
+
+    mission.update(first, now=0.1)
+    mission.update(second, now=0.2)
+
+    assert mission.state is task3_module.MissionState.ALIGN
+
+
+def test_confirmation_falls_back_to_angle_and_distance_continuity(task3_module):
+    mission = _mission(task3_module)
+    first = [_target(distance=3.0, angle=-5.0, track_id=None, bbox=None)]
+    second = [_target(distance=2.9, angle=-4.0, track_id=None, bbox=None)]
+
+    mission.update(first, now=0.1)
+    mission.update(second, now=0.2)
+
+    assert mission.state is task3_module.MissionState.ALIGN
+
+
+def test_front_target_stops_immediately_then_approaches_forward(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    task3_module.stop_vehicle = (
+        lambda publisher: commands.append((0.0, 0.0))
+    )
+    mission = _mission(task3_module)
+    commands.clear()
+    target = [_target(distance=3.0, angle=0.0, class_name="red_buoys")]
+
+    mission.update(target, now=0.1)
+    assert mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
+    assert commands[-1] == (0.0, 0.0)
+
+    mission.update(target, now=0.2)
+    assert mission.state is task3_module.MissionState.ALIGN
+
+    mission.update(target, now=0.3)
+    assert mission.state is task3_module.MissionState.APPROACH
+
+    mission.update(target, now=0.4)
+    assert commands[-1][0] > 0.0
+    assert commands[-1][1] == pytest.approx(0.0)
+
+
 def test_lost_target_stops_and_enters_reacquire(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
     stopped = []
     task3_module.stop_vehicle = lambda publisher: stopped.append(publisher)
     mission = _mission(task3_module)
@@ -202,20 +387,50 @@ def test_lost_target_stops_and_enters_reacquire(task3_module):
     assert mission.state is task3_module.MissionState.REACQUIRE
     assert stopped[-1] == "cmd_vel"
 
+    mission.update([], now=now + 0.35)
+    assert commands[-1][0] == pytest.approx(
+        mission.config.reacquire_linear_x
+    )
+    assert commands[-1][0] > 0.0
 
-def test_full_scan_relocates_to_bounded_search_point(task3_module):
+    mission.update(
+        [],
+        now=now + 0.3 + mission.config.target_lost_timeout_sec,
+    )
+    assert mission.state is task3_module.MissionState.SEARCH
+
+
+def test_s_search_alternates_forward_legs_then_relocates(task3_module):
+    commands = []
     gps_targets = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
     task3_module.publish_set_position = (
         lambda publisher, lat, lon:
         gps_targets.append((lat, lon))
     )
     mission = _mission(
         task3_module,
-        search_scan_timeout_sec=0.1,
+        search_leg_timeout_sec=0.1,
+        search_legs_per_cycle=4,
     )
+    commands.clear()
 
-    mission.update([], now=0.2)
+    mission.update([], now=0.01)
+    mission.update([], now=0.11)
+    mission.update([], now=0.22)
+    mission.update([], now=0.33)
+    mission.update([], now=0.44)
+
     assert mission.state is task3_module.MissionState.SEARCH_RELOCATE
+    assert [command[0] for command in commands] == pytest.approx(
+        [mission.config.search_linear_x] * 4
+    )
+    assert [1 if command[1] > 0.0 else -1 for command in commands] == [
+        1, -1, 1, -1,
+    ]
     assert _gps_distance_m(
         mission.home_lat,
         mission.home_lon,
@@ -223,13 +438,55 @@ def test_full_scan_relocates_to_bounded_search_point(task3_module):
         mission.search_target["lon"],
     ) == pytest.approx(mission.config.search_radius_step_m, abs=0.02)
 
-    mission.update([], now=0.25)
+    mission.update([], now=0.45)
     assert gps_targets == [
         (
             mission.search_target["lat"],
             mission.search_target["lon"],
         )
     ]
+
+    mission._enter_search(now=0.5, reason="next search cycle")
+    assert mission.search_direction == -1.0
+
+
+def test_invalid_target_data_pauses_search_leg_timeout(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    task3_module.stop_vehicle = (
+        lambda publisher: commands.append((0.0, 0.0))
+    )
+    mission = _mission(
+        task3_module,
+        search_leg_timeout_sec=1.0,
+    )
+    commands.clear()
+
+    mission.update([], now=0.4)
+    mission.update([_target(distance=None)], now=1.4)
+    mission.update([_target(distance=None)], now=2.4)
+    mission.update([], now=2.5)
+
+    assert mission.state is task3_module.MissionState.SEARCH
+    assert mission.search_leg_index == 0
+    assert commands[-1][0] == pytest.approx(
+        mission.config.search_linear_x
+    )
+
+
+def test_target_interrupts_search_relocation_without_gps_publish(task3_module):
+    mission = _mission(task3_module)
+    mission._enter_search_relocate(now=0.1)
+    task3_module.publish_set_position = lambda *args, **kwargs: pytest.fail(
+        "visible target must interrupt GPS search relocation"
+    )
+
+    mission.update([_target(class_name="red_buoys")], now=0.2)
+
+    assert mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
 
 
 def test_final_confirmation_rejects_unstable_distance(task3_module):
@@ -246,6 +503,103 @@ def test_final_confirmation_rejects_unstable_distance(task3_module):
 
     assert mission.state is task3_module.MissionState.FINAL_CONFIRM
     assert mission.impact_count == 0
+
+
+def test_production_defaults_require_three_frames_and_three_impacts(task3_module):
+    defaults = task3_module.Task3Config()
+    assert defaults.final_confirmation_required == 3
+    assert defaults.required_impact_count == 3
+
+    mission = _mission(
+        task3_module,
+        final_confirmation_required=3,
+    )
+    far_target = [_target(distance=2.5)]
+    near_target = [_target(distance=1.2)]
+    mission.update(far_target, now=0.1)
+    mission.update(far_target, now=0.2)
+    mission.update(far_target, now=0.3)
+    mission.update(near_target, now=0.4)
+    assert mission.state is task3_module.MissionState.FINAL_CONFIRM
+
+    mission.update(near_target, now=0.5)
+    mission.update(near_target, now=0.6)
+    assert mission.state is task3_module.MissionState.FINAL_CONFIRM
+
+    mission.update(near_target, now=0.7)
+    assert mission.state is task3_module.MissionState.RAM
+
+
+def test_negative_motion_is_rejected_outside_confirmed_retreat(task3_module):
+    commands = []
+    stopped = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    task3_module.stop_vehicle = lambda publisher: stopped.append(publisher)
+    mission = _mission(task3_module)
+
+    accepted = mission._publish_motion(
+        linear_x=-0.1,
+        angular_z=0.0,
+        reason="invalid test command",
+    )
+
+    assert accepted is False
+    assert mission.state is task3_module.MissionState.FAILSAFE
+    assert commands == []
+    assert stopped[-1] == "cmd_vel"
+
+
+def test_confirmed_retreat_is_short_straight_and_heading_corrected(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    mission = _mission(
+        task3_module,
+        retreat_min_sec=0.6,
+        retreat_max_sec=1.5,
+    )
+    mission.state = task3_module.MissionState.RETREAT
+    mission.state_started_at = 1.0
+    mission.impact_count = 1
+    mission.retreat_heading = 15.0
+    mission.current_heading = 20.0
+    commands.clear()
+
+    mission.update([], now=1.2)
+
+    assert commands[-1][0] == pytest.approx(-0.25)
+    assert commands[-1][1] == pytest.approx(math.radians(-5.0))
+
+    mission.update([], now=2.5)
+
+    assert mission.state is task3_module.MissionState.REACQUIRE
+    assert len([linear for linear, _ in commands if linear < 0.0]) == 1
+
+
+def test_retreat_heading_is_captured_when_contact_completes(task3_module):
+    mission = _mission(task3_module)
+    mission.state = task3_module.MissionState.RAM
+    mission.state_started_at = 1.0
+    mission.current_heading = 42.0
+
+    contact_time = 1.0 + mission.config.ram_duration_sec + 0.01
+    mission.update([], now=contact_time)
+
+    assert mission.state is task3_module.MissionState.CONTACT_HOLD
+    assert mission.retreat_heading == pytest.approx(42.0)
+
+    mission.current_heading = 80.0
+    mission.update(
+        [],
+        now=contact_time + mission.config.contact_hold_sec + 0.01,
+    )
+    assert mission.state is task3_module.MissionState.RETREAT
+    assert mission.retreat_heading == pytest.approx(42.0)
 
 
 def test_exactly_three_confirmed_impacts_finish_task(task3_module):

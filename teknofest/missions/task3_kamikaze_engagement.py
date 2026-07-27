@@ -39,11 +39,15 @@ DRIVE_MODE = "GUIDED"
 ACTIVE_TASK_NAME = "task3"
 EARTH_RADIUS_M = 6378137.0
 
+# Task3 hedefini değiştirmek için yalnız bu değeri düzenleyin. Tekil/çoğul
+# model etiketleri (ör. red_buoy/red_buoys) otomatik eşleştirilir.
+TASK3_TARGET_BUOY_CLASS = "red_buoy"
+
 
 @dataclass(frozen=True)
 class Task3Config:
     # Hedef parametreleri
-    target_class: str = "red_buoy"
+    target_class: str = TASK3_TARGET_BUOY_CLASS
     required_impact_count: int = 3
     min_confidence: float = 0.45
 
@@ -57,9 +61,11 @@ class Task3Config:
 
     # Arama parametreleri
     entry_settle_sec: float = 1.0
-    search_angular_z: float = 0.22
-    search_scan_degrees: float = 350.0
-    search_scan_timeout_sec: float = 28.0
+    search_linear_x: float = 0.25
+    search_angular_z: float = 0.18
+    search_leg_sweep_deg: float = 70.0
+    search_leg_timeout_sec: float = 6.0
+    search_legs_per_cycle: int = 4
     search_radius_step_m: float = 2.0
     search_max_radius_m: float = 6.0
     search_points_per_ring: int = 4
@@ -67,8 +73,10 @@ class Task3Config:
     search_relocate_timeout_sec: float = 20.0
 
     # Hedef doğrulama parametreleri
-    confirmation_window_size: int = 7
-    confirmation_required: int = 5
+    confirmation_window_size: int = 2
+    confirmation_required: int = 2
+    confirmation_max_gap_sec: float = 0.5
+    target_filter_alpha: float = 0.40
     confirmation_angle_spread_deg: float = 12.0
     confirmation_distance_spread_ratio: float = 0.45
     acquire_timeout_sec: float = 2.0
@@ -89,17 +97,20 @@ class Task3Config:
     final_distance_spread_m: float = 0.35
     target_angle_jump_deg: float = 25.0
     target_distance_jump_ratio: float = 0.60
-    target_lost_timeout_sec: float = 2.0
+    target_bbox_min_iou: float = 0.05
+    target_lost_timeout_sec: float = 1.0
+    reacquire_linear_x: float = 0.15
     reacquire_angular_z: float = 0.16
 
     # Temas / geri çekilme parametreleri
     ram_speed: float = 0.75
     ram_duration_sec: float = 1.6
     contact_hold_sec: float = 0.7
-    retreat_speed: float = 0.40
-    retreat_min_sec: float = 1.0
-    retreat_max_sec: float = 3.5
+    retreat_speed: float = 0.25
+    retreat_min_sec: float = 0.6
+    retreat_max_sec: float = 1.5
     retreat_target_distance_m: float = 2.5
+    retreat_heading_max_angular_z: float = 0.25
 
     def __post_init__(self):
         if self.required_impact_count < 1:
@@ -110,6 +121,12 @@ class Task3Config:
             )
         if self.search_points_per_ring < 1:
             raise ValueError("search_points_per_ring must be at least 1")
+        if self.search_legs_per_cycle < 1:
+            raise ValueError("search_legs_per_cycle must be at least 1")
+        if self.search_leg_sweep_deg <= 0.0:
+            raise ValueError("search_leg_sweep_deg must be positive")
+        if self.search_leg_timeout_sec <= 0.0:
+            raise ValueError("search_leg_timeout_sec must be positive")
         if self.search_radius_step_m <= 0.0:
             raise ValueError("search_radius_step_m must be positive")
         if self.search_max_radius_m < self.search_radius_step_m:
@@ -174,6 +191,7 @@ class Task3KamikazeEngagement:
         self.confirmation_samples = deque(
             maxlen=self.config.confirmation_window_size
         )
+        self.confirmation_last_time = None
         self.distance_history = deque(
             maxlen=self.config.confirmation_window_size
         )
@@ -182,9 +200,20 @@ class Task3KamikazeEngagement:
         )
 
         self.search_last_heading = None
+        self.search_last_update_at = None
         self.search_accumulated_degrees = 0.0
+        self.search_leg_started_at = None
+        self.search_leg_index = 0
+        self.search_direction = 1.0
+        self.search_cycle_index = 0
         self.search_point_index = 0
         self.search_target = None
+        self.retreat_heading = None
+
+        self.target_data_uncertain = False
+        self.target_data_uncertain_reason = None
+        self.target_rejection_reason = None
+        self.last_observed_classes = ()
 
     @staticmethod
     def _now(now):
@@ -197,6 +226,36 @@ class Task3KamikazeEngagement:
         except (TypeError, ValueError):
             return None
         return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _first_present(mapping, keys):
+        for key in keys:
+            if key in mapping and mapping[key] is not None:
+                return mapping[key]
+        return None
+
+    @staticmethod
+    def _canonical_class_name(value):
+        text = str(value or "").strip().lower()
+        return text.replace("-", "_").replace(" ", "_")
+
+    @classmethod
+    def _class_alias_key(cls, value):
+        canonical = cls._canonical_class_name(value)
+        return canonical[:-1] if canonical.endswith("_buoys") else canonical
+
+    @staticmethod
+    def _normalize_side(value):
+        text = str(value or "").strip().lower()
+        if text in ("left", "sol", "port"):
+            return "left"
+        if text in ("right", "sag", "sağ", "starboard"):
+            return "right"
+        if text in (
+                "across", "center", "centre", "middle", "orta", "front",
+        ):
+            return "center"
+        return None
 
     @staticmethod
     def _angle_error_deg(target_deg, current_deg):
@@ -241,6 +300,46 @@ class Task3KamikazeEngagement:
     def _stop(self):
         stop_vehicle(self.topics.cmd_vel_pub)
 
+    def _publish_motion(self, linear_x, angular_z, reason):
+        linear_x = max(-1.0, min(1.0, float(linear_x)))
+        angular_z = max(
+            -self.config.max_angular_z,
+            min(self.config.max_angular_z, float(angular_z)),
+        )
+        retreat_allowed = (
+            self.state == MissionState.RETREAT
+            and self.impact_count > 0
+        )
+        if linear_x < 0.0 and not retreat_allowed:
+            self._enter_failsafe(
+                "Task 3 güvenlik ihlali: doğrulanmış temas dışında "
+                "negatif linear_x engellendi."
+            )
+            return False
+
+        publish_cmd_vel(
+            self.topics.cmd_vel_pub,
+            linear_x=linear_x,
+            angular_z=angular_z,
+        )
+        target_text = (
+            "none"
+            if self.last_target is None
+            else (
+                f"{self.last_target['class']}/"
+                f"{self.last_target['distance']:.2f}m/"
+                f"{self.last_target['angle']:+.1f}deg"
+            )
+        )
+        self.logger.info(
+            f"Task3 decision: state={self.state.name}, reason={reason}, "
+            f"observed={list(self.last_observed_classes)}, target={target_text}, "
+            f"rejected={self.target_rejection_reason}, "
+            f"linear_x={linear_x:+.2f}, angular_z={angular_z:+.2f}",
+            throttle_duration_sec=0.5,
+        )
+        return True
+
     def _enter_failsafe(self, reason):
         if self.state != MissionState.FAILSAFE:
             self.logger.error(reason)
@@ -264,12 +363,23 @@ class Task3KamikazeEngagement:
         self.last_target = None
         self.last_target_angle = 0.0
         self.confirmation_samples.clear()
+        self.confirmation_last_time = None
         self.distance_history.clear()
         self.final_confirmation_samples.clear()
         self.search_last_heading = self.current_heading
+        self.search_last_update_at = now
         self.search_accumulated_degrees = 0.0
+        self.search_leg_started_at = now
+        self.search_leg_index = 0
+        self.search_direction = 1.0
+        self.search_cycle_index = 0
         self.search_point_index = 0
         self.search_target = None
+        self.retreat_heading = None
+        self.target_data_uncertain = False
+        self.target_data_uncertain_reason = None
+        self.target_rejection_reason = None
+        self.last_observed_classes = ()
         self.state = MissionState.ENTRY_SETTLE
         self.state_started_at = now
         self._stop()
@@ -387,53 +497,132 @@ class Task3KamikazeEngagement:
     def _normalize_target(self, detection):
         if not isinstance(detection, dict):
             return None
-        class_name = str(detection.get("class", "")).strip().lower()
-        if class_name != self.config.target_class.strip().lower():
+
+        class_name = self._canonical_class_name(
+            self._first_present(
+                detection,
+                ("class", "class_name", "label"),
+            )
+        )
+        configured_class = self._canonical_class_name(self.config.target_class)
+        if self._class_alias_key(class_name) != self._class_alias_key(
+                configured_class
+        ):
             return None
 
-        confidence = self._finite_float(detection.get("confidence"))
-        distance = self._finite_float(detection.get("distance"))
-        angle = self._finite_float(detection.get("Buoy angle: "))
-        if (
-                confidence is None
-                or confidence < self.config.min_confidence
-                or distance is None
-                or distance <= 0.0
-                or angle is None
-        ):
+        confidence = self._finite_float(
+            self._first_present(detection, ("confidence", "conf"))
+        )
+        if confidence is None:
+            self.target_rejection_reason = (
+                f"{class_name}: eksik/geçersiz confidence"
+            )
+            return None
+        if confidence < self.config.min_confidence:
+            self.target_rejection_reason = (
+                f"confidence {confidence:.2f} < "
+                f"{self.config.min_confidence:.2f}"
+            )
+            return None
+
+        distance = self._finite_float(
+            self._first_present(
+                detection,
+                ("distance", "distance_m", "depth"),
+            )
+        )
+        side = self._normalize_side(
+            self._first_present(
+                detection,
+                ("Buoy side: ", "side", "buoy_side"),
+            )
+        )
+        angle = self._finite_float(
+            self._first_present(
+                detection,
+                ("Buoy angle: ", "angle_from_center", "angle"),
+            )
+        )
+        if angle is None and side is not None:
+            angle = {
+                "left": -15.0,
+                "right": 15.0,
+                "center": 0.0,
+            }[side]
+
+        invalid_fields = []
+        if distance is None or distance <= 0.0:
+            invalid_fields.append("distance")
+        if angle is None:
+            invalid_fields.append("angle/side")
+        if invalid_fields:
+            self.target_data_uncertain = True
+            self.target_data_uncertain_reason = (
+                f"{class_name}: eksik/geçersiz {', '.join(invalid_fields)}"
+            )
+            self.target_rejection_reason = self.target_data_uncertain_reason
             return None
 
         bbox = detection.get("bbox")
         if bbox is not None:
             if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                return None
-            try:
-                bbox = [int(value) for value in bbox]
-            except (TypeError, ValueError):
-                return None
-            if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-                return None
+                bbox = None
+            else:
+                try:
+                    bbox = [int(value) for value in bbox]
+                except (TypeError, ValueError):
+                    bbox = None
+                if (
+                        bbox is not None
+                        and (bbox[2] <= bbox[0] or bbox[3] <= bbox[1])
+                ):
+                    bbox = None
 
         return {
             "class": class_name,
             "confidence": confidence,
             "distance": distance,
             "angle": angle,
+            "side": side,
             "bbox": bbox,
+            "track_id": detection.get("track_id"),
             "raw": detection,
         }
 
     def _select_target(self, detections):
-        candidates = [
-            target
-            for target in (
-                self._normalize_target(detection)
-                for detection in (detections or [])
+        detections = detections or []
+        observed_classes = {
+            self._canonical_class_name(
+                self._first_present(
+                    detection,
+                    ("class", "class_name", "label"),
+                )
             )
-            if target is not None
-        ]
+            for detection in detections
+            if isinstance(detection, dict)
+        }
+        self.last_observed_classes = tuple(
+            sorted(item for item in observed_classes if item)
+        )
+        self.target_data_uncertain = False
+        self.target_data_uncertain_reason = None
+        self.target_rejection_reason = None
+
+        candidates = []
+        for detection in detections:
+            target = self._normalize_target(detection)
+            if target is not None:
+                candidates.append(target)
         if not candidates:
+            if detections and self.target_rejection_reason is None:
+                self.target_rejection_reason = (
+                    f"configured target={self.config.target_class} "
+                    f"not in observed={list(self.last_observed_classes)}"
+                )
             return None
+        self.target_data_uncertain = False
+        self.target_data_uncertain_reason = None
+        self.target_rejection_reason = None
 
         if self.last_target is None:
             return min(
@@ -454,9 +643,47 @@ class Task3KamikazeEngagement:
             ),
         )
 
+    @staticmethod
+    def _bbox_iou(first, second):
+        if not (
+                isinstance(first, (list, tuple))
+                and isinstance(second, (list, tuple))
+                and len(first) == 4
+                and len(second) == 4
+        ):
+            return None
+        ax1, ay1, ax2, ay2 = map(float, first)
+        bx1, by1, bx2, by2 = map(float, second)
+        intersection = (
+            max(0.0, min(ax2, bx2) - max(ax1, bx1))
+            * max(0.0, min(ay2, by2) - max(ay1, by1))
+        )
+        union = (
+            max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            + max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            - intersection
+        )
+        return intersection / union if union > 0.0 else None
+
     def _target_is_consistent(self, target):
         if target is None or self.last_target is None:
             return target is not None
+        target_track_id = target.get("track_id")
+        last_track_id = self.last_target.get("track_id")
+        if target_track_id is not None and last_track_id is not None:
+            if target_track_id == last_track_id:
+                return True
+
+        bbox_iou = self._bbox_iou(
+            target.get("bbox"),
+            self.last_target.get("bbox"),
+        )
+        if (
+                bbox_iou is not None
+                and bbox_iou >= self.config.target_bbox_min_iou
+        ):
+            return True
+
         angle_jump = abs(target["angle"] - self.last_target["angle"])
         distance_base = max(self.last_target["distance"], 0.1)
         distance_jump_ratio = (
@@ -468,17 +695,55 @@ class Task3KamikazeEngagement:
             and distance_jump_ratio <= self.config.target_distance_jump_ratio
         )
 
-    def _record_confirmation(self, target):
-        self.confirmation_samples.append(target)
-        valid = [
-            sample
-            for sample in self.confirmation_samples
-            if sample is not None
-        ]
-        if len(valid) < self.config.confirmation_required:
+    def _filter_target(self, target, previous):
+        if previous is None:
+            return dict(target)
+        alpha = self.config.target_filter_alpha
+        filtered = dict(target)
+        filtered["angle"] = (
+            alpha * target["angle"]
+            + (1.0 - alpha) * previous["angle"]
+        )
+        filtered["distance"] = (
+            alpha * target["distance"]
+            + (1.0 - alpha) * previous["distance"]
+        )
+        return filtered
+
+    def _record_confirmation(self, target, now):
+        if target is None:
+            self.confirmation_samples.clear()
+            self.confirmation_last_time = None
             return None
 
-        recent = valid[-self.config.confirmation_required:]
+        previous = (
+            self.confirmation_samples[-1]
+            if self.confirmation_samples
+            else None
+        )
+        continuous = (
+            previous is not None
+            and self.confirmation_last_time is not None
+            and now - self.confirmation_last_time
+            <= self.config.confirmation_max_gap_sec
+        )
+        if continuous:
+            self.last_target = previous
+            continuous = self._target_is_consistent(target)
+
+        if not continuous:
+            self.confirmation_samples.clear()
+        else:
+            target = self._filter_target(target, previous)
+
+        self.confirmation_samples.append(target)
+        self.confirmation_last_time = now
+        if len(self.confirmation_samples) < self.config.confirmation_required:
+            return None
+
+        recent = list(self.confirmation_samples)[
+            -self.config.confirmation_required:
+        ]
         angles = [sample["angle"] for sample in recent]
         distances = [sample["distance"] for sample in recent]
         distance_median = self._median(distances)
@@ -491,27 +756,57 @@ class Task3KamikazeEngagement:
                 or distance_spread_ratio
                 > self.config.confirmation_distance_spread_ratio
         ):
+            self.confirmation_samples.clear()
+            self.confirmation_samples.append(target)
             return None
 
-        confirmed = dict(recent[-1])
-        confirmed["angle"] = self._median(angles)
-        confirmed["distance"] = distance_median
-        return confirmed
+        return dict(recent[-1])
+
+    def _wait_for_target_data(self):
+        if not self.target_data_uncertain:
+            return False
+        self._stop()
+        self.logger.warn(
+            f"Task3 target verisi belirsiz: "
+            f"{self.target_data_uncertain_reason}; state={self.state.name}, "
+            f"observed={list(self.last_observed_classes)}, "
+            f"rejected={self.target_rejection_reason}, "
+            f"linear_x=+0.00, angular_z=+0.00. Araç bekletiliyor.",
+            throttle_duration_sec=1.0,
+        )
+        return True
 
     def _begin_acquisition(self, target, now, reason):
         self._stop()
         self.confirmation_samples.clear()
         self.confirmation_samples.append(target)
+        self.confirmation_last_time = now
         self.last_target = target
         self.last_target_angle = target["angle"]
         self._set_state(MissionState.ACQUIRE_CONFIRM, now, reason)
+        self.logger.info(
+            f"Task3 decision: state={self.state.name}, reason={reason}, "
+            f"observed={list(self.last_observed_classes)}, "
+            f"target={target['class']}/{target['distance']:.2f}m/"
+            f"{target['angle']:+.1f}deg, rejected=None, "
+            f"linear_x=+0.00, angular_z=+0.00",
+            throttle_duration_sec=0.5,
+        )
 
     def _enter_search(self, now, reason):
         self._stop()
         self.search_last_heading = self.current_heading
+        self.search_last_update_at = now
         self.search_accumulated_degrees = 0.0
+        self.search_leg_started_at = now
+        self.search_leg_index = 0
+        self.search_direction = (
+            1.0 if self.search_cycle_index % 2 == 0 else -1.0
+        )
+        self.search_cycle_index += 1
         self.search_target = None
         self.confirmation_samples.clear()
+        self.confirmation_last_time = None
         self.distance_history.clear()
         self.final_confirmation_samples.clear()
         self.last_target = None
@@ -550,14 +845,16 @@ class Task3KamikazeEngagement:
         self._set_state(
             MissionState.SEARCH_RELOCATE,
             now,
-            "360 derece taramada hedef bulunamadı",
+            "ileri S-tarama döngüsünde hedef bulunamadı",
         )
 
     def _enter_reacquire(self, now, reason):
         self._stop()
+        self.retreat_heading = None
         if self.last_target is not None:
             self.last_target_angle = self.last_target["angle"]
         self.confirmation_samples.clear()
+        self.confirmation_last_time = None
         self.final_confirmation_samples.clear()
         self._set_state(MissionState.REACQUIRE, now, reason)
 
@@ -579,14 +876,46 @@ class Task3KamikazeEngagement:
             return self.config.medium_approach_speed
         return self.config.near_approach_speed
 
+    def _advance_search_leg(self, now):
+        self.search_leg_index += 1
+        if self.search_leg_index >= self.config.search_legs_per_cycle:
+            self._enter_search_relocate(now)
+            return False
+        self.search_direction *= -1.0
+        self.search_last_heading = self.current_heading
+        self.search_accumulated_degrees = 0.0
+        self.search_leg_started_at = now
+        self.logger.info(
+            f"Task3 S-tarama bacağı değişti: "
+            f"{self.search_leg_index + 1}/"
+            f"{self.config.search_legs_per_cycle}, "
+            f"direction={'right' if self.search_direction > 0.0 else 'left'}."
+        )
+        return True
+
     def _update_search(self, detections, now):
+        last_update_at = self.search_last_update_at
+        self.search_last_update_at = now
         target = self._select_target(detections)
         if target is not None:
             self._begin_acquisition(target, now, "arama sırasında hedef adayı")
             return
+        if self._wait_for_target_data():
+            if (
+                    self.search_leg_started_at is not None
+                    and last_update_at is not None
+            ):
+                self.search_leg_started_at += max(
+                    0.0,
+                    now - last_update_at,
+                )
+            self.search_last_heading = self.current_heading
+            return
 
         if self.search_last_heading is None:
             self.search_last_heading = self.current_heading
+        if self.search_leg_started_at is None:
+            self.search_leg_started_at = now
         heading_delta = abs(
             self._angle_error_deg(
                 self.current_heading,
@@ -598,17 +927,20 @@ class Task3KamikazeEngagement:
 
         if (
                 self.search_accumulated_degrees
-                >= self.config.search_scan_degrees
-                or now - self.state_started_at
-                >= self.config.search_scan_timeout_sec
+                >= self.config.search_leg_sweep_deg
+                or now - self.search_leg_started_at
+                >= self.config.search_leg_timeout_sec
         ):
-            self._enter_search_relocate(now)
-            return
+            if not self._advance_search_leg(now):
+                return
 
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
-            linear_x=0.0,
-            angular_z=self.config.search_angular_z,
+        self._publish_motion(
+            linear_x=self.config.search_linear_x,
+            angular_z=self.search_direction * self.config.search_angular_z,
+            reason=(
+                f"S-search leg {self.search_leg_index + 1}/"
+                f"{self.config.search_legs_per_cycle}"
+            ),
         )
 
     def _update_search_relocate(self, detections, now):
@@ -619,6 +951,8 @@ class Task3KamikazeEngagement:
                 now,
                 "arama noktaları arasında hedef adayı",
             )
+            return
+        if self._wait_for_target_data():
             return
 
         distance = calculate_gps_distance(
@@ -644,13 +978,19 @@ class Task3KamikazeEngagement:
     def _update_acquire(self, detections, now):
         self._stop()
         target = self._select_target(detections)
-        if target is not None and not self._target_is_consistent(target):
-            target = None
-        if target is not None:
-            self.last_target = target
-            self.last_target_angle = target["angle"]
+        if self._wait_for_target_data():
+            self._record_confirmation(None, now)
+            return
 
-        confirmed = self._record_confirmation(target)
+        confirmed = self._record_confirmation(target, now)
+        if target is not None:
+            latest = (
+                self.confirmation_samples[-1]
+                if self.confirmation_samples
+                else target
+            )
+            self.last_target = latest
+            self.last_target_angle = latest["angle"]
         if confirmed is not None:
             self.last_target = confirmed
             self.last_target_angle = confirmed["angle"]
@@ -667,9 +1007,12 @@ class Task3KamikazeEngagement:
 
     def _update_align(self, detections, now):
         target = self._select_target(detections)
+        if self._wait_for_target_data():
+            return
         if target is None or not self._target_is_consistent(target):
             self._enter_reacquire(now, "hizalama sırasında hedef kayboldu")
             return
+        target = self._filter_target(target, self.last_target)
         self.last_target = target
         self.last_target_angle = target["angle"]
 
@@ -683,17 +1026,21 @@ class Task3KamikazeEngagement:
             )
             return
 
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
+        self._publish_motion(
             linear_x=0.0,
             angular_z=self._steering_command(target["angle"]),
+            reason="target alignment",
         )
 
     def _update_approach(self, detections, now):
         target = self._select_target(detections)
+        if self._wait_for_target_data():
+            return
         if target is None or not self._target_is_consistent(target):
             self._enter_reacquire(now, "yaklaşma sırasında hedef kayboldu")
             return
+        observed_distance = target["distance"]
+        target = self._filter_target(target, self.last_target)
         self.last_target = target
         self.last_target_angle = target["angle"]
 
@@ -706,9 +1053,7 @@ class Task3KamikazeEngagement:
             )
             return
 
-        self.distance_history.append(target["distance"])
-        distance = self._median(self.distance_history)
-        if distance <= self.config.final_confirm_distance_m:
+        if observed_distance <= self.config.final_confirm_distance_m:
             self._stop()
             self.final_confirmation_samples.clear()
             self._set_state(
@@ -718,22 +1063,30 @@ class Task3KamikazeEngagement:
             )
             return
 
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
+        self.distance_history.append(target["distance"])
+        distance = self._median(self.distance_history)
+
+        self._publish_motion(
             linear_x=self._approach_speed(distance),
             angular_z=self._steering_command(target["angle"]),
+            reason="target approach",
         )
 
     def _update_final_confirm(self, detections, now):
         self._stop()
         target = self._select_target(detections)
+        if self._wait_for_target_data():
+            self.final_confirmation_samples.clear()
+            return
         if target is None or not self._target_is_consistent(target):
             self._enter_reacquire(now, "son teyitte hedef kayboldu")
             return
+        observed_target = target
+        target = self._filter_target(target, self.last_target)
         self.last_target = target
         self.last_target_angle = target["angle"]
 
-        if abs(target["angle"]) > self.config.align_tolerance_deg:
+        if abs(observed_target["angle"]) > self.config.align_tolerance_deg:
             self.final_confirmation_samples.clear()
             self._set_state(
                 MissionState.ALIGN,
@@ -742,7 +1095,7 @@ class Task3KamikazeEngagement:
             )
             return
         if (
-                target["distance"]
+                observed_target["distance"]
                 > self.config.final_confirm_distance_m
                 + self.config.final_distance_spread_m
         ):
@@ -754,7 +1107,7 @@ class Task3KamikazeEngagement:
             )
             return
 
-        self.final_confirmation_samples.append(target)
+        self.final_confirmation_samples.append(observed_target)
         if (
                 len(self.final_confirmation_samples)
                 < self.config.final_confirmation_required
@@ -790,15 +1143,16 @@ class Task3KamikazeEngagement:
     def _update_ram(self, now):
         elapsed = now - self.state_started_at
         if elapsed < self.config.ram_duration_sec:
-            publish_cmd_vel(
-                self.topics.cmd_vel_pub,
+            self._publish_motion(
                 linear_x=self.config.ram_speed,
                 angular_z=0.0,
+                reason="confirmed ram",
             )
             return
 
         self._stop()
         self.impact_count += 1
+        self.retreat_heading = self.current_heading
         self._set_state(
             MissionState.CONTACT_HOLD,
             now,
@@ -825,7 +1179,20 @@ class Task3KamikazeEngagement:
 
     def _update_retreat(self, detections, now):
         elapsed = now - self.state_started_at
+        if self.impact_count <= 0:
+            self._enter_failsafe(
+                "Task 3 RETREAT doğrulanmış temas olmadan başlatıldı."
+            )
+            return
+
         target = self._select_target(detections)
+        if self._wait_for_target_data():
+            if elapsed >= self.config.retreat_max_sec:
+                self._enter_reacquire(
+                    now,
+                    "geri çekilme veri beklerken zaman sınırına ulaştı",
+                )
+            return
         target_far_enough = (
             target is not None
             and target["distance"] >= self.config.retreat_target_distance_m
@@ -846,10 +1213,23 @@ class Task3KamikazeEngagement:
             )
             return
 
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
+        if self.retreat_heading is None:
+            self.retreat_heading = self.current_heading
+        heading_error_deg = self._angle_error_deg(
+            self.retreat_heading,
+            self.current_heading,
+        )
+        heading_correction = max(
+            -self.config.retreat_heading_max_angular_z,
+            min(
+                self.config.retreat_heading_max_angular_z,
+                math.radians(heading_error_deg),
+            ),
+        )
+        self._publish_motion(
             linear_x=-self.config.retreat_speed,
-            angular_z=0.0,
+            angular_z=heading_correction,
+            reason="post-contact straight retreat",
         )
 
     def _update_reacquire(self, detections, now):
@@ -861,16 +1241,18 @@ class Task3KamikazeEngagement:
                 "hedef yeniden bulundu",
             )
             return
+        if self._wait_for_target_data():
+            return
 
         if now - self.state_started_at >= self.config.target_lost_timeout_sec:
             self._enter_search(now, "lokal yeniden arama başarısız")
             return
 
         direction = 1.0 if self.last_target_angle >= 0.0 else -1.0
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
-            linear_x=0.0,
+        self._publish_motion(
+            linear_x=self.config.reacquire_linear_x,
             angular_z=direction * self.config.reacquire_angular_z,
+            reason="local forward reacquire",
         )
 
     def update(self, detections, now=None, vision_fresh=True):
