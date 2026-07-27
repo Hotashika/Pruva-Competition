@@ -55,7 +55,7 @@ WAYPOINT_HEADING_TOLERANCE_DEG = 15.0  # Kucuk heading farklarinda gereksiz sali
 # KAÇINMA PARAMETRELERİ
 # ============================================================
 # Engel bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
-AVOIDANCE_START_DISTANCE_M = 3.0
+AVOIDANCE_START_DISTANCE_M = 2.5
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
 AVOIDANCE_PASS_CLEARANCE_M = 2.5
 AVOIDANCE_EMERGENCY_DISTANCE_M = 1.5
@@ -63,8 +63,7 @@ AVOIDANCE_MIN_LINEAR_SPEED = 0.2
 AVOIDANCE_MAX_LINEAR_SPEED = 0.6
 AVOIDANCE_MAX_ANGULAR_Z = 0.7
 AVOIDANCE_TURN_SPEED_REDUCTION = 0.5
-AVOIDANCE_MIN_DURATION_SEC = 0.8
-AVOIDANCE_CLEAR_DURATION_SEC = 0.5
+AVOIDANCE_CLEAR_DURATION_SEC = 0.2
 AVOIDANCE_TIMEOUT_SEC = 8.0
 
 # ============================================================
@@ -173,6 +172,7 @@ class Task1Maneuvering:
         self.last_avoidance_linear_x = 0.0
         self.last_avoidance_angular_z = 0.0
         self.aligned_target_key = None
+        self.resume_navigation_without_alignment = False
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
         self.waiting_for_sensor_text = "GPS Data"
@@ -729,6 +729,7 @@ class Task1Maneuvering:
         self.waypoint_hold_until = time.monotonic() + WAYPOINT_SETTLE_SEC
         self.waypoint_hold_name = waypoint_name
         self.aligned_target_key = None
+        self.resume_navigation_without_alignment = False
         self.logger.info(
             f"{waypoint_name} reached; vehicle stopped for "
             f"{WAYPOINT_SETTLE_SEC:.2f}s before next heading alignment."
@@ -773,7 +774,9 @@ class Task1Maneuvering:
             round(float(target_lat), 7),
             round(float(target_lon), 7),
         )
-        if self.aligned_target_key != target_key:
+        if self.resume_navigation_without_alignment:
+            self.aligned_target_key = target_key
+        elif self.aligned_target_key != target_key:
             if not align_heading_to_gps_target(
                     self.topics.cmd_vel_pub,
                     self.current_lat,
@@ -860,20 +863,17 @@ class Task1Maneuvering:
                 self.avoid_clear_started_time = now
 
             clear_duration = now - self.avoid_clear_started_time
-            if (
-                    elapsed >= AVOIDANCE_MIN_DURATION_SEC
-                    and clear_duration >= AVOIDANCE_CLEAR_DURATION_SEC
-            ):
+            if clear_duration >= AVOIDANCE_CLEAR_DURATION_SEC:
                 completed_class = self.avoiding_class
                 completed_side = self.active_pass_side
-                stop_vehicle(self.topics.cmd_vel_pub)
                 self._reset_avoidance_state()
+                self.resume_navigation_without_alignment = True
                 self.logger.info(
                     f"{completed_class} cleared for {clear_duration:.2f}s; "
                     f"{completed_side} dynamic pass completed, "
-                    "resuming main GNSS route."
+                    "resuming main GNSS route without stopping."
                 )
-                return True
+                return False
 
             self._republish_last_avoidance_command()
             self.logger.info(
@@ -926,6 +926,7 @@ class Task1Maneuvering:
         self.active_obstacle_reference = obstacle
         self.avoid_started_time = now
         self.avoid_clear_started_time = None
+        self.resume_navigation_without_alignment = False
         self._publish_avoidance_command(command)
         side_reference = (
             "Geographic" if obstacle["class"] in CARDINAL_PASS_SIDES

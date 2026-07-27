@@ -105,6 +105,7 @@ def _mission_without_ros(task1_module, heading=0.0):
     mission.current_heading = heading
     mission.current_target_index = 2
     mission.aligned_target_key = None
+    mission.resume_navigation_without_alignment = False
     mission.state = task1_module.MissionState.NAVIGATING
     mission.avoiding_class = None
     mission.avoiding_track_id = None
@@ -499,7 +500,7 @@ def test_changed_track_id_rejects_unrelated_obstacle(task1_module):
     assert mission.avoiding_track_id == 7
 
 
-def test_short_detection_loss_republishes_last_command_then_resumes(
+def test_short_detection_loss_republishes_then_resumes_without_stop(
         task1_module,
         monkeypatch,
 ):
@@ -524,17 +525,114 @@ def test_short_detection_loss_republishes_last_command_then_resumes(
     )
     initial_command = published[-1]
 
-    assert mission._update_active_avoidance([], now=10.2)
+    assert mission._update_active_avoidance([], now=10.1)
     assert mission.state is task1_module.MissionState.AVOIDING
     assert published[-1] == initial_command
 
-    assert mission._update_active_avoidance([], now=10.7)
+    assert mission._update_active_avoidance([], now=10.29)
     assert mission.state is task1_module.MissionState.AVOIDING
 
-    assert mission._update_active_avoidance([], now=10.81)
+    assert not mission._update_active_avoidance([], now=10.31)
     assert mission.state is task1_module.MissionState.NAVIGATING
     assert mission.current_target_index == 2
-    assert stops == [True]
+    assert mission.resume_navigation_without_alignment
+    assert stops == []
+
+
+def test_clear_view_resumes_same_waypoint_in_same_tick_without_alignment(
+        task1_module,
+        monkeypatch,
+):
+    mission = _mission_without_ros(task1_module)
+    target = {"lat": 63.4310, "lon": 10.3960}
+    mission.waypoints = [{}, {}, target]
+    mission.waypoint_tolerance = 1.0
+    mission._prepare_update = lambda: True
+    published_targets = []
+    stops = []
+    monkeypatch.setattr(task1_module.time, "monotonic", lambda: 10.31)
+    monkeypatch.setattr(
+        task1_module,
+        "calculate_gps_distance",
+        lambda *args, **kwargs: 10.0,
+    )
+    monkeypatch.setattr(
+        task1_module,
+        "publish_cmd_vel",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        task1_module,
+        "stop_vehicle",
+        lambda _publisher: stops.append(True),
+    )
+    monkeypatch.setattr(
+        task1_module,
+        "align_heading_to_gps_target",
+        lambda *args, **kwargs: pytest.fail(
+            "post-avoidance navigation must not realign"
+        ),
+    )
+    monkeypatch.setattr(
+        task1_module,
+        "publish_set_position",
+        lambda _publisher, lat, lon: published_targets.append((lat, lon)),
+    )
+    assert mission._start_avoidance(
+        _detection("red_buoys", distance=2.5, angle=0.0),
+        now=10.0,
+    )
+    mission.avoid_clear_started_time = 10.1
+
+    mission.update([])
+    mission.update([])
+
+    assert mission.state is task1_module.MissionState.NAVIGATING
+    assert mission.current_target_index == 2
+    assert mission.resume_navigation_without_alignment
+    assert published_targets == [
+        (target["lat"], target["lon"]),
+        (target["lat"], target["lon"]),
+    ]
+    assert stops == []
+
+
+def test_avoidance_starts_only_at_two_and_a_half_metres(
+        task1_module,
+        monkeypatch,
+):
+    mission = _mission_without_ros(task1_module)
+    mission.waypoints = [{}, {}, {"lat": 63.4310, "lon": 10.3960}]
+    mission.waypoint_tolerance = 1.0
+    mission._prepare_update = lambda: True
+    mission._set_position_to_gps_target = lambda *args, **kwargs: False
+    clock = {"now": 1.0}
+    monkeypatch.setattr(
+        task1_module.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        task1_module,
+        "publish_cmd_vel",
+        lambda *args, **kwargs: None,
+    )
+
+    for now in (1.0, 1.1):
+        clock["now"] = now
+        mission.update([
+            _detection("red_buoys", distance=2.51, angle=0.0)
+        ])
+    assert mission.state is task1_module.MissionState.NAVIGATING
+
+    for now in (1.2, 1.3):
+        clock["now"] = now
+        mission.update([
+            _detection("red_buoys", distance=2.5, angle=0.0)
+        ])
+
+    assert task1_module.AVOIDANCE_START_DISTANCE_M == 2.5
+    assert mission.state is task1_module.MissionState.AVOIDING
 
 
 def test_active_invalid_data_uses_short_loss_grace(

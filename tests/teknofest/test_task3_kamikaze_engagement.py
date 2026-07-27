@@ -201,10 +201,23 @@ def test_search_moves_forward_for_wrong_class_and_stops_for_invalid_target_data(
     )
 
 
-def test_target_class_parameter_accepts_plural_and_legacy_fields(task3_module):
+@pytest.mark.parametrize(
+    ("class_field", "class_name"),
+    [
+        ("class", "red_buoy"),
+        ("class_name", "red_buoys"),
+        ("label", "orange_buoy"),
+        ("class", "orange_buoys"),
+    ],
+)
+def test_target_classes_accept_red_and_orange_labels(
+        task3_module,
+        class_field,
+        class_name,
+):
     mission = _mission(task3_module)
     detection = {
-        "class_name": "red_buoys",
+        class_field: class_name,
         "conf": 0.91,
         "distance_m": 2.2,
         "angle_from_center": -4.0,
@@ -213,30 +226,27 @@ def test_target_class_parameter_accepts_plural_and_legacy_fields(task3_module):
 
     target = mission._select_target([detection])
 
-    assert task3_module.TASK3_TARGET_BUOY_CLASS == "red_buoy"
-    assert target["class"] == "red_buoys"
+    assert task3_module.TASK3_TARGET_BUOY_CLASSES == (
+        "red_buoy",
+        "red_buoys",
+        "orange_buoy",
+        "orange_buoys",
+    )
+    assert target["class"] == class_name
     assert target["distance"] == pytest.approx(2.2)
     assert target["angle"] == pytest.approx(-4.0)
 
-    alternate_target = mission._select_target(
-        [
-            {
-                "label": "red_buoy",
-                "confidence": 0.92,
-                "depth": 2.0,
-                "angle": 3.0,
-            }
-        ]
-    )
-    assert alternate_target["distance"] == pytest.approx(2.0)
-    assert alternate_target["angle"] == pytest.approx(3.0)
+    mission.update([detection], now=0.1)
+    assert mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
 
-    green_mission = _mission(task3_module, target_class="green_buoy")
-    green_mission.update(
-        [_target(class_name="green_buoys")],
-        now=0.1,
-    )
-    assert green_mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
+
+@pytest.mark.parametrize("class_name", ["green_buoy", "yellow_buoys"])
+def test_target_classes_reject_other_buoy_labels(task3_module, class_name):
+    mission = _mission(task3_module)
+
+    target = mission._select_target([_target(class_name=class_name)])
+
+    assert target is None
 
 
 @pytest.mark.parametrize(

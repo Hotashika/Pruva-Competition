@@ -6,7 +6,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 # Active Njord object detectors. Vessel detection is intentionally not used;
 # every mission consumes detections from the buoy and AR-tag models.
-BUOY_MODEL_PATH = str(REPOSITORY_ROOT / "models" / "njord_buoy" / "njord_buoy.engine")
+
+#BUOY_MODEL_PATH = str(REPOSITORY_ROOT / "models" / "njord_buoy" / "njord_buoy.engine")
+BUOY_MODEL_PATH = str(REPOSITORY_ROOT / "models" / "njord_buoy" / "buoy.engine")
 AR_TAG_MODEL_PATH = str(REPOSITORY_ROOT / "models" / "ar_tag" / "ar_tag.engine")
 
 TOLERANCE_RATIO = 0.05  # Tolerance ratio for bounding box size filtering

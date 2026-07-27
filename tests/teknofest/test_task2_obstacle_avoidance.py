@@ -113,6 +113,7 @@ def _mission(task2_module):
 
     mission.last_angular_z = 0.0
     mission.aligned_target_key = None
+    mission.resume_navigation_without_alignment = False
     mission.yellow_course_acquired = False
     mission.yellow_initial_search_started_time = None
     mission.waypoint_hold_until = None
@@ -178,17 +179,20 @@ def test_only_yellow_buoy_triggers_obstacle_logic(task2_module):
     assert mission.obstacle_data_uncertain is False
 
 
-def test_avoidance_starts_at_three_metres_and_is_clear_at_five(task2_module):
+def test_avoidance_candidate_boundaries_are_two_and_a_half_and_five(
+        task2_module,
+):
     mission = _mission(task2_module)
 
     start_boundary = mission._nearest_relevant_obstacle([
-        _yellow(distance=3.0)
+        _yellow(distance=2.5)
     ])
     clear_boundary = mission._nearest_relevant_obstacle([
         _yellow(distance=5.0)
     ])
 
-    assert start_boundary["distance"] == 3.0
+    assert task2_module.AVOIDANCE_START_DISTANCE_M == 2.5
+    assert start_boundary["distance"] == 2.5
     assert clear_boundary is None
     assert mission.obstacle_data_uncertain is False
 
@@ -407,13 +411,13 @@ def test_short_detection_loss_holds_last_command_and_reacquisition_continues(
     assert mission._start_avoidance(detection, now=0.0)
     first_command = velocity_commands[-1]
 
-    mission._update_active_avoidance([], now=0.2)
-    assert mission.avoidance_clear_started_time == 0.2
+    assert mission._update_active_avoidance([], now=0.1)
+    assert mission.avoidance_clear_started_time == 0.1
     assert velocity_commands[-1] == first_command
 
-    mission._update_active_avoidance(
+    assert mission._update_active_avoidance(
         [_yellow(distance=2.2, side="left", angle=-6.0)],
-        now=0.4,
+        now=0.29,
     )
 
     assert mission.state is task2_module.MissionState.AVOIDING
@@ -440,7 +444,7 @@ def test_uncertain_depth_stops_without_advancing_clear_timer(task2_module):
     assert velocity_commands[-1] == (0.0, 0.0)
 
 
-def test_clear_view_stops_then_same_keeper_resumes_on_next_tick(
+def test_clear_view_resumes_same_keeper_in_same_tick_without_alignment(
         task2_module,
         monkeypatch,
 ):
@@ -473,38 +477,109 @@ def test_clear_view_stops_then_same_keeper_resumes_on_next_tick(
             (linear_x, angular_z)
         )
     )
-    task2_module.stop_vehicle = (
-        lambda publisher: velocity_commands.append((0.0, 0.0))
-    )
+    stops = []
+    task2_module.stop_vehicle = lambda publisher: stops.append(True)
     task2_module.calculate_gps_distance = lambda *args, **kwargs: 10.0
-    task2_module.align_heading_to_gps_target = lambda *args, **kwargs: True
+    task2_module.align_heading_to_gps_target = (
+        lambda *args, **kwargs: pytest.fail(
+            "post-avoidance navigation must not realign"
+        )
+    )
     task2_module.publish_set_position = (
         lambda publisher, lat, lon: published_targets.append((lat, lon))
     )
     assert mission._start_avoidance(_yellow(), now=0.0)
 
-    mission._update_active_avoidance([], now=0.1)
-    mission._update_active_avoidance([], now=0.61)
+    assert mission._update_active_avoidance([], now=0.1)
+    assert mission._update_active_avoidance([], now=0.29)
 
     assert mission.state is task2_module.MissionState.AVOIDING
     assert keeper_calls == []
     assert published_targets == []
 
-    mission._update_active_avoidance([], now=0.81)
+    clock["now"] = 0.31
+    mission.avoidance_clear_started_time = 0.1
+    mission.update([])
+    mission.update([])
 
     assert mission.state is task2_module.MissionState.NAVIGATING
     assert mission.course_keeper is keeper
     assert keeper.marker == "preserved"
-    assert keeper_calls == []
-    assert published_targets == []
-    assert velocity_commands[-1] == (0.0, 0.0)
+    assert len(keeper_calls) == 2
+    assert published_targets == [
+        (37.95160, 32.50120),
+        (37.95160, 32.50120),
+    ]
+    assert mission.resume_navigation_without_alignment
+    assert stops == []
 
-    clock["now"] = 1.0
+
+def test_post_avoidance_blocked_course_falls_back_to_main_waypoint(
+        task2_module,
+        monkeypatch,
+):
+    mission = _mission(task2_module)
+    main_target = mission.waypoints[mission.current_target_index]
+    published_targets = []
+    stops = []
+    clock = {"now": 0.21}
+    mission.yellow_course_acquired = True
+    mission.course_keeper = types.SimpleNamespace(
+        compute=lambda **kwargs: types.SimpleNamespace(
+            should_stop=True,
+            target_lat=None,
+            target_lon=None,
+            status="blocked",
+            reason="fewer_than_two_yellow_buoys",
+        ),
+    )
+    monkeypatch.setattr(
+        task2_module.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+    task2_module.publish_cmd_vel = lambda *args, **kwargs: None
+    task2_module.stop_vehicle = lambda publisher: stops.append(True)
+    task2_module.calculate_gps_distance = lambda *args, **kwargs: 10.0
+    task2_module.align_heading_to_gps_target = (
+        lambda *args, **kwargs: pytest.fail(
+            "post-avoidance fallback must not realign"
+        )
+    )
+    task2_module.publish_set_position = (
+        lambda publisher, lat, lon: published_targets.append((lat, lon))
+    )
+    assert mission._start_avoidance(_yellow(), now=0.0)
+    mission.avoidance_clear_started_time = 0.0
+
     mission.update([])
 
-    assert mission.course_keeper is keeper
-    assert len(keeper_calls) == 1
-    assert published_targets == [(37.95160, 32.50120)]
+    assert mission.state is task2_module.MissionState.NAVIGATING
+    assert published_targets == [
+        (main_target["lat"], main_target["lon"])
+    ]
+    assert mission.resume_navigation_without_alignment
+    assert stops == []
+
+
+def test_avoidance_does_not_start_above_two_and_a_half_metres(
+        task2_module,
+        monkeypatch,
+):
+    mission = _mission(task2_module)
+    mission._navigate_to_gps_target = lambda *args, **kwargs: False
+    clock = {"now": 1.0}
+    monkeypatch.setattr(
+        task2_module.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+
+    for now in (1.0, 1.1):
+        clock["now"] = now
+        mission.update([_yellow(distance=2.51)])
+
+    assert mission.state is task2_module.MissionState.NAVIGATING
 
 
 def test_eight_second_timeout_enters_failsafe_and_requests_hold(task2_module):

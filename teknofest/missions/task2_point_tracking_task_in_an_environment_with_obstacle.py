@@ -110,7 +110,7 @@ YELLOW_TARGET_MEMORY_SEC = 1.0
 # KAÇINMA PARAMETRELERİ
 # ============================================================
 # Sarı duba bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
-AVOIDANCE_START_DISTANCE_M = 3.0
+AVOIDANCE_START_DISTANCE_M = 2.5
 # Aktif engel bu mesafeye çıktığında temiz görüş süresi başlar.
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
 AVOIDANCE_PASS_CLEARANCE_M = 2.5
@@ -119,8 +119,7 @@ AVOIDANCE_MIN_LINEAR_SPEED = 0.2
 AVOIDANCE_MAX_LINEAR_SPEED = 0.6
 AVOIDANCE_MAX_ANGULAR_Z = 0.7
 AVOIDANCE_TURN_SPEED_REDUCTION = 0.5
-AVOIDANCE_MIN_DURATION_SEC = 0.8
-AVOIDANCE_CLEAR_DURATION_SEC = 0.5
+AVOIDANCE_CLEAR_DURATION_SEC = 0.2
 AVOIDANCE_TIMEOUT_SEC = 8.0
 SIDE_FALLBACK_ANGLE_DEG = 15.0
 
@@ -180,6 +179,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.yellow_course_acquired = False
         self.yellow_initial_search_started_time = None
         self.aligned_target_key = None
+        self.resume_navigation_without_alignment = False
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
 
@@ -326,6 +326,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.waypoint_hold_until = time.monotonic() + WAYPOINT_SETTLE_SEC
         self.waypoint_hold_name = waypoint_name
         self.aligned_target_key = None
+        self.resume_navigation_without_alignment = False
         self.logger.info(
             f"{waypoint_name} ulaşıldı; araç {WAYPOINT_SETTLE_SEC:.2f}s durduruldu."
         )
@@ -798,6 +799,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.active_obstacle_reference = obstacle
         self.state = MissionState.AVOIDING
         self.aligned_target_key = None
+        self.resume_navigation_without_alignment = False
         self._publish_avoidance_command(command)
 
         self.logger.warn(
@@ -827,12 +829,12 @@ class Task2PointTrackingWithObstacleAvoidance:
 
     def _finish_avoidance(self):
         completed_side = self.avoidance_side
-        stop_vehicle(self.topics.cmd_vel_pub)
         self._reset_avoidance_state()
+        self.resume_navigation_without_alignment = True
         self.logger.info(
             f"Engel kesintisiz {AVOIDANCE_CLEAR_DURATION_SEC:.1f}s temiz. "
             f"{completed_side} taraftan dinamik geçiş tamamlandı; "
-            "aynı ana waypoint ve sarı duba parkur takibine dönülüyor."
+            "durmadan aynı ana waypoint ve sarı duba parkur takibine dönülüyor."
         )
 
     def _avoidance_timed_out(self, now=None):
@@ -842,13 +844,14 @@ class Task2PointTrackingWithObstacleAvoidance:
         return now - self.avoidance_started_time >= AVOIDANCE_TIMEOUT_SEC
 
     def _update_active_avoidance(self, detections, now=None):
+        """Kaçınma bu çevrimi tüketiyorsa True, tamamlandıysa False döndürür."""
         now = time.monotonic() if now is None else float(now)
         if self.avoidance_started_time is None:
             self._enter_failsafe("AVOIDING başlangıç zamanı yok; FAILSAFE + HOLD.")
-            return
+            return True
         if self._avoidance_timed_out(now):
             self._enter_failsafe("Kaçınma zaman aşımı; FAILSAFE + HOLD.")
-            return
+            return True
 
         # Eksik derinlik/yön temiz görüş değildir: araç durur, clear sayacı sıfırlanır.
         self._nearest_relevant_obstacle(detections, now=now)
@@ -865,24 +868,20 @@ class Task2PointTrackingWithObstacleAvoidance:
                 "düzelene kadar durduruldu.",
                 throttle_duration_sec=1.0,
             )
-            return
+            return True
 
         obstacle = self._matching_avoidance_obstacle(detections)
         if obstacle is None:
             if self.avoidance_clear_started_time is None:
                 self.avoidance_clear_started_time = now
-            maneuver_elapsed = now - self.avoidance_started_time
             clear_elapsed = now - self.avoidance_clear_started_time
-            if (
-                    maneuver_elapsed >= AVOIDANCE_MIN_DURATION_SEC
-                    and clear_elapsed >= AVOIDANCE_CLEAR_DURATION_SEC
-            ):
+            if clear_elapsed >= AVOIDANCE_CLEAR_DURATION_SEC:
                 self._finish_avoidance()
-                return
+                return False
 
             # Kısa tespit kaybında son güvenli komutu clear süresince koru.
             self._republish_last_avoidance_command()
-            return
+            return True
 
         self.avoidance_clear_started_time = None
         command = self._calculate_avoidance_command(obstacle)
@@ -893,7 +892,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                 angular_z=0.0,
             )
             self.last_angular_z = 0.0
-            return
+            return True
 
         self._publish_avoidance_command(command)
         self.logger.info(
@@ -905,6 +904,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             f"angular_z={command['angular_z']:+.2f}",
             throttle_duration_sec=0.5,
         )
+        return True
 
     # ========================================================
     # GPS HEDEF TAKİBİ
@@ -959,17 +959,23 @@ class Task2PointTrackingWithObstacleAvoidance:
                         initial_search_active = False
 
                 if not initial_search_active:
-                    publish_cmd_vel(
-                        self.topics.cmd_vel_pub,
-                        linear_x=0.0,
-                        angular_z=0.0,
-                    )
-                    self.logger.warn(
-                        f"Sarı duba parkur hedefi hesaplanamadı "
-                        f"({course_decision.reason}); araç bekletiliyor.",
-                        throttle_duration_sec=1.0,
-                    )
-                    return False
+                    if self.resume_navigation_without_alignment:
+                        navigation_status = (
+                            "post_avoidance_main_waypoint_fallback/"
+                            f"{course_decision.reason}"
+                        )
+                    else:
+                        publish_cmd_vel(
+                            self.topics.cmd_vel_pub,
+                            linear_x=0.0,
+                            angular_z=0.0,
+                        )
+                        self.logger.warn(
+                            f"Sarı duba parkur hedefi hesaplanamadı "
+                            f"({course_decision.reason}); araç bekletiliyor.",
+                            throttle_duration_sec=1.0,
+                        )
+                        return False
             if (
                     course_decision.target_lat is not None
                     and course_decision.target_lon is not None
@@ -988,7 +994,9 @@ class Task2PointTrackingWithObstacleAvoidance:
             round(float(navigation_lat), 7),
             round(float(navigation_lon), 7),
         )
-        if self.aligned_target_key != target_key:
+        if self.resume_navigation_without_alignment:
+            self.aligned_target_key = target_key
+        elif self.aligned_target_key != target_key:
             if not align_heading_to_gps_target(
                     self.topics.cmd_vel_pub,
                     self.current_lat,
@@ -1066,11 +1074,11 @@ class Task2PointTrackingWithObstacleAvoidance:
 
         now = time.monotonic()
 
-        # Aktif kaçınma yalnız /cube/cmd_vel kullanır; course keeper ve GPS
-        # hedef yayıncısı bu dalda çağrılmaz.
+        # Devam eden kaçınma yalnız /cube/cmd_vel kullanır. Temiz geçiş
+        # doğrulanırsa aynı çevrimde course keeper ve GPS navigasyonu sürer.
         if self.state == MissionState.AVOIDING:
-            self._update_active_avoidance(detections, now=now)
-            return
+            if self._update_active_avoidance(detections, now=now):
+                return
 
         target_gps = self.waypoints[self.current_target_index]
         target_lat = target_gps["lat"]
