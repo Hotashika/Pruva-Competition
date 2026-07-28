@@ -407,6 +407,26 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             })
         )
 
+    def test_metric_fusion_obstacles_are_collision_targets(self):
+        for detection_type in ("fused_obstacle", "seg_depth_obstacle"):
+            with self.subTest(detection_type=detection_type):
+                self.assertTrue(
+                    self.mission._is_vessel({
+                        "type": detection_type,
+                        "class": "surface_obstacle_candidate",
+                        "distance": 3.5,
+                    })
+                )
+
+    def test_visual_only_segment_is_not_a_collision_target(self):
+        self.assertFalse(
+            self.mission._is_vessel({
+                "type": "visual_obstacle_candidate",
+                "class": "surface_obstacle_candidate",
+                "distance": None,
+            })
+        )
+
     def test_port_side_risk_stands_on_then_uses_starboard_gps_target(self):
         self._update(5.0, -25.0, 10.0)
         self._update(4.7, -25.0, 10.3)

@@ -36,6 +36,7 @@ class VisionNode(Node):
         super().__init__("vision_node")
         self.profile = profile
         self.detectors = {}
+        self.detector_uses_imu = set()
         self.current_task = None
         self.qr_detector = None
         self.qr_pub = None
@@ -58,6 +59,7 @@ class VisionNode(Node):
         self.depth_shm = self._attach_with_retry(profile.shared_state.DEPTH_SHM_NAME)
         self.meta_shm = self._attach_with_retry(profile.shared_state.META_SHM_NAME)
         self.calib_shm = None
+        self.imu_shm = None
 
         self.rgb = np.ndarray(
             profile.RGB_SHAPE,
@@ -75,6 +77,17 @@ class VisionNode(Node):
             buffer=self.meta_shm.buf,
         )
         self.calib = None
+        self.imu = None
+
+        if getattr(profile, "USE_SHARED_IMU", False):
+            self.imu_shm = self._attach_with_retry(
+                profile.shared_state.IMU_SHM_NAME
+            )
+            self.imu = np.ndarray(
+                profile.shared_state.IMU_SHAPE,
+                dtype=np.float64,
+                buffer=self.imu_shm.buf,
+            )
 
         if profile.USE_SHARED_CALIBRATION:
             self.calib_shm = self._attach_with_retry(
@@ -107,6 +120,12 @@ class VisionNode(Node):
         )
         self.last_frame_id = -1
         self.pub = self.create_publisher(String, "/vision/detections", 10)
+        shadow_topic = getattr(profile, "SHADOW_DETECTIONS_TOPIC", None)
+        self.shadow_pub = (
+            None
+            if not shadow_topic
+            else self.create_publisher(String, shadow_topic, 10)
+        )
         self.create_subscription(
             String,
             "/mission/active_task",
@@ -137,6 +156,7 @@ class VisionNode(Node):
             if name not in wanted:
                 self.get_logger().info(f"Closing '{name}' detector...")
                 del self.detectors[name]
+                self.detector_uses_imu.discard(name)
 
         for name in wanted:
             if name in self.detectors:
@@ -164,6 +184,8 @@ class VisionNode(Node):
             self.detectors[name] = spec["class"](
                 **detector_kwargs,
             )
+            if spec.get("uses_imu"):
+                self.detector_uses_imu.add(name)
 
         try:
             import torch
@@ -281,11 +303,14 @@ class VisionNode(Node):
         camera_timestamp_ms = int(self.meta[1])
         bgr_image = self.rgb[:, :, :3].copy()
         depth_array = self.depth.copy()
+        imu_sample = None if self.imu is None else self.imu.copy()
         if int(self.meta[0]) != frame_id:
             return
         self.last_frame_id = frame_id
 
         all_detections = []
+        shadow_detections = []
+        shadow_diagnostics = {}
         for name, detector in self.detectors.items():
             if (
                     name == "ar_tag"
@@ -295,7 +320,14 @@ class VisionNode(Node):
                 tracked = self._track_last_ar_detection(bgr_image)
                 detections = [] if tracked is None else [tracked]
             else:
-                detections = detector.detect(bgr_image, depth_array)
+                if name in self.detector_uses_imu:
+                    detections = detector.detect(
+                        bgr_image,
+                        depth_array,
+                        imu=imu_sample,
+                    )
+                else:
+                    detections = detector.detect(bgr_image, depth_array)
                 if name == "ar_tag" and self.profile.QR_TOPIC:
                     self.last_ar_inference_time = time.monotonic()
                     best = self._best_ar_detection(detections)
@@ -308,6 +340,18 @@ class VisionNode(Node):
             for detection in detections:
                 detection.setdefault("type", name)
             all_detections.extend(detections)
+            detector_shadow = getattr(
+                detector,
+                "last_shadow_detections",
+                None,
+            )
+            if detector_shadow is not None:
+                shadow_detections.extend(detector_shadow)
+                shadow_diagnostics[name] = getattr(
+                    detector,
+                    "last_diagnostics",
+                    {},
+                )
 
         if self.current_task == self.profile.QR_TASK:
             best_ar = self._best_ar_detection(
@@ -331,19 +375,36 @@ class VisionNode(Node):
         message.data = json.dumps(payload)
         self.pub.publish(message)
 
+        if self.shadow_pub is not None and shadow_diagnostics:
+            shadow_message = String()
+            shadow_message.data = json.dumps(
+                {
+                    "frame_id": frame_id,
+                    "camera_timestamp_ms": camera_timestamp_ms,
+                    "active_task": self.current_task,
+                    "detections": shadow_detections,
+                    "diagnostics": shadow_diagnostics,
+                }
+            )
+            self.shadow_pub.publish(shadow_message)
+
     def destroy_node(self):
         self.rgb = None
         self.depth = None
         self.meta = None
         self.calib = None
+        self.imu = None
         handles = [self.rgb_shm, self.depth_shm, self.meta_shm]
         if self.calib_shm is not None:
             handles.append(self.calib_shm)
+        if self.imu_shm is not None:
+            handles.append(self.imu_shm)
         self.profile.close_shared_memory_handles(*handles)
         self.rgb_shm = None
         self.depth_shm = None
         self.meta_shm = None
         self.calib_shm = None
+        self.imu_shm = None
         super().destroy_node()
 
 
