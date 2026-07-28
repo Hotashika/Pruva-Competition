@@ -1,6 +1,7 @@
 """TEKNOFEST Task 3: confirmed buoy search, approach, and repeated impact."""
 
 import json
+import math
 import sys
 import time
 from collections import deque
@@ -117,15 +118,16 @@ class Task3Config:
     reacquire_linear_x: float = 0.15
     reacquire_angular_z: float = 0.16
 
-    # Temas / geri çekilme parametreleri
+    # Temas / ileri ayrılma / kayıtlı hedefe dönüş parametreleri
     ram_speed: float = 0.75
     ram_duration_sec: float = 1.6
     contact_hold_sec: float = 0.7
-    retreat_speed: float = 0.25
-    retreat_min_sec: float = 0.6
-    retreat_max_sec: float = 1.5
-    retreat_target_distance_m: float = 2.5
-    retreat_heading_max_angular_z: float = 0.25
+    post_impact_forward_speed: float = 0.40
+    post_impact_forward_duration_sec: float = 2.0
+    impact_return_speed: float = 0.30
+    impact_return_stop_distance_m: float = 1.0
+    impact_return_heading_tolerance_deg: float = 8.0
+    impact_return_timeout_sec: float = 20.0
 
     def __post_init__(self):
         if self.required_impact_count < 1:
@@ -156,6 +158,24 @@ class Task3Config:
             raise ValueError("search_heading_tolerance_deg must be positive")
         if self.search_turn_timeout_min_sec <= 0.0:
             raise ValueError("search_turn_timeout_min_sec must be positive")
+        if self.post_impact_forward_speed <= 0.0:
+            raise ValueError("post_impact_forward_speed must be positive")
+        if self.post_impact_forward_duration_sec <= 0.0:
+            raise ValueError(
+                "post_impact_forward_duration_sec must be positive"
+            )
+        if self.impact_return_speed <= 0.0:
+            raise ValueError("impact_return_speed must be positive")
+        if self.impact_return_stop_distance_m <= 0.0:
+            raise ValueError(
+                "impact_return_stop_distance_m must be positive"
+            )
+        if self.impact_return_heading_tolerance_deg <= 0.0:
+            raise ValueError(
+                "impact_return_heading_tolerance_deg must be positive"
+            )
+        if self.impact_return_timeout_sec <= 0.0:
+            raise ValueError("impact_return_timeout_sec must be positive")
 
 
 class MissionState(Enum):
@@ -168,7 +188,8 @@ class MissionState(Enum):
     FINAL_CONFIRM = auto()
     RAM = auto()
     CONTACT_HOLD = auto()
-    RETREAT = auto()
+    FORWARD_CLEAR = auto()
+    IMPACT_RETURN = auto()
     REACQUIRE = auto()
     FINISHED = auto()
     FAILSAFE = auto()
@@ -223,7 +244,7 @@ class Task3KamikazeEngagement:
             maxlen=self.config.final_confirmation_required
         )
 
-        self.retreat_heading = None
+        self.impact_target_gps = None
 
         self.target_data_uncertain = False
         self.target_data_uncertain_reason = None
@@ -238,14 +259,6 @@ class Task3KamikazeEngagement:
     def impact_count(self, value):
         self.impact_controller.impact_count = int(value)
 
-    @property
-    def retreat_heading(self):
-        return self.impact_controller.retreat_heading
-
-    @retreat_heading.setter
-    def retreat_heading(self, value):
-        self.impact_controller.retreat_heading = value
-
     @staticmethod
     def _now(now):
         return time.monotonic() if now is None else float(now)
@@ -257,6 +270,20 @@ class Task3KamikazeEngagement:
     @staticmethod
     def _median(values):
         return median(values)
+
+    @staticmethod
+    def _gps_bearing_deg(lat1, lon1, lat2, lon2):
+        latitude_1 = math.radians(float(lat1))
+        latitude_2 = math.radians(float(lat2))
+        longitude_delta = math.radians(float(lon2) - float(lon1))
+        east = math.sin(longitude_delta) * math.cos(latitude_2)
+        north = (
+            math.cos(latitude_1) * math.sin(latitude_2)
+            - math.sin(latitude_1)
+            * math.cos(latitude_2)
+            * math.cos(longitude_delta)
+        )
+        return math.degrees(math.atan2(east, north)) % 360.0
 
     def _set_state(self, state, now, reason=None):
         if state == self.state:
@@ -280,14 +307,9 @@ class Task3KamikazeEngagement:
             -self.config.max_angular_z,
             min(self.config.max_angular_z, float(angular_z)),
         )
-        retreat_allowed = (
-            self.state == MissionState.RETREAT
-            and self.impact_count > 0
-        )
-        if linear_x < 0.0 and not retreat_allowed:
+        if linear_x < 0.0:
             self._enter_failsafe(
-                "Task 3 güvenlik ihlali: doğrulanmış temas dışında "
-                "negatif linear_x engellendi."
+                "Task 3 güvenlik ihlali: negatif linear_x engellendi."
             )
             return False
 
@@ -334,6 +356,7 @@ class Task3KamikazeEngagement:
         self.mission_started_at = now
         self.finished = False
         self.impact_controller.reset()
+        self.impact_target_gps = None
         self.last_target = None
         self.last_target_angle = 0.0
         self.confirmation_samples.clear()
@@ -586,7 +609,6 @@ class Task3KamikazeEngagement:
 
     def _enter_reacquire(self, now, reason):
         self._stop()
-        self.retreat_heading = None
         if self.last_target is not None:
             self.last_target_angle = self.last_target["angle"]
         self.confirmation_samples.clear()
@@ -611,6 +633,20 @@ class Task3KamikazeEngagement:
         if distance > midpoint:
             return self.config.medium_approach_speed
         return self.config.near_approach_speed
+
+    def _record_impact_gps(self, now):
+        self.impact_target_gps = {
+            "lat": float(self.current_lat),
+            "lon": float(self.current_lon),
+            "recorded_at": float(now),
+            "impact_count": self.impact_count,
+        }
+        self.logger.info(
+            "Task 3 temas GPS noktası kaydedildi: "
+            f"lat={self.impact_target_gps['lat']:.7f}, "
+            f"lon={self.impact_target_gps['lon']:.7f}, "
+            f"impact_count={self.impact_count}."
+        )
 
     def _update_search(self, detections, now):
         target = self._select_target(detections)
@@ -808,10 +844,7 @@ class Task3KamikazeEngagement:
 
     def _update_ram(self, now):
         elapsed = now - self.state_started_at
-        decision = self.impact_controller.ram_decision(
-            elapsed,
-            self.current_heading,
-        )
+        decision = self.impact_controller.ram_decision(elapsed)
         if decision.action == ImpactAction.RAM_MOTION:
             self._publish_motion(
                 linear_x=decision.linear_x,
@@ -820,6 +853,7 @@ class Task3KamikazeEngagement:
             )
             return
 
+        self._record_impact_gps(now)
         self._stop()
         self._set_state(
             MissionState.CONTACT_HOLD,
@@ -843,44 +877,24 @@ class Task3KamikazeEngagement:
             )
             return
         self._set_state(
-            MissionState.RETREAT,
+            MissionState.FORWARD_CLEAR,
             now,
             decision.reason,
         )
 
-    def _update_retreat(self, detections, now):
-        elapsed = now - self.state_started_at
-        if self.impact_count <= 0:
-            decision = self.impact_controller.retreat_decision(
-                elapsed=elapsed,
-                target_far_enough=False,
-                current_heading=self.current_heading,
-            )
-            self._enter_failsafe(decision.reason)
-            return
-
-        target = self._select_target(detections)
-        if self._wait_for_target_data():
-            if self.impact_controller.retreat_timeout_reached(elapsed):
-                self._enter_reacquire(
-                    now,
-                    "geri çekilme veri beklerken zaman sınırına ulaştı",
+    def _update_forward_clear(self, now):
+        decision = self.impact_controller.forward_clear_decision(
+            now - self.state_started_at
+        )
+        if decision.action == ImpactAction.IMPACT_RETURN:
+            self._stop()
+            if self.impact_target_gps is None:
+                self._enter_failsafe(
+                    "Task 3 kayıtlı temas GPS noktası bulunamadı."
                 )
-            return
-        target_far_enough = (
-            target is not None
-            and target["distance"] >= self.config.retreat_target_distance_m
-        )
-        decision = self.impact_controller.retreat_decision(
-            elapsed=elapsed,
-            target_far_enough=target_far_enough,
-            current_heading=self.current_heading,
-        )
-        if decision.action == ImpactAction.REACQUIRE:
-            if target is not None:
-                self.last_target = target
-                self.last_target_angle = target["angle"]
-            self._enter_reacquire(
+                return
+            self._set_state(
+                MissionState.IMPACT_RETURN,
                 now,
                 decision.reason,
             )
@@ -890,6 +904,79 @@ class Task3KamikazeEngagement:
             linear_x=decision.linear_x,
             angular_z=decision.angular_z,
             reason=decision.reason,
+        )
+
+    def _update_impact_return(self, detections, now):
+        target = self._select_target(detections)
+        if target is not None:
+            self._begin_acquisition(
+                target,
+                now,
+                "kayıtlı temas noktasına dönüşte hedef bulundu",
+            )
+            return
+        if self._wait_for_target_data():
+            return
+        if self.impact_target_gps is None:
+            self._enter_failsafe(
+                "Task 3 kayıtlı temas GPS noktası bulunamadı."
+            )
+            return
+        if (
+                now - self.state_started_at
+                >= self.config.impact_return_timeout_sec
+        ):
+            self._enter_search(
+                now,
+                "kayıtlı temas noktasına dönüş zaman aşımı",
+            )
+            return
+
+        distance = calculate_gps_distance(
+            self.current_lat,
+            self.current_lon,
+            self.impact_target_gps["lat"],
+            self.impact_target_gps["lon"],
+        )
+        target_heading = self._gps_bearing_deg(
+            self.current_lat,
+            self.current_lon,
+            self.impact_target_gps["lat"],
+            self.impact_target_gps["lon"],
+        )
+        heading_error = self._angle_error_deg(
+            target_heading,
+            self.current_heading,
+        )
+        if (
+                abs(heading_error)
+                > self.config.impact_return_heading_tolerance_deg
+        ):
+            self._publish_motion(
+                linear_x=0.0,
+                angular_z=self._steering_command(heading_error),
+                reason=(
+                    "saved impact GPS alignment; "
+                    f"distance={distance:.1f}m, "
+                    f"target_heading={target_heading:.1f}deg"
+                ),
+            )
+            return
+        if distance <= self.config.impact_return_stop_distance_m:
+            self._enter_search(
+                now,
+                "kayıtlı temas noktasına ulaşıldı; görsel tarama",
+            )
+            return
+
+        self._publish_motion(
+            linear_x=self.config.impact_return_speed,
+            angular_z=self._steering_command(heading_error),
+            reason=(
+                "return to saved impact GPS; "
+                f"distance={distance:.1f}m, "
+                f"target_heading={target_heading:.1f}deg"
+            ),
         )
 
     def _update_reacquire(self, detections, now):
@@ -975,8 +1062,11 @@ class Task3KamikazeEngagement:
         if self.state == MissionState.CONTACT_HOLD:
             self._update_contact_hold(now)
             return
-        if self.state == MissionState.RETREAT:
-            self._update_retreat(detections, now)
+        if self.state == MissionState.FORWARD_CLEAR:
+            self._update_forward_clear(now)
+            return
+        if self.state == MissionState.IMPACT_RETURN:
+            self._update_impact_return(detections, now)
             return
         if self.state == MissionState.REACQUIRE:
             self._update_reacquire(detections, now)

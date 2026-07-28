@@ -160,12 +160,12 @@ def test_buoy_command_uses_vehicle_relative_class_side(
 @pytest.mark.parametrize(
     ("obstacle_class", "heading", "expected_forward", "expected_starboard"),
     (
-        ("east_buoys", 0.0, 0.0, 2.5),
-        ("east_buoys", 90.0, 2.5, 0.0),
-        ("east_buoys", 180.0, 0.0, -2.5),
-        ("west_buoys", 0.0, 0.0, -2.5),
-        ("west_buoys", 90.0, -2.5, 0.0),
-        ("west_buoys", 180.0, 0.0, 2.5),
+        ("east_buoys", 0.0, 0.0, 3.0),
+        ("east_buoys", 90.0, 3.0, 0.0),
+        ("east_buoys", 180.0, 0.0, -3.0),
+        ("west_buoys", 0.0, 0.0, -3.0),
+        ("west_buoys", 90.0, -3.0, 0.0),
+        ("west_buoys", 180.0, 0.0, 3.0),
     ),
 )
 def test_cardinal_offset_preserves_geographic_side(
@@ -597,7 +597,7 @@ def test_clear_view_resumes_same_waypoint_in_same_tick_without_alignment(
     assert stops == []
 
 
-def test_avoidance_starts_only_at_two_and_a_half_metres(
+def test_avoidance_starts_only_at_three_metres(
         task1_module,
         monkeypatch,
 ):
@@ -621,17 +621,17 @@ def test_avoidance_starts_only_at_two_and_a_half_metres(
     for now in (1.0, 1.1):
         clock["now"] = now
         mission.update([
-            _detection("red_buoys", distance=2.51, angle=0.0)
+            _detection("red_buoys", distance=3.01, angle=0.0)
         ])
     assert mission.state is task1_module.MissionState.NAVIGATING
 
     for now in (1.2, 1.3):
         clock["now"] = now
         mission.update([
-            _detection("red_buoys", distance=2.5, angle=0.0)
+            _detection("red_buoys", distance=3.0, angle=0.0)
         ])
 
-    assert task1_module.AVOIDANCE_START_DISTANCE_M == 2.5
+    assert task1_module.AVOIDANCE_START_DISTANCE_M == 3.0
     assert mission.state is task1_module.MissionState.AVOIDING
 
 

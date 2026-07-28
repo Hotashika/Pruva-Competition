@@ -1,8 +1,7 @@
-"""ROS-independent impact and retreat decisions for TEKNOFEST Task 3."""
+"""ROS-independent repeated-impact decisions for TEKNOFEST Task 3."""
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
@@ -13,10 +12,9 @@ class ImpactAction(Enum):
     CONTACT_HOLD = auto()
     HOLD = auto()
     FINISH = auto()
-    RETREAT = auto()
-    RETREAT_MOTION = auto()
-    REACQUIRE = auto()
-    FAILSAFE = auto()
+    FORWARD_CLEAR = auto()
+    FORWARD_CLEAR_MOTION = auto()
+    IMPACT_RETURN = auto()
 
 
 @dataclass(frozen=True)
@@ -27,23 +25,15 @@ class ImpactDecision:
     reason: Optional[str] = None
 
 
-def _angle_error_deg(target_deg, current_deg) -> float:
-    return (
-        float(target_deg) - float(current_deg) + 180.0
-    ) % 360.0 - 180.0
-
-
 class Task3ImpactController:
     def __init__(self, config):
         self.config = config
         self.impact_count = 0
-        self.retreat_heading = None
 
     def reset(self):
         self.impact_count = 0
-        self.retreat_heading = None
 
-    def ram_decision(self, elapsed, current_heading) -> ImpactDecision:
+    def ram_decision(self, elapsed) -> ImpactDecision:
         if elapsed < self.config.ram_duration_sec:
             return ImpactDecision(
                 action=ImpactAction.RAM_MOTION,
@@ -53,7 +43,6 @@ class Task3ImpactController:
             )
 
         self.impact_count += 1
-        self.retreat_heading = current_heading
         return ImpactDecision(
             action=ImpactAction.CONTACT_HOLD,
             reason=f"{self.impact_count}. temas komutu tamamlandı",
@@ -68,59 +57,19 @@ class Task3ImpactController:
                 reason="gerekli temas sayısı tamamlandı",
             )
         return ImpactDecision(
-            action=ImpactAction.RETREAT,
-            reason="yeniden yaklaşmak için geri çekilme",
+            action=ImpactAction.FORWARD_CLEAR,
+            reason="yeniden yaklaşmak için ileri ayrılma",
         )
 
-    def retreat_timeout_reached(self, elapsed) -> bool:
-        return elapsed >= self.config.retreat_max_sec
-
-    def retreat_decision(
-            self,
-            *,
-            elapsed,
-            target_far_enough,
-            current_heading,
-    ) -> ImpactDecision:
-        if self.impact_count <= 0:
+    def forward_clear_decision(self, elapsed) -> ImpactDecision:
+        if elapsed >= self.config.post_impact_forward_duration_sec:
             return ImpactDecision(
-                action=ImpactAction.FAILSAFE,
-                reason=(
-                    "Task 3 RETREAT doğrulanmış temas olmadan başlatıldı."
-                ),
+                action=ImpactAction.IMPACT_RETURN,
+                reason="ileri ayrılma tamamlandı; kayıtlı hedefe dönülüyor",
             )
-
-        if (
-                elapsed >= self.config.retreat_max_sec
-                or (
-                    elapsed >= self.config.retreat_min_sec
-                    and target_far_enough
-                )
-        ):
-            return ImpactDecision(
-                action=ImpactAction.REACQUIRE,
-                reason=(
-                    "geri çekilme tamamlandı; "
-                    "hedef yeniden teyit edilecek"
-                ),
-            )
-
-        if self.retreat_heading is None:
-            self.retreat_heading = current_heading
-        heading_error_deg = _angle_error_deg(
-            self.retreat_heading,
-            current_heading,
-        )
-        heading_correction = max(
-            -self.config.retreat_heading_max_angular_z,
-            min(
-                self.config.retreat_heading_max_angular_z,
-                math.radians(heading_error_deg),
-            ),
-        )
         return ImpactDecision(
-            action=ImpactAction.RETREAT_MOTION,
-            linear_x=-self.config.retreat_speed,
-            angular_z=heading_correction,
-            reason="post-contact straight retreat",
+            action=ImpactAction.FORWARD_CLEAR_MOTION,
+            linear_x=self.config.post_impact_forward_speed,
+            angular_z=0.0,
+            reason="post-contact forward clear",
         )
