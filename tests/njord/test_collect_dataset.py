@@ -3,6 +3,7 @@ import unittest
 
 from njord.collect_dataset import (
     DEFAULT_OUTPUT_ROOT,
+    _quaternion_to_euler,
     build_parser,
     collection_name,
     non_negative_float,
@@ -18,6 +19,7 @@ class CollectDatasetCommandTests(unittest.TestCase):
         self.assertEqual(5.0, arguments.fps)
         self.assertEqual(0.0, arguments.duration)
         self.assertEqual(DEFAULT_OUTPUT_ROOT, arguments.output_dir)
+        self.assertFalse(arguments.attach)
 
     def test_accepts_named_fixed_duration_collection(self):
         arguments = build_parser().parse_args(
@@ -27,6 +29,21 @@ class CollectDatasetCommandTests(unittest.TestCase):
         self.assertEqual("pool_test", arguments.name)
         self.assertEqual(2.5, arguments.fps)
         self.assertEqual(10.0, arguments.duration)
+
+    def test_accepts_live_attach_mode(self):
+        arguments = build_parser().parse_args(
+            ["--attach", "--name", "Task2_Live", "--fps", "5"]
+        )
+
+        self.assertTrue(arguments.attach)
+        self.assertEqual("task2_live", arguments.name)
+
+    def test_converts_identity_quaternion_to_zero_euler_angles(self):
+        roll, pitch, yaw = _quaternion_to_euler(0.0, 0.0, 0.0, 1.0)
+
+        self.assertAlmostEqual(0.0, roll)
+        self.assertAlmostEqual(0.0, pitch)
+        self.assertAlmostEqual(0.0, yaw)
 
     def test_rejects_unsafe_names_and_invalid_numbers(self):
         with self.assertRaises(argparse.ArgumentTypeError):

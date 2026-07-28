@@ -6,7 +6,7 @@ frame_lock = threading.Lock()
 frame_condition = threading.Condition(frame_lock)
 
 latest_center_depth = None  # nearest detection bbox median, metres
-latest_imu = None  # pitch, yaw, roll
+latest_imu = None  # roll, pitch, yaw
 latest_timestamp = None  # ms
 latest_data_id = 0
 data_lock = threading.Lock()
@@ -19,5 +19,5 @@ IMU_SHM_NAME = "ZED_IMU"
 CALIB_SHM_NAME = "ZED_CALIB"
 
 META_SHAPE = (2,)  # frame_id, image timestamp in ms
-IMU_SHAPE = (3,)  # pitch, yaw, roll
+IMU_SHAPE = (3,)  # roll, pitch, yaw
 CALIB_SHAPE = (2,)  # fx, cx

@@ -1687,6 +1687,7 @@ class OrangeCubeBridgeNode(Node):
             self.ground_speed_m_s,
             self.roll,
             self.pitch,
+            self.yaw,
             self.heading_deg,
         )
         if link_ready and all(
@@ -1701,6 +1702,7 @@ class OrangeCubeBridgeNode(Node):
                     "ground_speed_m_s": float(self.ground_speed_m_s),
                     "roll_deg": math.degrees(float(self.roll)),
                     "pitch_deg": math.degrees(float(self.pitch)),
+                    "yaw_deg": math.degrees(float(self.yaw)) % 360.0,
                     "heading_deg": float(self.heading_deg) % 360.0,
                     "speed_setpoint_m_s": float(self.speed_setpoint_m_s),
                     "heading_setpoint_deg": (

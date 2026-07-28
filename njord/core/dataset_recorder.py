@@ -28,6 +28,69 @@ METADATA_FIELDS = (
     "depth_file",
 )
 
+FRAME_METADATA_FIELDS = (
+    "frame_id",
+    "camera_timestamp_ms",
+    "system_timestamp_utc",
+    "left_file",
+    "right_file",
+    "depth_file",
+)
+
+IMU_FIELDS = (
+    "system_timestamp_utc",
+    "source",
+    "ros_timestamp_ns",
+    "frame_id",
+    "camera_timestamp_ms",
+    "roll_rad",
+    "pitch_rad",
+    "yaw_rad",
+    "orientation_x",
+    "orientation_y",
+    "orientation_z",
+    "orientation_w",
+    "angular_velocity_x_rad_s",
+    "angular_velocity_y_rad_s",
+    "angular_velocity_z_rad_s",
+    "linear_acceleration_x_m_s2",
+    "linear_acceleration_y_m_s2",
+    "linear_acceleration_z_m_s2",
+)
+
+GPS_FIELDS = (
+    "system_timestamp_utc",
+    "ros_timestamp_ns",
+    "frame_id",
+    "camera_timestamp_ms",
+    "latitude_deg",
+    "longitude_deg",
+    "altitude_m",
+    "position_covariance_type",
+)
+
+KINEMATICS_FIELDS = (
+    "system_timestamp_utc",
+    "camera_timestamp_ms",
+    "frame_id",
+    "detected",
+    "track_id",
+    "latitude_deg",
+    "longitude_deg",
+    "heading_deg",
+    "distance_m",
+    "bearing_deg",
+    "relative_course_deg",
+    "relative_speed_mps",
+    "true_course_deg",
+    "true_speed_mps",
+    "closing_rate_mps",
+    "tcpa_sec",
+    "dcpa_m",
+    "collision_risk",
+    "collision_reason",
+)
+
 
 class DatasetRecorderError(RuntimeError):
     """Raised when the asynchronous dataset writer cannot persist a frame."""
@@ -152,6 +215,7 @@ class DatasetRecorder:
         manifest_interval_frames: int = 30,
         image_writer: Optional[ImageWriter] = None,
         depth_writer: Optional[DepthWriter] = None,
+        separate_imu: bool = False,
     ):
         if not 1 <= int(jpeg_quality) <= 100:
             raise ValueError("jpeg_quality must be in the range [1, 100]")
@@ -176,7 +240,11 @@ class DatasetRecorder:
         self.left_dir = self.run_dir / "left"
         self.right_dir = self.run_dir / "right"
         self.depth_dir = self.run_dir / "depth"
-        self.metadata_path = self.run_dir / "metadata.csv"
+        self.separate_imu = bool(separate_imu)
+        self.metadata_path = self.run_dir / (
+            "frames.csv" if self.separate_imu else "metadata.csv"
+        )
+        self.imu_path = self.run_dir / "imu.csv" if self.separate_imu else None
         self.manifest_path = self.run_dir / "manifest.json"
         self.calibration_path = self.run_dir / "calibration.yaml"
         self.record_right = bool(record_right)
@@ -209,10 +277,28 @@ class DatasetRecorder:
         )
         self._metadata_writer = csv.DictWriter(
             self._metadata_file,
-            fieldnames=METADATA_FIELDS,
+            fieldnames=(
+                FRAME_METADATA_FIELDS if self.separate_imu else METADATA_FIELDS
+            ),
         )
         self._metadata_writer.writeheader()
         self._metadata_file.flush()
+        self._imu_lock = threading.RLock()
+        self._imu_file = None
+        self._imu_writer = None
+        if self.imu_path is not None:
+            self._imu_file = self.imu_path.open(
+                "x",
+                newline="",
+                encoding="utf-8",
+                buffering=1,
+            )
+            self._imu_writer = csv.DictWriter(
+                self._imu_file,
+                fieldnames=IMU_FIELDS,
+            )
+            self._imu_writer.writeheader()
+            self._imu_file.flush()
 
         self._queue: queue.Queue[FramePacket | object] = queue.Queue(
             maxsize=int(queue_size)
@@ -248,6 +334,7 @@ class DatasetRecorder:
             "queue_size": int(queue_size),
             "manifest_interval_frames": self.manifest_interval_frames,
             "metadata_file": self.metadata_path.name,
+            "imu_file": self.imu_path.name if self.imu_path is not None else None,
             "calibration_file": self.calibration_path.name,
             "left_directory": self.left_dir.name,
             "right_directory": self.right_dir.name if self.record_right else None,
@@ -434,22 +521,39 @@ class DatasetRecorder:
             self._depth_writer(depth_path, packet.depth_map)
             created_paths.append(depth_path)
 
-            self._metadata_writer.writerow(
-                {
-                    "frame_id": packet.frame_id,
-                    "camera_timestamp_ms": packet.camera_timestamp_ms,
-                    "system_timestamp_utc": packet.system_timestamp_utc,
-                    "roll_rad": f"{packet.roll:.9f}",
-                    "pitch_rad": f"{packet.pitch:.9f}",
-                    "yaw_rad": f"{packet.yaw:.9f}",
-                    "left_file": left_path.relative_to(self.run_dir).as_posix(),
-                    "right_file": ""
-                    if right_path is None
-                    else right_path.relative_to(self.run_dir).as_posix(),
-                    "depth_file": depth_path.relative_to(self.run_dir).as_posix(),
-                }
-            )
+            metadata_row = {
+                "frame_id": packet.frame_id,
+                "camera_timestamp_ms": packet.camera_timestamp_ms,
+                "system_timestamp_utc": packet.system_timestamp_utc,
+                "left_file": left_path.relative_to(self.run_dir).as_posix(),
+                "right_file": ""
+                if right_path is None
+                else right_path.relative_to(self.run_dir).as_posix(),
+                "depth_file": depth_path.relative_to(self.run_dir).as_posix(),
+            }
+            if not self.separate_imu:
+                metadata_row.update(
+                    {
+                        "roll_rad": f"{packet.roll:.9f}",
+                        "pitch_rad": f"{packet.pitch:.9f}",
+                        "yaw_rad": f"{packet.yaw:.9f}",
+                    }
+                )
+            self._metadata_writer.writerow(metadata_row)
             self._metadata_file.flush()
+            if self.separate_imu:
+                self._write_imu_row(
+                    {
+                        "system_timestamp_utc": packet.system_timestamp_utc,
+                        "source": "zed",
+                        "ros_timestamp_ns": "",
+                        "frame_id": packet.frame_id,
+                        "camera_timestamp_ms": packet.camera_timestamp_ms,
+                        "roll_rad": f"{packet.roll:.9f}",
+                        "pitch_rad": f"{packet.pitch:.9f}",
+                        "yaw_rad": f"{packet.yaw:.9f}",
+                    }
+                )
         except Exception:
             for created_path in created_paths:
                 try:
@@ -457,6 +561,98 @@ class DatasetRecorder:
                 except FileNotFoundError:
                     pass
             raise
+
+    @staticmethod
+    def _optional_float(value, digits=9):
+        if value is None or value == "":
+            return ""
+        number = float(value)
+        if not math.isfinite(number):
+            return ""
+        return f"{number:.{digits}f}"
+
+    def _write_imu_row(self, values: Mapping[str, Any]) -> None:
+        if self._imu_writer is None or self._imu_file is None:
+            raise RuntimeError("separate IMU recording is not enabled")
+        row = {field: "" for field in IMU_FIELDS}
+        row.update({key: value for key, value in values.items() if key in row})
+        with self._imu_lock:
+            if self._imu_file.closed:
+                raise RuntimeError("IMU recorder is closed")
+            self._imu_writer.writerow(row)
+            self._imu_file.flush()
+
+    def record_imu_sample(
+        self,
+        *,
+        source: str,
+        system_timestamp_utc: Optional[str] = None,
+        ros_timestamp_ns: Optional[int] = None,
+        frame_id: Optional[int] = None,
+        camera_timestamp_ms: Optional[int] = None,
+        roll_rad: Optional[float] = None,
+        pitch_rad: Optional[float] = None,
+        yaw_rad: Optional[float] = None,
+        orientation_x: Optional[float] = None,
+        orientation_y: Optional[float] = None,
+        orientation_z: Optional[float] = None,
+        orientation_w: Optional[float] = None,
+        angular_velocity_x_rad_s: Optional[float] = None,
+        angular_velocity_y_rad_s: Optional[float] = None,
+        angular_velocity_z_rad_s: Optional[float] = None,
+        linear_acceleration_x_m_s2: Optional[float] = None,
+        linear_acceleration_y_m_s2: Optional[float] = None,
+        linear_acceleration_z_m_s2: Optional[float] = None,
+    ) -> None:
+        """Append an external IMU sample to ``imu.csv``.
+
+        Camera-aligned ZED orientation samples are written automatically by
+        ``record_frame``. This method is used for the independent Pixhawk IMU
+        stream while a manual live collection is active.
+        """
+
+        with self._state_lock:
+            if self._closed or self._shutdown_started:
+                raise RuntimeError("DatasetRecorder is closed")
+
+        self._write_imu_row(
+            {
+                "system_timestamp_utc": system_timestamp_utc or _utc_now_iso(),
+                "source": str(source),
+                "ros_timestamp_ns": ""
+                if ros_timestamp_ns is None
+                else int(ros_timestamp_ns),
+                "frame_id": "" if frame_id is None else int(frame_id),
+                "camera_timestamp_ms": ""
+                if camera_timestamp_ms is None
+                else int(camera_timestamp_ms),
+                "roll_rad": self._optional_float(roll_rad),
+                "pitch_rad": self._optional_float(pitch_rad),
+                "yaw_rad": self._optional_float(yaw_rad),
+                "orientation_x": self._optional_float(orientation_x),
+                "orientation_y": self._optional_float(orientation_y),
+                "orientation_z": self._optional_float(orientation_z),
+                "orientation_w": self._optional_float(orientation_w),
+                "angular_velocity_x_rad_s": self._optional_float(
+                    angular_velocity_x_rad_s
+                ),
+                "angular_velocity_y_rad_s": self._optional_float(
+                    angular_velocity_y_rad_s
+                ),
+                "angular_velocity_z_rad_s": self._optional_float(
+                    angular_velocity_z_rad_s
+                ),
+                "linear_acceleration_x_m_s2": self._optional_float(
+                    linear_acceleration_x_m_s2
+                ),
+                "linear_acceleration_y_m_s2": self._optional_float(
+                    linear_acceleration_y_m_s2
+                ),
+                "linear_acceleration_z_m_s2": self._optional_float(
+                    linear_acceleration_z_m_s2
+                ),
+            }
+        )
 
     def _snapshot_manifest(
         self,
@@ -517,6 +713,16 @@ class DatasetRecorder:
             self._metadata_file.close()
         except Exception as exc:  # noqa: BLE001 - persisted and surfaced by close
             cleanup_errors.append(f"metadata close: {exc}")
+        if self._imu_file is not None:
+            with self._imu_lock:
+                try:
+                    self._imu_file.flush()
+                except Exception as exc:  # noqa: BLE001 - surfaced by close
+                    cleanup_errors.append(f"IMU flush: {exc}")
+                try:
+                    self._imu_file.close()
+                except Exception as exc:  # noqa: BLE001 - surfaced by close
+                    cleanup_errors.append(f"IMU close: {exc}")
 
         if cleanup_errors:
             with self._state_lock:
@@ -581,3 +787,152 @@ class DatasetRecorder:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
+
+
+class Task2TestRecorder(DatasetRecorder):
+    """Manual Njord test recorder with separate sensor and kinematics files."""
+
+    def __init__(
+        self,
+        output_root: os.PathLike[str] | str,
+        *,
+        run_name: Optional[str] = None,
+        calibration: Optional[Mapping[str, Any]] = None,
+        jpeg_quality: int = 90,
+        queue_size: int = 64,
+    ):
+        super().__init__(
+            output_root,
+            run_name=run_name,
+            calibration=calibration,
+            record_right=False,
+            jpeg_quality=jpeg_quality,
+            queue_size=queue_size,
+            separate_imu=True,
+        )
+        self.gps_path = self.run_dir / "gps.csv"
+        self.kinematics_path = self.run_dir / "kinematics.csv"
+        self._sidecar_lock = threading.RLock()
+        self._sidecars_closed = False
+        self._gps_file = None
+        self._gps_writer = None
+        self._kinematics_file = None
+        self._kinematics_writer = None
+        try:
+            self._gps_file = self.gps_path.open(
+                "x",
+                newline="",
+                encoding="utf-8",
+                buffering=1,
+            )
+            self._gps_writer = csv.DictWriter(
+                self._gps_file,
+                fieldnames=GPS_FIELDS,
+            )
+            self._gps_writer.writeheader()
+            self._gps_file.flush()
+
+            self._kinematics_file = self.kinematics_path.open(
+                "x",
+                newline="",
+                encoding="utf-8",
+                buffering=1,
+            )
+            self._kinematics_writer = csv.DictWriter(
+                self._kinematics_file,
+                fieldnames=KINEMATICS_FIELDS,
+            )
+            self._kinematics_writer.writeheader()
+            self._kinematics_file.flush()
+        except Exception:
+            for output_file in (self._gps_file, self._kinematics_file):
+                if output_file is not None:
+                    output_file.close()
+            super().close()
+            raise
+
+        self._manifest.update(
+            {
+                "recording_profile": "njord_task2_manual_test",
+                "gps_file": self.gps_path.name,
+                "kinematics_file": self.kinematics_path.name,
+            }
+        )
+        self._write_manifest("recording")
+
+    def _ensure_sidecars_open(self) -> None:
+        if self._sidecars_closed:
+            raise RuntimeError("Task2TestRecorder is closed")
+
+    def record_gps(
+        self,
+        *,
+        latitude_deg: float,
+        longitude_deg: float,
+        altitude_m: float,
+        ros_timestamp_ns: Optional[int] = None,
+        frame_id: Optional[int] = None,
+        camera_timestamp_ms: Optional[int] = None,
+        position_covariance_type: Optional[int] = None,
+        system_timestamp_utc: Optional[str] = None,
+    ) -> None:
+        row = {
+            "system_timestamp_utc": system_timestamp_utc or _utc_now_iso(),
+            "ros_timestamp_ns": ""
+            if ros_timestamp_ns is None
+            else int(ros_timestamp_ns),
+            "frame_id": "" if frame_id is None else int(frame_id),
+            "camera_timestamp_ms": ""
+            if camera_timestamp_ms is None
+            else int(camera_timestamp_ms),
+            "latitude_deg": self._optional_float(latitude_deg),
+            "longitude_deg": self._optional_float(longitude_deg),
+            "altitude_m": self._optional_float(altitude_m),
+            "position_covariance_type": ""
+            if position_covariance_type is None
+            else int(position_covariance_type),
+        }
+        with self._sidecar_lock:
+            self._ensure_sidecars_open()
+            self._gps_writer.writerow(row)
+            self._gps_file.flush()
+
+    def record_kinematics(self, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping):
+            raise TypeError("kinematics payload must be a mapping")
+        row = {field: "" for field in KINEMATICS_FIELDS}
+        row.update(
+            {
+                key: value
+                for key, value in payload.items()
+                if key in KINEMATICS_FIELDS and value is not None
+            }
+        )
+        row["system_timestamp_utc"] = (
+            row["system_timestamp_utc"] or _utc_now_iso()
+        )
+        with self._sidecar_lock:
+            self._ensure_sidecars_open()
+            self._kinematics_writer.writerow(row)
+            self._kinematics_file.flush()
+
+    def _close_sidecars(self) -> None:
+        with self._sidecar_lock:
+            if self._sidecars_closed:
+                return
+            self._sidecars_closed = True
+            for output_file in (self._gps_file, self._kinematics_file):
+                if output_file is not None:
+                    output_file.flush()
+                    output_file.close()
+
+    def close(self, timeout: float = 30.0) -> None:
+        failure = None
+        try:
+            super().close(timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - close sidecars before surfacing
+            failure = exc
+        finally:
+            self._close_sidecars()
+        if failure is not None:
+            raise failure

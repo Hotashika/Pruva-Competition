@@ -18,6 +18,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from teknofest.missions.utils.mission_data_recorder import MissionDataRecorder
 from utils.mavlink_utilities import (
     calculate_gps_distance,
     call_set_mode,
@@ -1026,11 +1027,21 @@ class Task3Node(Node):
             self.publish_active_task,
         )
         self.publish_active_task()
+        self.data_recorder = MissionDataRecorder(self, ACTIVE_TASK_NAME)
 
     def publish_active_task(self):
         message = String()
         message.data = ACTIVE_TASK_NAME
         self.active_task_pub.publish(message)
+
+    def wait_for_complete_telemetry(self, timeout_sec=10.0):
+        return self.data_recorder.wait_for_complete_telemetry(timeout_sec)
+
+    def start_telemetry_recording(self):
+        self.data_recorder.start()
+
+    def stop_telemetry_recording(self):
+        self.data_recorder.stop()
 
     def gps_callback(self, msg):
         self.task.update_gps(msg.latitude, msg.longitude)
@@ -1099,6 +1110,12 @@ def main(args=None):
     node = Task3Node()
 
     try:
+        if not node.wait_for_complete_telemetry(timeout_sec=30.0):
+            node.get_logger().error(
+                "Roll/pitch/yaw ve araç telemetrisi hazır değil; Task 3 başlatılmadı."
+            )
+            return
+
         if not node.wait_for_vision(timeout_sec=30.0):
             node.get_logger().error("Vision hazır değil; Task 3 başlatılmadı.")
             return
@@ -1127,6 +1144,11 @@ def main(args=None):
             )
             return
 
+        try:
+            node.start_telemetry_recording()
+        except (OSError, RuntimeError, ValueError) as exc:
+            node.get_logger().error(f"Görev veri kaydı başlatılamadı: {exc}")
+            return
         node.mission_active = True
         node.get_logger().info("Task 3 kontrol döngüsü başladı.")
         while (
@@ -1146,6 +1168,7 @@ def main(args=None):
         node.get_logger().info("Task 3 kullanıcı tarafından durduruldu.")
     finally:
         node.mission_active = False
+        node.stop_telemetry_recording()
         stop_vehicle(node.mission_topics.cmd_vel_pub)
         call_trigger_service(
             node,

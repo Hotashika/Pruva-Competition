@@ -219,7 +219,7 @@ def test_finished_task3_finishes_competition(monkeypatch):
     assert active_task_updates == ["finished"]
     assert telemetry_stops == [True]
     assert logs == [
-        "Task 3 tamamlandı; yarışma zinciri ve telemetri kaydı sonlandırıldı."
+        "Task 3 tamamlandı; yarışma zinciri ve veri kaydı sonlandırıldı."
     ]
 
 

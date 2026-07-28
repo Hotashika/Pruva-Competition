@@ -44,6 +44,7 @@ WAYPOINT_PATH = WAYPOINT_DIRECTORY / "njord_task2.waypoints"
 KINEMATICS_OUTPUT_DIR = (
     Path(__file__).resolve().parents[1] / "logs" / "task2_vessel_kinematics"
 )
+KINEMATICS_TOPIC = "/task2/kinematics"
 ACTIVE_TASK_NAME = "task2"
 HOLD_MODE_NAME = "HOLD"
 
@@ -273,6 +274,58 @@ class VesselKinematicsCsvRecorder:
         self._file.flush()
         self._file.close()
         self._closed = True
+
+
+def build_kinematics_payload(
+    observation,
+    kinematics,
+    assessment,
+    *,
+    frame_id=None,
+    camera_timestamp_ms=None,
+    latitude_deg=None,
+    longitude_deg=None,
+    heading_deg=None,
+):
+    """Build the live Task 2 kinematics sample used by manual test recorders."""
+
+    detected = observation is not None
+    if detected:
+        frame_id = observation.frame_id
+        camera_timestamp_ms = observation.camera_timestamp_ms
+        latitude_deg = observation.latitude
+        longitude_deg = observation.longitude
+        heading_deg = observation.heading_deg
+
+    return {
+        "system_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "camera_timestamp_ms": camera_timestamp_ms,
+        "frame_id": frame_id,
+        "detected": int(detected),
+        "track_id": None if observation is None else observation.track_id,
+        "latitude_deg": latitude_deg,
+        "longitude_deg": longitude_deg,
+        "heading_deg": heading_deg,
+        "distance_m": None if observation is None else observation.distance_m,
+        "bearing_deg": None if observation is None else observation.angle_deg,
+        "relative_course_deg": (
+            None if kinematics is None else kinematics.relative_course_deg
+        ),
+        "relative_speed_mps": (
+            None if kinematics is None else kinematics.relative_speed_mps
+        ),
+        "true_course_deg": (
+            None if kinematics is None else kinematics.true_course_deg
+        ),
+        "true_speed_mps": (
+            None if kinematics is None else kinematics.true_speed_mps
+        ),
+        "closing_rate_mps": assessment.closing_rate_mps,
+        "tcpa_sec": assessment.tcpa_sec,
+        "dcpa_m": assessment.dcpa_m,
+        "collision_risk": int(assessment.risk),
+        "collision_reason": assessment.reason,
+    }
 
 
 def load_task2_waypoints(path=WAYPOINT_PATH):
@@ -1127,6 +1180,11 @@ class Task2Node(Node):
             10,
         )
         self.active_task_pub = self.create_publisher(String, "/mission/active_task", 10)
+        self.kinematics_pub = self.create_publisher(
+            String,
+            KINEMATICS_TOPIC,
+            10,
+        )
         self.decision_pub = self.create_publisher(String, DECISION_TOPIC, 10)
 
         waypoints = load_task2_waypoints()
@@ -1139,6 +1197,7 @@ class Task2Node(Node):
             self.mission_clients,
             waypoints,
         )
+        self.task.kinematics_callback = self._record_kinematics
 
         self.control_timer = self.create_timer(0.1, self.timer_callback)
         self.active_task_timer = self.create_timer(1.0, self.publish_active_task)
@@ -1225,6 +1284,25 @@ class Task2Node(Node):
         frame_id,
         camera_timestamp_ms,
     ):
+        payload = build_kinematics_payload(
+            observation,
+            kinematics,
+            assessment,
+            frame_id=frame_id,
+            camera_timestamp_ms=camera_timestamp_ms,
+            latitude_deg=self.task.current_lat,
+            longitude_deg=self.task.current_lon,
+            heading_deg=self.task.current_heading,
+        )
+        message = String()
+        message.data = json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        self.kinematics_pub.publish(message)
+
         if self.kinematics_recorder is None:
             return
         try:
@@ -1244,7 +1322,6 @@ class Task2Node(Node):
             except Exception:
                 pass
             self.kinematics_recorder = None
-            self.task.kinematics_callback = None
 
     def gps_callback(self, message):
         if abs(message.latitude) < MIN_VALID_ABS_COORD and abs(message.longitude) < MIN_VALID_ABS_COORD:
@@ -1439,7 +1516,6 @@ def main(args=None):
             )
             return
 
-        node.start_kinematics_recording()
         node.mission_active = True
         node.task.state = MissionState.NAVIGATING
         node.publish_active_task()

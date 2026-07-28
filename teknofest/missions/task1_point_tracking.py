@@ -18,6 +18,7 @@ from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String
 
 from teknofest.config.mission_config import WAYPOINT_DIRECTORY
+from teknofest.missions.utils.mission_data_recorder import MissionDataRecorder
 # Yardımcı fonksiyonlar (Kendi yazdıklarımız ve mavlink_utilities içindekiler)
 from utils.mavlink_utilities import (
     align_heading_to_gps_target,
@@ -389,7 +390,7 @@ class Task1Maneuvering:
 # ROS 2 NODE (GÖREV YÖNETİCİSİ)
 # ============================================================
 class Task1Node(Node):
-    def __init__(self):
+    def __init__(self, recording_session_name="task1"):
         super().__init__('task1_mission_node')
         self.get_logger().info("Task 1 (Maneuvering) Node Starting...")
 
@@ -442,6 +443,11 @@ class Task1Node(Node):
         )
         self.active_task_timer = self.create_timer(1.0, self._publish_active_task)
         self._publish_active_task()
+
+        self.data_recorder = MissionDataRecorder(
+            self,
+            recording_session_name,
+        )
 
         # 4. Ana Kontrol Döngüsünü Başlat (Saniyede 10 kez çalışır: 0.1 sn)
         self.control_timer = self.create_timer(0.1, self.timer_callback)
@@ -496,6 +502,15 @@ class Task1Node(Node):
         msg = String()
         msg.data = "task1"
         self.active_task_pub.publish(msg)
+
+    def wait_for_complete_telemetry(self, timeout_sec=10.0):
+        return self.data_recorder.wait_for_complete_telemetry(timeout_sec)
+
+    def start_telemetry_recording(self):
+        self.data_recorder.start()
+
+    def stop_telemetry_recording(self):
+        self.data_recorder.stop()
 
     @staticmethod
     def _parse_detections_payload(payload):
@@ -638,6 +653,12 @@ def main(args=None):
             node.get_logger().error("Geçerli GPS/heading verisi yok! Mission not starting.")
             return
 
+        if not node.wait_for_complete_telemetry(timeout_sec=10.0):
+            node.get_logger().error(
+                "Roll/pitch/yaw ve araç telemetrisi hazır değil! Mission not starting."
+            )
+            return
+
         if not node.wait_for_vision(timeout_sec=30.0):
             node.get_logger().error("Vision hazır değil! Mission not starting.")
             return
@@ -658,6 +679,17 @@ def main(args=None):
             node.get_logger().error("GUIDED/ARM heartbeat teyit edilemedi! Mission not starting.")
             return
 
+        try:
+            node.start_telemetry_recording()
+        except (OSError, RuntimeError, ValueError) as exc:
+            node.get_logger().error(f"Görev veri kaydı başlatılamadı: {exc}")
+            stop_vehicle(node.mission_topics.cmd_vel_pub)
+            call_trigger_service(
+                node,
+                node.mission_clients.disarm_client,
+                "DISARM",
+            )
+            return
         node.mission_active = True
         node.get_logger().info("Mission loop started.")
 
@@ -665,6 +697,7 @@ def main(args=None):
             rclpy.spin_once(node, timeout_sec=0.1)
 
         node.mission_active = False
+        node.stop_telemetry_recording()
         if node.task.state == MissionState.FAILSAFE:
             node.get_logger().error("Mission terminated due to FAILSAFE.")
         else:
@@ -678,6 +711,7 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("Mission terminated manually.")
         node.mission_active = False
+        node.stop_telemetry_recording()
         stop_vehicle(node.mission_topics.cmd_vel_pub)
         try:
             call_trigger_service(node, node.mission_clients.disarm_client, "DISARM")
@@ -685,6 +719,7 @@ def main(args=None):
             pass
 
     finally:
+        node.stop_telemetry_recording()
         node.destroy_node()
         rclpy.shutdown()
 
