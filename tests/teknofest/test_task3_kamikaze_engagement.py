@@ -69,6 +69,26 @@ def _gps_distance_m(lat1, lon1, lat2, lon2):
     return math.hypot(north_m, east_m)
 
 
+def test_target_classes_annotation_is_python38_compatible():
+    source = TASK3_PATH.read_text(encoding="utf-8")
+
+    assert "target_classes: Tuple[str, ...]" in source
+    assert "target_classes: tuple[" not in source
+
+
+def test_task3_node_initializes_mission_data_recorder():
+    source = TASK3_PATH.read_text(encoding="utf-8")
+
+    assert (
+        "from teknofest.missions.utils.mission_data_recorder "
+        "import MissionDataRecorder"
+    ) in source
+    assert (
+        "self.data_recorder = MissionDataRecorder(self, ACTIVE_TASK_NAME)"
+        in source
+    )
+
+
 def _logger():
     sink = lambda *args, **kwargs: None
     return types.SimpleNamespace(
@@ -142,9 +162,12 @@ def _acquire_and_reach_final_confirm(mission, task3_module, now):
     now += 0.05
     mission.update(far_target, now=now)
     assert mission.state is task3_module.MissionState.APPROACH
-    now += 0.05
-    mission.update([_target(distance=1.2)], now=now)
+
+    for _ in range(mission.config.approach_distance_required):
+        now += 0.05
+        mission.update([_target(distance=1.2)], now=now)
     assert mission.state is task3_module.MissionState.FINAL_CONFIRM
+
     now += 0.05
     mission.update([_target(distance=1.2)], now=now)
     now += 0.05
@@ -154,7 +177,6 @@ def _acquire_and_reach_final_confirm(mission, task3_module, now):
 
 
 def _complete_one_impact(mission, task3_module, now):
-    mission.update([], now=now)
     assert mission.state is task3_module.MissionState.RAM
     now += mission.config.ram_duration_sec + 0.01
     mission.update([], now=now)
@@ -374,6 +396,105 @@ def test_front_target_stops_immediately_then_approaches_forward(task3_module):
     assert commands[-1][1] == pytest.approx(0.0)
 
 
+def test_single_close_sample_does_not_end_approach(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    mission = _mission(task3_module)
+    target = [_target(distance=2.5)]
+
+    mission.update(target, now=0.1)
+    mission.update(target, now=0.2)
+    mission.update(target, now=0.3)
+    assert mission.state is task3_module.MissionState.APPROACH
+
+    mission.update([_target(distance=1.2)], now=0.4)
+
+    assert mission.state is task3_module.MissionState.APPROACH
+    assert list(mission.distance_history) == [pytest.approx(1.2)]
+    assert commands[-1][0] > 0.0
+
+
+def test_approach_uses_seven_sample_median_before_final_confirm(task3_module):
+    mission = _mission(task3_module)
+    target = [_target(distance=2.5)]
+
+    mission.update(target, now=0.1)
+    mission.update(target, now=0.2)
+    mission.update(target, now=0.3)
+    assert mission.state is task3_module.MissionState.APPROACH
+
+    approach_distances = (2.5, 2.3, 1.0, 2.1, 1.9, 1.3, 1.2)
+    for index, distance in enumerate(approach_distances, start=4):
+        mission.update(
+            [_target(distance=distance)],
+            now=index / 10.0,
+        )
+
+    assert mission.state is task3_module.MissionState.APPROACH
+    assert mission._median(mission.distance_history) == pytest.approx(1.9)
+
+    mission.update([_target(distance=1.1)], now=1.1)
+    assert mission.state is task3_module.MissionState.FINAL_CONFIRM
+    assert mission._median(mission.distance_history) == pytest.approx(1.3)
+
+
+def test_approach_keeps_forward_motion_for_moderate_angle_error(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    mission = _mission(task3_module)
+    target = [_target(distance=2.5)]
+
+    mission.update(target, now=0.1)
+    mission.update(target, now=0.2)
+    mission.update(target, now=0.3)
+    assert mission.state is task3_module.MissionState.APPROACH
+
+    mission.update([_target(distance=3.0, angle=20.0)], now=0.4)
+
+    assert mission.state is task3_module.MissionState.APPROACH
+    assert commands[-1][0] == pytest.approx(
+        mission.config.medium_approach_speed
+    )
+    assert commands[-1][1] > 0.0
+
+
+def test_final_confirmation_keeps_advancing_and_starts_ram_immediately(
+        task3_module,
+):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    mission = _mission(task3_module)
+    now = 0.1
+
+    mission.update([_target(distance=2.5)], now=now)
+    mission.update([_target(distance=2.5)], now=now + 0.1)
+    mission.update([_target(distance=2.5)], now=now + 0.2)
+    for offset in range(mission.config.approach_distance_required):
+        mission.update(
+            [_target(distance=1.2)],
+            now=now + 0.3 + offset * 0.1,
+        )
+    assert mission.state is task3_module.MissionState.FINAL_CONFIRM
+
+    mission.update([_target(distance=1.2)], now=now + 0.9)
+    assert commands[-1][0] == pytest.approx(
+        mission.config.final_confirm_forward_speed
+    )
+
+    mission.update([_target(distance=1.2)], now=now + 1.0)
+    assert mission.state is task3_module.MissionState.RAM
+    assert commands[-1] == pytest.approx((mission.config.ram_speed, 0.0))
+
+
 def test_lost_target_stops_and_enters_reacquire(task3_module):
     commands = []
     task3_module.publish_cmd_vel = (
@@ -526,38 +647,53 @@ def test_final_confirmation_rejects_unstable_distance(task3_module):
     mission.update([_target(distance=2.5)], now=now)
     mission.update([_target(distance=2.5)], now=now + 0.05)
     mission.update([_target(distance=2.5)], now=now + 0.10)
-    mission.update([_target(distance=1.2)], now=now + 0.15)
+    for offset in range(mission.config.approach_distance_required):
+        mission.update(
+            [_target(distance=1.2)],
+            now=now + 0.15 + offset * 0.05,
+        )
     assert mission.state is task3_module.MissionState.FINAL_CONFIRM
 
-    mission.update([_target(distance=1.2)], now=now + 0.20)
-    mission.update([_target(distance=1.5)], now=now + 0.25)
+    mission.update([_target(distance=1.2)], now=now + 0.45)
+    mission.update([_target(distance=1.5)], now=now + 0.50)
 
     assert mission.state is task3_module.MissionState.FINAL_CONFIRM
     assert mission.impact_count == 0
 
 
-def test_production_defaults_require_three_frames_and_three_impacts(task3_module):
+def test_production_defaults_use_aggressive_approach_and_three_impacts(
+        task3_module,
+):
     defaults = task3_module.Task3Config()
-    assert defaults.final_confirmation_required == 3
+    assert defaults.approach_distance_window_size == 7
+    assert defaults.approach_distance_required == 5
+    assert defaults.realign_threshold_deg == pytest.approx(30.0)
+    assert defaults.far_approach_speed == pytest.approx(0.70)
+    assert defaults.medium_approach_speed == pytest.approx(0.55)
+    assert defaults.near_approach_speed == pytest.approx(0.40)
+    assert defaults.final_confirmation_required == 2
+    assert defaults.final_confirm_forward_speed == pytest.approx(0.35)
+    assert defaults.ram_speed == pytest.approx(0.85)
+    assert defaults.ram_duration_sec == pytest.approx(2.0)
     assert defaults.required_impact_count == 3
 
     mission = _mission(
         task3_module,
-        final_confirmation_required=3,
+        final_confirmation_required=2,
     )
     far_target = [_target(distance=2.5)]
     near_target = [_target(distance=1.2)]
     mission.update(far_target, now=0.1)
     mission.update(far_target, now=0.2)
     mission.update(far_target, now=0.3)
-    mission.update(near_target, now=0.4)
+    for index in range(mission.config.approach_distance_required):
+        mission.update(near_target, now=0.4 + index * 0.1)
     assert mission.state is task3_module.MissionState.FINAL_CONFIRM
 
-    mission.update(near_target, now=0.5)
-    mission.update(near_target, now=0.6)
+    mission.update(near_target, now=1.0)
     assert mission.state is task3_module.MissionState.FINAL_CONFIRM
 
-    mission.update(near_target, now=0.7)
+    mission.update(near_target, now=1.1)
     assert mission.state is task3_module.MissionState.RAM
 
 

@@ -297,7 +297,10 @@ class VisionNode(Node):
                 detection.setdefault("type", name)
             all_detections.extend(detections)
 
-        if self.current_task == self.profile.QR_TASK:
+        if (
+                self.qr_pub is not None
+                and self.current_task == self.profile.QR_TASK
+        ):
             best_ar = self._best_ar_detection(
                 [
                     item

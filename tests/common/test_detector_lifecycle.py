@@ -209,6 +209,17 @@ class CompetitionProfileContractTests(unittest.TestCase):
         self.assertIn("self.detector_registry.active_items()", source)
         self.assertNotIn("del self.detectors[name]", source)
 
+    def test_vision_node_requires_qr_publisher_before_running_qr_pipeline(self):
+        source = (
+            REPOSITORY_ROOT / "vision" / "vision_node.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "self.qr_pub is not None\n"
+            "                and self.current_task == self.profile.QR_TASK",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

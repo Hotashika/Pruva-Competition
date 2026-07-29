@@ -207,6 +207,22 @@ def test_angle_and_depth_change_dynamic_command(task1_module):
     assert left["angular_z"] < right["angular_z"]
 
 
+def test_dynamic_avoidance_uses_reduced_linear_speed_range(task1_module):
+    mission = _mission_without_ros(task1_module)
+
+    maximum_speed = mission._calculate_avoidance_command(
+        _detection("red_buoys", distance=4.0, angle=0.0)
+    )
+    minimum_speed = mission._calculate_avoidance_command(
+        _detection("red_buoys", distance=1.6, angle=45.0)
+    )
+
+    assert task1_module.AVOIDANCE_MIN_LINEAR_SPEED == pytest.approx(0.15)
+    assert task1_module.AVOIDANCE_MAX_LINEAR_SPEED == pytest.approx(0.4)
+    assert 0.15 <= maximum_speed["linear_x"] <= 0.4
+    assert minimum_speed["linear_x"] == pytest.approx(0.15)
+
+
 def test_emergency_distance_stops_forward_motion_and_clamps_turn(task1_module):
     mission = _mission_without_ros(task1_module)
 

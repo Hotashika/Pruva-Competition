@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
+from typing import Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT_TEXT = str(REPO_ROOT)
@@ -64,7 +65,7 @@ TASK3_TARGET_BUOY_CLASSES = (
 @dataclass(frozen=True)
 class Task3Config:
     # Hedef parametreleri
-    target_classes: tuple[str, ...] = TASK3_TARGET_BUOY_CLASSES
+    target_classes: Tuple[str, ...] = TASK3_TARGET_BUOY_CLASSES
     required_impact_count: int = 3
     min_confidence: float = 0.45
 
@@ -97,18 +98,21 @@ class Task3Config:
     acquire_timeout_sec: float = 2.0
 
     # Yaklaşma / dümen parametreleri
-    align_tolerance_deg: float = 6.0
-    realign_threshold_deg: float = 12.0
-    steering_kp: float = 0.025
-    max_angular_z: float = 0.45
+    align_tolerance_deg: float = 8.0
+    realign_threshold_deg: float = 30.0
+    steering_kp: float = 0.018
+    max_angular_z: float = 0.35
     far_approach_distance_m: float = 4.0
     final_confirm_distance_m: float = 1.4
-    far_approach_speed: float = 0.55
-    medium_approach_speed: float = 0.35
-    near_approach_speed: float = 0.20
+    approach_distance_window_size: int = 7
+    approach_distance_required: int = 5
+    far_approach_speed: float = 0.70
+    medium_approach_speed: float = 0.55
+    near_approach_speed: float = 0.40
 
     # Hedef sürekliliği parametreleri
-    final_confirmation_required: int = 3
+    final_confirmation_required: int = 2
+    final_confirm_forward_speed: float = 0.35
     final_distance_spread_m: float = 0.35
     target_angle_jump_deg: float = 25.0
     target_distance_jump_ratio: float = 0.60
@@ -118,8 +122,8 @@ class Task3Config:
     reacquire_angular_z: float = 0.16
 
     # Temas / geri çekilme parametreleri
-    ram_speed: float = 0.75
-    ram_duration_sec: float = 1.6
+    ram_speed: float = 0.85
+    ram_duration_sec: float = 2.0
     contact_hold_sec: float = 0.7
     retreat_speed: float = 0.25
     retreat_min_sec: float = 0.6
@@ -133,6 +137,19 @@ class Task3Config:
         if self.confirmation_required > self.confirmation_window_size:
             raise ValueError(
                 "confirmation_required cannot exceed confirmation_window_size"
+            )
+        if self.approach_distance_window_size < 1:
+            raise ValueError(
+                "approach_distance_window_size must be at least 1"
+            )
+        if not (
+                1
+                <= self.approach_distance_required
+                <= self.approach_distance_window_size
+        ):
+            raise ValueError(
+                "approach_distance_required must be between 1 and "
+                "approach_distance_window_size"
             )
         if self.search_linear_x <= 0.0:
             raise ValueError("search_linear_x must be positive")
@@ -156,6 +173,8 @@ class Task3Config:
             raise ValueError("search_heading_tolerance_deg must be positive")
         if self.search_turn_timeout_min_sec <= 0.0:
             raise ValueError("search_turn_timeout_min_sec must be positive")
+        if self.final_confirm_forward_speed <= 0.0:
+            raise ValueError("final_confirm_forward_speed must be positive")
 
 
 class MissionState(Enum):
@@ -217,7 +236,7 @@ class Task3KamikazeEngagement:
         )
         self.confirmation_last_time = None
         self.distance_history = deque(
-            maxlen=self.config.confirmation_window_size
+            maxlen=self.config.approach_distance_window_size
         )
         self.final_confirmation_samples = deque(
             maxlen=self.config.final_confirmation_required
@@ -719,18 +738,21 @@ class Task3KamikazeEngagement:
             )
             return
 
-        if observed_distance <= self.config.final_confirm_distance_m:
-            self._stop()
+        self.distance_history.append(observed_distance)
+        distance = self._median(self.distance_history)
+        close_distance_confirmed = (
+            len(self.distance_history)
+            >= self.config.approach_distance_required
+            and distance <= self.config.final_confirm_distance_m
+        )
+        if close_distance_confirmed:
             self.final_confirmation_samples.clear()
             self._set_state(
                 MissionState.FINAL_CONFIRM,
                 now,
-                "yakın mesafe eşiğine ulaşıldı",
+                "yakın mesafe medyanı doğrulandı",
             )
             return
-
-        self.distance_history.append(target["distance"])
-        distance = self._median(self.distance_history)
 
         self._publish_motion(
             linear_x=self._approach_speed(distance),
@@ -739,7 +761,6 @@ class Task3KamikazeEngagement:
         )
 
     def _update_final_confirm(self, detections, now):
-        self._stop()
         target = self._select_target(detections)
         if self._wait_for_target_data():
             self.final_confirmation_samples.clear()
@@ -753,6 +774,7 @@ class Task3KamikazeEngagement:
         self.last_target_angle = target["angle"]
 
         if abs(observed_target["angle"]) > self.config.align_tolerance_deg:
+            self._stop()
             self.final_confirmation_samples.clear()
             self._set_state(
                 MissionState.ALIGN,
@@ -765,6 +787,7 @@ class Task3KamikazeEngagement:
                 > self.config.final_confirm_distance_m
                 + self.config.final_distance_spread_m
         ):
+            self._stop()
             self.final_confirmation_samples.clear()
             self._set_state(
                 MissionState.APPROACH,
@@ -778,6 +801,11 @@ class Task3KamikazeEngagement:
                 len(self.final_confirmation_samples)
                 < self.config.final_confirmation_required
         ):
+            self._publish_motion(
+                linear_x=self.config.final_confirm_forward_speed,
+                angular_z=self._steering_command(target["angle"]),
+                reason="moving final confirmation",
+            )
             return
 
         distances = [
@@ -795,6 +823,11 @@ class Task3KamikazeEngagement:
                 > self.config.align_tolerance_deg
         ):
             self.final_confirmation_samples.clear()
+            self._publish_motion(
+                linear_x=self.config.final_confirm_forward_speed,
+                angular_z=self._steering_command(target["angle"]),
+                reason="moving final confirmation retry",
+            )
             return
 
         self.last_target = dict(target)
@@ -804,6 +837,11 @@ class Task3KamikazeEngagement:
             MissionState.RAM,
             now,
             f"{self.impact_count + 1}. temas için son teyit tamamlandı",
+        )
+        self._publish_motion(
+            linear_x=self.config.ram_speed,
+            angular_z=0.0,
+            reason="confirmed ram start",
         )
 
     def _update_ram(self, now):
