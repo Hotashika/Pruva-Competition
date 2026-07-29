@@ -106,8 +106,8 @@ def _mission(task3_module, **config_overrides):
         "final_confirmation_required": 2,
         "ram_duration_sec": 0.2,
         "contact_hold_sec": 0.1,
-        "retreat_min_sec": 0.1,
-        "retreat_max_sec": 0.2,
+        "post_impact_forward_duration_sec": 0.2,
+        "impact_return_timeout_sec": 1.0,
         "target_lost_timeout_sec": 0.2,
         "gps_timeout_sec": 100.0,
         "heading_timeout_sec": 100.0,
@@ -697,7 +697,7 @@ def test_production_defaults_use_aggressive_approach_and_three_impacts(
     assert mission.state is task3_module.MissionState.RAM
 
 
-def test_negative_motion_is_rejected_outside_confirmed_retreat(task3_module):
+def test_negative_motion_is_always_rejected(task3_module):
     commands = []
     stopped = []
     task3_module.publish_cmd_vel = (
@@ -719,54 +719,77 @@ def test_negative_motion_is_rejected_outside_confirmed_retreat(task3_module):
     assert stopped[-1] == "cmd_vel"
 
 
-def test_confirmed_retreat_is_short_straight_and_heading_corrected(task3_module):
+def test_impact_gps_is_saved_and_vehicle_clears_forward(task3_module):
     commands = []
     task3_module.publish_cmd_vel = (
         lambda publisher, linear_x, angular_z:
         commands.append((linear_x, angular_z))
     )
-    mission = _mission(
-        task3_module,
-        retreat_min_sec=0.6,
-        retreat_max_sec=1.5,
-    )
-    mission.state = task3_module.MissionState.RETREAT
-    mission.state_started_at = 1.0
-    mission.impact_count = 1
-    mission.retreat_heading = 15.0
-    mission.current_heading = 20.0
-    commands.clear()
-
-    mission.update([], now=1.2)
-
-    assert commands[-1][0] == pytest.approx(-0.25)
-    assert commands[-1][1] == pytest.approx(math.radians(-5.0))
-
-    mission.update([], now=2.5)
-
-    assert mission.state is task3_module.MissionState.REACQUIRE
-    assert len([linear for linear, _ in commands if linear < 0.0]) == 1
-
-
-def test_retreat_heading_is_captured_when_contact_completes(task3_module):
     mission = _mission(task3_module)
     mission.state = task3_module.MissionState.RAM
     mission.state_started_at = 1.0
-    mission.current_heading = 42.0
+    mission.current_lat = 37.95126
+    mission.current_lon = 32.50091
+    commands.clear()
 
     contact_time = 1.0 + mission.config.ram_duration_sec + 0.01
     mission.update([], now=contact_time)
 
     assert mission.state is task3_module.MissionState.CONTACT_HOLD
-    assert mission.retreat_heading == pytest.approx(42.0)
-
-    mission.current_heading = 80.0
-    mission.update(
-        [],
-        now=contact_time + mission.config.contact_hold_sec + 0.01,
+    assert mission.impact_target_gps["lat"] == pytest.approx(37.95126)
+    assert mission.impact_target_gps["lon"] == pytest.approx(32.50091)
+    assert mission.impact_target_gps["recorded_at"] == pytest.approx(
+        contact_time
     )
-    assert mission.state is task3_module.MissionState.RETREAT
-    assert mission.retreat_heading == pytest.approx(42.0)
+    assert mission.impact_target_gps["impact_count"] == 1
+
+    hold_end = contact_time + mission.config.contact_hold_sec + 0.01
+    mission.update([], now=hold_end)
+    assert mission.state is task3_module.MissionState.FORWARD_CLEAR
+
+    mission.update([], now=hold_end + 0.01)
+    assert commands[-1] == pytest.approx(
+        (mission.config.post_impact_forward_speed, 0.0)
+    )
+    assert all(linear >= 0.0 for linear, _ in commands)
+
+
+def test_saved_impact_gps_guides_return_until_camera_reacquires(
+        task3_module,
+):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    mission = _mission(task3_module)
+    mission.state = task3_module.MissionState.IMPACT_RETURN
+    mission.state_started_at = 1.0
+    mission.impact_count = 1
+    mission.impact_target_gps = {
+        "lat": 37.95125,
+        "lon": 32.50090,
+        "recorded_at": 0.5,
+        "impact_count": 1,
+    }
+    mission.update_gps(37.95127, 32.50090, now=1.1)
+    mission.update_heading(0.0, now=1.1)
+    commands.clear()
+
+    mission.update([], now=1.1)
+    assert commands[-1][0] == pytest.approx(0.0)
+    assert commands[-1][1] != pytest.approx(0.0)
+
+    mission.update_heading(180.0, now=1.2)
+    mission.update([], now=1.2)
+    assert commands[-1][0] == pytest.approx(
+        mission.config.impact_return_speed
+    )
+    assert commands[-1][0] > 0.0
+
+    mission.update([_target(distance=2.0)], now=1.3)
+    assert mission.state is task3_module.MissionState.ACQUIRE_CONFIRM
+    assert all(linear >= 0.0 for linear, _ in commands)
 
 
 def test_exactly_three_confirmed_impacts_finish_task(task3_module):
@@ -784,10 +807,10 @@ def test_exactly_three_confirmed_impacts_finish_task(task3_module):
         assert mission.impact_count == expected_count
 
         if expected_count < 3:
-            assert mission.state is task3_module.MissionState.RETREAT
-            now += mission.config.retreat_max_sec + 0.01
+            assert mission.state is task3_module.MissionState.FORWARD_CLEAR
+            now += mission.config.post_impact_forward_duration_sec + 0.01
             mission.update([], now=now)
-            assert mission.state is task3_module.MissionState.REACQUIRE
+            assert mission.state is task3_module.MissionState.IMPACT_RETURN
             now += 0.01
         else:
             assert mission.state is task3_module.MissionState.FINISHED

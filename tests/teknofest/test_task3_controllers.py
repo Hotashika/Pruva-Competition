@@ -27,10 +27,8 @@ def _controller_config(**overrides):
         "ram_duration_sec": 0.2,
         "contact_hold_sec": 0.1,
         "required_impact_count": 3,
-        "retreat_speed": 0.25,
-        "retreat_min_sec": 0.6,
-        "retreat_max_sec": 1.5,
-        "retreat_heading_max_angular_z": 0.25,
+        "post_impact_forward_speed": 0.4,
+        "post_impact_forward_duration_sec": 1.5,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -182,35 +180,26 @@ def test_search_turn_watchdog_reports_failure():
     assert "watchdog timeout" in decision.reason
 
 
-def test_impact_controller_owns_ram_hold_and_retreat_decisions():
+def test_impact_controller_owns_ram_hold_and_forward_clear_decisions():
     controller = Task3ImpactController(_controller_config())
 
-    ram = controller.ram_decision(elapsed=0.1, current_heading=42.0)
+    ram = controller.ram_decision(elapsed=0.1)
     assert ram.action is ImpactAction.RAM_MOTION
     assert ram.linear_x == pytest.approx(0.75)
 
-    contact = controller.ram_decision(elapsed=0.21, current_heading=42.0)
+    contact = controller.ram_decision(elapsed=0.21)
     assert contact.action is ImpactAction.CONTACT_HOLD
     assert controller.impact_count == 1
-    assert controller.retreat_heading == pytest.approx(42.0)
 
     hold = controller.contact_hold_decision(elapsed=0.05)
     assert hold.action is ImpactAction.HOLD
-    retreat = controller.contact_hold_decision(elapsed=0.11)
-    assert retreat.action is ImpactAction.RETREAT
+    forward_clear = controller.contact_hold_decision(elapsed=0.11)
+    assert forward_clear.action is ImpactAction.FORWARD_CLEAR
 
-    retreat_motion = controller.retreat_decision(
-        elapsed=0.2,
-        target_far_enough=False,
-        current_heading=47.0,
-    )
-    assert retreat_motion.action is ImpactAction.RETREAT_MOTION
-    assert retreat_motion.linear_x == pytest.approx(-0.25)
-    assert retreat_motion.angular_z < 0.0
+    forward_motion = controller.forward_clear_decision(elapsed=0.2)
+    assert forward_motion.action is ImpactAction.FORWARD_CLEAR_MOTION
+    assert forward_motion.linear_x == pytest.approx(0.4)
+    assert forward_motion.angular_z == pytest.approx(0.0)
 
-    reacquire = controller.retreat_decision(
-        elapsed=1.5,
-        target_far_enough=False,
-        current_heading=47.0,
-    )
-    assert reacquire.action is ImpactAction.REACQUIRE
+    impact_return = controller.forward_clear_decision(elapsed=1.5)
+    assert impact_return.action is ImpactAction.IMPACT_RETURN
