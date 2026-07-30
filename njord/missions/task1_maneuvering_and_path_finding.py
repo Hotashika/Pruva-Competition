@@ -10,6 +10,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import rclpy
+from geometry_msgs.msg import Twist
 from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -33,6 +34,7 @@ from utils.read_waypoints import parse_qgc_waypoints
 
 WAYPOINT_PATH = WAYPOINT_DIRECTORY / "njord_task1.waypoints"
 ACTIVE_TASK_NAME = "task1"
+TASK_VELOCITY_TOPIC = "/cube/task2_velocity"
 
 # ============================================================
 # GÜVENLİK PARAMETRELERİ
@@ -57,20 +59,23 @@ WAYPOINT_HEADING_TOLERANCE_DEG = 22.0  # Kucuk heading farklarinda gereksiz sali
 # Engel bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
 AVOIDANCE_START_DISTANCE_M = 4.0
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
+AVOIDANCE_MONITOR_DISTANCE_M = 12.0
 AVOIDANCE_PASS_CLEARANCE_M = 3.0
-AVOIDANCE_EMERGENCY_DISTANCE_M = 1.5
-AVOIDANCE_MIN_LINEAR_SPEED = 0.2
-AVOIDANCE_MAX_LINEAR_SPEED = 0.6
-AVOIDANCE_MAX_ANGULAR_Z = 0.7
-AVOIDANCE_TURN_SPEED_REDUCTION = 0.5
-AVOIDANCE_MIN_DURATION_SEC = 1.0
-AVOIDANCE_CLEAR_DURATION_SEC = 0.7
-AVOIDANCE_TIMEOUT_SEC = 8.0
+AVOIDANCE_STARBOARD_ANGLE_DEG = 45.0
+AVOIDANCE_STARBOARD_DURATION_SEC = 4.0
+AVOIDANCE_FORWARD_MIN_DURATION_SEC = 3.0
+AVOIDANCE_CLEAR_CONFIRM_SEC = 1.0
+AVOIDANCE_BEHIND_MARGIN_M = 1.0
+AVOIDANCE_MATCH_MAX_BEARING_DELTA_DEG = 45.0
+AVOIDANCE_MATCH_MAX_DISTANCE_DELTA_M = 4.0
+AVOIDANCE_TIMEOUT_SEC = 40.0
+TASK_TARGET_SPEED_KNOTS = 2.0
+TASK_TARGET_SPEED_M_S = TASK_TARGET_SPEED_KNOTS * 0.514444
 
 # ============================================================
 # VISION / ENGEL EŞLEŞTİRME PARAMETRELERİ
 # ============================================================
-VISION_DETECTION_TIMEOUT_SEC = 1.0
+VISION_DETECTION_TIMEOUT_SEC = 12.0
 MIN_OBSTACLE_CONFIDENCE = 0.45
 OBSTACLE_CONFIRMATION_MAX_GAP_SEC = 0.75
 OBSTACLE_FILTER_ALPHA = 0.40
@@ -168,10 +173,15 @@ class Task1Maneuvering:
         self.pending_obstacle_time = None
         self.pending_obstacle_count = 0
         self.avoid_started_time = None
+        self.avoidance_phase_started_time = None
+        self.avoidance_phase = None
+        self.avoidance_entry_heading = None
+        self.avoidance_first_leg_bearing = None
         self.avoid_clear_started_time = None
         self.active_pass_side = None
-        self.last_avoidance_linear_x = 0.0
-        self.last_avoidance_angular_z = 0.0
+        self.active_obstacle_bearing_deg = None
+        self.last_avoidance_north_m_s = 0.0
+        self.last_avoidance_east_m_s = 0.0
         self.aligned_target_key = None
         self.resume_navigation_without_alignment = False
         self.waypoint_hold_until = None
@@ -511,7 +521,10 @@ class Task1Maneuvering:
             obj = self._normalize_obstacle(raw)
             if obj is None or obj["confidence"] < MIN_OBSTACLE_CONFIDENCE:
                 continue
-            if obj["distance"] is None or not 0 < obj["distance"] < AVOIDANCE_EXIT_DISTANCE_M:
+            if (
+                    obj["distance"] is None
+                    or not 0 < obj["distance"] < AVOIDANCE_EXIT_DISTANCE_M
+            ):
                 continue
             if self._detection_angle_deg(obj) is None:
                 continue
@@ -557,8 +570,38 @@ class Task1Maneuvering:
                 return angle_deg
         return None
 
+    def _pass_side_and_first_leg_bearing(self, obstacle_class):
+        """Mevcut Task 1 geçiş yönünü ilk zamanlı kolun kerterizine çevirir."""
+        if self.current_heading is None:
+            return None
+
+        entry_heading = float(self.current_heading) % 360.0
+        buoy_side = BUOY_PASS_SIDES.get(obstacle_class)
+        if buoy_side is not None:
+            signed_offset = (
+                AVOIDANCE_STARBOARD_ANGLE_DEG
+                if buoy_side == "starboard"
+                else -AVOIDANCE_STARBOARD_ANGLE_DEG
+            )
+            return buoy_side, (entry_heading + signed_offset) % 360.0
+
+        cardinal_side = CARDINAL_PASS_SIDES.get(obstacle_class)
+        if cardinal_side is None:
+            return None
+
+        geographic_bearing = 90.0 if cardinal_side == "east" else 270.0
+        bearing_error = (
+            (geographic_bearing - entry_heading + 180.0) % 360.0
+            - 180.0
+        )
+        limited_offset = max(
+            -AVOIDANCE_STARBOARD_ANGLE_DEG,
+            min(AVOIDANCE_STARBOARD_ANGLE_DEG, bearing_error),
+        )
+        return cardinal_side, (entry_heading + limited_offset) % 360.0
+
     def _pass_side_and_body_offset(self, obstacle_class):
-        """Sinif kuralini arac eksenindeki sanal gecis offsetine cevirir."""
+        """Mevcut sınıf kuralını araç eksenindeki geçiş ofsetine çevirir."""
         buoy_side = BUOY_PASS_SIDES.get(obstacle_class)
         if buoy_side is not None:
             starboard_m = (
@@ -578,101 +621,67 @@ class Task1Maneuvering:
             else -AVOIDANCE_PASS_CLEARANCE_M
         )
         heading_rad = math.radians(float(self.current_heading))
-        # Geographic east offsetini body forward/starboard eksenine dondur.
         forward_m = east_m * math.sin(heading_rad)
         starboard_m = east_m * math.cos(heading_rad)
         return cardinal_side, forward_m, starboard_m
 
-    def _calculate_avoidance_command(self, obstacle):
-        """Aci ve derinlikten dinamik ileri hiz ve heading offseti hesaplar."""
-        obstacle = self._normalize_obstacle(obstacle)
+    def _publish_velocity_bearing(self, target_bearing):
+        """Sabit kerterizde dünya eksenli kuzey/doğu hız hedefi yayımlar."""
+        bearing_rad = math.radians(float(target_bearing) % 360.0)
+        message = Twist()
+        message.linear.x = TASK_TARGET_SPEED_M_S * math.cos(bearing_rad)
+        message.linear.y = TASK_TARGET_SPEED_M_S * math.sin(bearing_rad)
+        message.linear.z = 0.0
+        message.angular.z = 0.0
+        self.topics.task2_velocity_pub.publish(message)
+        self.last_avoidance_north_m_s = message.linear.x
+        self.last_avoidance_east_m_s = message.linear.y
+        return message
+
+    def _publish_avoidance_velocity(self):
+        """Geçici GPS hedefi oluşturmadan iki fazlı manevrayı yürütür."""
+        if self.avoidance_entry_heading is None:
+            self._enter_failsafe(
+                "Avoidance entry heading is unavailable. FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            return None
+
+        target_bearing = (
+            self.avoidance_first_leg_bearing
+            if self.avoidance_phase == "offset"
+            else self.avoidance_entry_heading
+        )
+        if target_bearing is None:
+            self._enter_failsafe(
+                "Avoidance first-leg bearing is unavailable. FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            return None
+        message = self._publish_velocity_bearing(target_bearing)
+        self.logger.info(
+            "Task 1 timed avoidance: "
+            f"phase={self.avoidance_phase}, bearing={target_bearing:.1f}deg, "
+            f"speed={TASK_TARGET_SPEED_M_S:.3f}m/s.",
+            throttle_duration_sec=1.0,
+        )
+        return message
+
+    @classmethod
+    def _obstacle_is_behind(cls, obstacle):
         if obstacle is None:
-            return None
-
-        distance_m = self._safe_float(obstacle.get("distance"))
-        angle_deg = self._detection_angle_deg(obstacle)
-        pass_offset = self._pass_side_and_body_offset(obstacle.get("class"))
-        if (
-                distance_m is None
-                or distance_m <= 0.0
-                or angle_deg is None
-                or pass_offset is None
-        ):
-            return None
-
-        pass_side, offset_forward_m, offset_starboard_m = pass_offset
-        angle_rad = math.radians(angle_deg)
-        # Kameradaki engel konumu + sinifin zorunlu gecis acikligi.
-        target_forward_m = distance_m * math.cos(angle_rad) + offset_forward_m
-        target_starboard_m = (
-            distance_m * math.sin(angle_rad) + offset_starboard_m
-        )
-        desired_heading_offset_rad = math.atan2(
-            target_starboard_m,
-            target_forward_m,
-        )
-        # Bridge angular_z degerini mevcut yaw'a radyan heading offseti olarak ekler.
-        angular_z = max(
-            -AVOIDANCE_MAX_ANGULAR_Z,
-            min(AVOIDANCE_MAX_ANGULAR_Z, desired_heading_offset_rad),
-        )
-
-        if distance_m <= AVOIDANCE_EMERGENCY_DISTANCE_M:
-            linear_x = 0.0
-        else:
-            distance_span_m = (
-                AVOIDANCE_START_DISTANCE_M - AVOIDANCE_EMERGENCY_DISTANCE_M
-            )
-            distance_factor = min(
-                1.0,
-                max(
-                    0.0,
-                    (distance_m - AVOIDANCE_EMERGENCY_DISTANCE_M)
-                    / distance_span_m,
-                ),
-            )
-            distance_speed = (
-                AVOIDANCE_MIN_LINEAR_SPEED
-                + distance_factor
-                * (AVOIDANCE_MAX_LINEAR_SPEED - AVOIDANCE_MIN_LINEAR_SPEED)
-            )
-            turn_factor = min(
-                1.0,
-                abs(angular_z) / AVOIDANCE_MAX_ANGULAR_Z,
-            )
-            linear_x = max(
-                AVOIDANCE_MIN_LINEAR_SPEED,
-                distance_speed
-                * (1.0 - AVOIDANCE_TURN_SPEED_REDUCTION * turn_factor),
-            )
-
-        return {
-            "linear_x": linear_x,
-            "angular_z": angular_z,
-            "pass_side": pass_side,
-            "distance": distance_m,
-            "angle_deg": angle_deg,
-        }
-
-    def _publish_avoidance_command(self, command):
-        self.last_avoidance_linear_x = command["linear_x"]
-        self.last_avoidance_angular_z = command["angular_z"]
-        self.active_pass_side = command["pass_side"]
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
-            linear_x=command["linear_x"],
-            angular_z=command["angular_z"],
-        )
-
-    def _republish_last_avoidance_command(self):
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
-            linear_x=self.last_avoidance_linear_x,
-            angular_z=self.last_avoidance_angular_z,
-        )
+            return False
+        forward_m = cls._safe_float(obstacle.get("forward_m"))
+        if forward_m is None:
+            distance_m = cls._safe_float(obstacle.get("distance"))
+            angle_deg = cls._detection_angle_deg(obstacle)
+            if distance_m is None or angle_deg is None:
+                return False
+            forward_m = distance_m * math.cos(math.radians(angle_deg))
+        return forward_m <= -AVOIDANCE_BEHIND_MARGIN_M
 
     def _matching_avoidance_obstacle(self, detections):
-        """Aktif kaçınma sınıfından hâlâ yakın görünen objeyi döndürür."""
+        """Manevrayı başlatan engeli kimlik veya mutlak kerterizle izler."""
         if self.avoiding_class is None:
             return None
 
@@ -687,40 +696,68 @@ class Task1Maneuvering:
                 continue
             if obj.get("class") != self.avoiding_class:
                 continue
-            if not self._same_obstacle(
-                    obj,
-                    reference,
-            ):
-                continue
-            try:
-                distance_m = float(obj.get("distance"))
-            except (TypeError, ValueError):
-                continue
+            distance_m = self._safe_float(obj.get("distance"))
+            angle_deg = self._detection_angle_deg(obj)
             if (
-                    0 < distance_m < AVOIDANCE_EXIT_DISTANCE_M
-                    and self._detection_angle_deg(obj) is not None
+                    distance_m is None
+                    or not 0 < distance_m <= AVOIDANCE_MONITOR_DISTANCE_M
+                    or angle_deg is None
             ):
-                score = self._obstacle_match_score(obj, reference)
-                candidates.append((score, obj))
+                continue
+
+            if self.avoiding_track_id is not None:
+                if obj.get("track_id") != self.avoiding_track_id:
+                    continue
+                score = 0.0
+            elif reference is None or self.current_heading is None:
+                continue
+            else:
+                candidate_bearing = (
+                    float(self.current_heading) + angle_deg
+                ) % 360.0
+                reference_bearing = self.active_obstacle_bearing_deg
+                reference_distance = self._safe_float(reference.get("distance"))
+                if reference_bearing is None or reference_distance is None:
+                    continue
+                bearing_delta = abs(
+                    (
+                        candidate_bearing - reference_bearing + 180.0
+                    ) % 360.0 - 180.0
+                )
+                distance_delta = abs(distance_m - reference_distance)
+                if (
+                        bearing_delta
+                        > AVOIDANCE_MATCH_MAX_BEARING_DELTA_DEG
+                        or distance_delta
+                        > AVOIDANCE_MATCH_MAX_DISTANCE_DELTA_M
+                ):
+                    continue
+                score = (
+                    bearing_delta / AVOIDANCE_MATCH_MAX_BEARING_DELTA_DEG
+                    + distance_delta / AVOIDANCE_MATCH_MAX_DISTANCE_DELTA_M
+                )
+            candidates.append((score, obj))
 
         if not candidates:
             return None
         obstacle = min(candidates, key=lambda item: item[0])[1]
-        filtered = self._filter_obstacle(obstacle, reference)
-        self.active_obstacle_reference = filtered
-        if obstacle.get("track_id") is not None:
-            self.avoiding_track_id = obstacle["track_id"]
-        return filtered
+        self.active_obstacle_reference = dict(obstacle)
+        return obstacle
 
     def _reset_avoidance_state(self):
         self.avoiding_class = None
         self.avoiding_track_id = None
         self.active_obstacle_reference = None
+        self.active_obstacle_bearing_deg = None
         self.avoid_started_time = None
+        self.avoidance_phase_started_time = None
+        self.avoidance_phase = None
+        self.avoidance_entry_heading = None
+        self.avoidance_first_leg_bearing = None
         self.avoid_clear_started_time = None
         self.active_pass_side = None
-        self.last_avoidance_linear_x = 0.0
-        self.last_avoidance_angular_z = 0.0
+        self.last_avoidance_north_m_s = 0.0
+        self.last_avoidance_east_m_s = 0.0
         self.aligned_target_key = None
         self.state = MissionState.NAVIGATING
 
@@ -844,14 +881,22 @@ class Task1Maneuvering:
 
     def _update_active_avoidance(self, detections, now):
         """Aktif kaçınmayı günceller; bu tick tüketildiyse True döndürür."""
-        elapsed = (
-            0.0
-            if self.avoid_started_time is None
-            else now - self.avoid_started_time
-        )
-        if elapsed >= AVOIDANCE_TIMEOUT_SEC:
+        if (
+                self.avoid_started_time is None
+                or self.avoidance_phase_started_time is None
+                or self.avoidance_entry_heading is None
+        ):
             self._enter_failsafe(
-                f"Obstacle did not clear within {AVOIDANCE_TIMEOUT_SEC:.1f}s. "
+                "Timed avoidance state is incomplete. FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            stop_vehicle(self.topics.cmd_vel_pub)
+            return True
+
+        total_elapsed = now - self.avoid_started_time
+        if total_elapsed >= AVOIDANCE_TIMEOUT_SEC:
+            self._enter_failsafe(
+                f"Timed avoidance exceeded {AVOIDANCE_TIMEOUT_SEC:.1f}s. "
                 "FAILSAFE + HOLD.",
                 request_hold=True,
             )
@@ -859,93 +904,118 @@ class Task1Maneuvering:
             return True
 
         obstacle = self._matching_avoidance_obstacle(detections)
-        if obstacle is None:
-            if self.avoid_clear_started_time is None:
-                self.avoid_clear_started_time = now
+        phase_elapsed = now - self.avoidance_phase_started_time
+        if self.avoidance_phase == "offset":
+            if phase_elapsed < AVOIDANCE_STARBOARD_DURATION_SEC:
+                self._publish_avoidance_velocity()
+                return True
 
-            clear_duration = now - self.avoid_clear_started_time
-            if (
-                    elapsed >= AVOIDANCE_MIN_DURATION_SEC
-                    and clear_duration >= AVOIDANCE_CLEAR_DURATION_SEC
-            ):
-                completed_class = self.avoiding_class
-                completed_side = self.active_pass_side
-                self._reset_avoidance_state()
-                self.resume_navigation_without_alignment = True
-                self.logger.info(
-                    f"{completed_class} cleared for {clear_duration:.2f}s; "
-                    f"{completed_side} dynamic pass completed, "
-                    "resuming main GNSS route without stopping."
-                )
-                return False
-
-            self._republish_last_avoidance_command()
+            self.avoidance_phase = "forward"
+            self.avoidance_phase_started_time = now
+            self.avoid_clear_started_time = now if obstacle is None else None
             self.logger.info(
-                f"Obstacle temporarily out of frame; holding last dynamic command "
-                f"for maneuver/clear confirmation "
-                f"(maneuver={elapsed:.2f}/{AVOIDANCE_MIN_DURATION_SEC:.2f}s, "
-                f"clear={clear_duration:.2f}/"
-                f"{AVOIDANCE_CLEAR_DURATION_SEC:.2f}s).",
-                throttle_duration_sec=0.5,
+                "Timed directional leg completed; continuing on the entry "
+                "heading until the obstacle clears."
             )
+            self._publish_avoidance_velocity()
             return True
 
-        self.avoid_clear_started_time = None
-        command = self._calculate_avoidance_command(obstacle)
-        if command is None:
+        if self.avoidance_phase != "forward":
             self._enter_failsafe(
-                "Active obstacle has invalid angle/depth. FAILSAFE + HOLD.",
+                f"Unknown timed avoidance phase: {self.avoidance_phase}. "
+                "FAILSAFE + HOLD.",
                 request_hold=True,
             )
             stop_vehicle(self.topics.cmd_vel_pub)
             return True
 
-        self._publish_avoidance_command(command)
-        self.logger.info(
-            f"Dynamic avoidance {obstacle['class']}: "
-            f"distance={command['distance']:.2f}m, "
-            f"angle={command['angle_deg']:.1f}deg, "
-            f"side={command['pass_side']}, "
-            f"linear={command['linear_x']:.2f}, "
-            f"angular={command['angular_z']:.2f}.",
-            throttle_duration_sec=0.5,
+        obstacle_behind = self._obstacle_is_behind(obstacle)
+        if obstacle is None:
+            if self.avoid_clear_started_time is None:
+                self.avoid_clear_started_time = now
+        else:
+            self.avoid_clear_started_time = None
+
+        detection_clear = (
+            self.avoid_clear_started_time is not None
+            and now - self.avoid_clear_started_time
+            >= AVOIDANCE_CLEAR_CONFIRM_SEC
         )
+        minimum_forward_complete = (
+            phase_elapsed >= AVOIDANCE_FORWARD_MIN_DURATION_SEC
+        )
+        if minimum_forward_complete and (obstacle_behind or detection_clear):
+            clear_reason = (
+                "obstacle is behind"
+                if obstacle_behind
+                else "obstacle absent for the clear-confirmation interval"
+            )
+            completed_class = self.avoiding_class
+            self._reset_avoidance_state()
+            self.resume_navigation_without_alignment = True
+            self.logger.info(
+                f"{completed_class} timed avoidance completed "
+                f"({clear_reason}); resuming the same mission waypoint."
+            )
+            return False
+
+        self._publish_avoidance_velocity()
         return True
 
     def _start_avoidance(self, obstacle, now):
-        """Yeni bir engel için dinamik kamera manevrasını başlatır."""
+        """Yeni bir engel için yön koruyan iki fazlı manevrayı başlatır."""
         obstacle = self._normalize_obstacle(obstacle)
-        if obstacle is None:
-            return False
-        command = self._calculate_avoidance_command(obstacle)
-        if command is None:
+        distance_m = (
+            None if obstacle is None
+            else self._safe_float(obstacle.get("distance"))
+        )
+        angle_deg = (
+            None if obstacle is None
+            else self._detection_angle_deg(obstacle)
+        )
+        if (
+                obstacle is None
+                or distance_m is None
+                or distance_m <= 0.0
+                or angle_deg is None
+                or self.current_heading is None
+        ):
             self.logger.warn(
-                "Obstacle detection has no valid angle/depth; "
-                "dynamic avoidance was not started.",
+                "Obstacle detection has no valid heading/angle/depth; "
+                "timed avoidance was not started.",
                 throttle_duration_sec=1.0,
             )
             return False
 
+        pass_target = self._pass_side_and_first_leg_bearing(obstacle["class"])
+        if pass_target is None:
+            return False
+        pass_side, first_leg_bearing = pass_target
+
         self.state = MissionState.AVOIDING
         self.avoiding_class = obstacle["class"]
         self.avoiding_track_id = obstacle.get("track_id")
-        self.active_obstacle_reference = obstacle
+        self.active_obstacle_reference = dict(obstacle)
         self.avoid_started_time = now
+        self.avoidance_phase_started_time = now
+        self.avoidance_phase = "offset"
+        self.avoidance_entry_heading = float(self.current_heading)
+        self.avoidance_first_leg_bearing = first_leg_bearing
         self.avoid_clear_started_time = None
+        self.active_obstacle_bearing_deg = (
+            self.avoidance_entry_heading + angle_deg
+        ) % 360.0
+        self.active_pass_side = pass_side
         self.resume_navigation_without_alignment = False
-        self._publish_avoidance_command(command)
-        side_reference = (
-            "Geographic" if obstacle["class"] in CARDINAL_PASS_SIDES
-            else "Vehicle-relative"
-        )
+        self.aligned_target_key = None
+        self._publish_avoidance_velocity()
         self.logger.info(
-            f"{obstacle['class']} dynamic avoidance started: "
-            f"distance={command['distance']:.2f}m, "
-            f"angle={command['angle_deg']:.1f}deg, "
-            f"{side_reference} side={command['pass_side']}, "
-            f"linear={command['linear_x']:.2f}, "
-            f"angular={command['angular_z']:.2f}, "
-            f"clearance={AVOIDANCE_PASS_CLEARANCE_M:.1f}m."
+            f"{obstacle['class']} timed avoidance started: "
+            f"distance={distance_m:.2f}m, angle={angle_deg:.1f}deg, "
+            f"entry_heading={self.avoidance_entry_heading:.1f}deg, "
+            f"pass_side={pass_side}, "
+            f"first_leg_bearing={first_leg_bearing:.1f}deg, "
+            f"speed={TASK_TARGET_SPEED_M_S:.3f}m/s."
         )
         return True
 
@@ -964,7 +1034,7 @@ class Task1Maneuvering:
         )
 
         # ---------------------------------------------------------
-        # 1. ENGELLERDEN KAÇINMA KONTROLÜ (dinamik kamera manevrasi)
+        # 1. ENGELLERDEN KAÇINMA KONTROLÜ (iki fazlı hız manevrası)
         # ---------------------------------------------------------
         now = time.monotonic()
         nearest = self._nearest_relevant_obstacle(detections, now)
@@ -1034,6 +1104,11 @@ class Task1Node(Node):
             heading_callback=self.heading_callback,
             state_callback=self.state_callback
         )
+        self.mission_topics.task2_velocity_pub = self.create_publisher(
+            Twist,
+            TASK_VELOCITY_TOPIC,
+            10,
+        )
 
         self.latest_detections = []
         self.last_detection_time = None
@@ -1079,13 +1154,14 @@ class Task1Node(Node):
         action = None
         reason = None
         if self.task.state == MissionState.AVOIDING:
+            phase = self.task.avoidance_phase or "unknown"
             side = self.task.active_pass_side or "selected side"
-            action = f"Dynamic camera pass on {side}"
+            action = f"Timed avoidance on {side} ({phase})"
             obstacle = self.task.avoiding_class or "course marker"
             reason = (
                 f"{obstacle} detected; "
-                f"linear={self.task.last_avoidance_linear_x:.2f}, "
-                f"angular={self.task.last_avoidance_angular_z:.2f}"
+                f"north={self.task.last_avoidance_north_m_s:.2f}m/s, "
+                f"east={self.task.last_avoidance_east_m_s:.2f}m/s"
             )
         msg = String()
         msg.data = mission_decision_json(

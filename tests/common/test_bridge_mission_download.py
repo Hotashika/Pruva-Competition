@@ -25,6 +25,14 @@ def _load_bridge(monkeypatch):
         "rclpy.executors",
         _module("rclpy.executors", ExternalShutdownException=RuntimeError),
     )
+    geometry_msgs = _module("geometry_msgs")
+    geometry_msgs.__path__ = []
+    monkeypatch.setitem(sys.modules, "geometry_msgs", geometry_msgs)
+    monkeypatch.setitem(
+        sys.modules,
+        "geometry_msgs.msg",
+        _module("geometry_msgs.msg", Twist=object),
+    )
 
     mavlink = types.SimpleNamespace(
         MAV_MISSION_ACCEPTED=0,
@@ -76,6 +84,7 @@ def _load_bridge(monkeypatch):
         "utils.mavlink_utilities",
         _module(
             "utils.mavlink_utilities",
+            calculate_gps_newpos=lambda *args: (0.0, 0.0),
             create_bridge_topics=lambda *_args, **_kwargs: None,
             create_bridge_services=lambda *_args, **_kwargs: None,
         ),

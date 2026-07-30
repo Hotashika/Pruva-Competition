@@ -94,7 +94,7 @@ STAND_ON_GRACE_SEC = 2.5
 # ============================================================
 # VISION PARAMETRELERİ
 # ============================================================
-VISION_DETECTION_TIMEOUT_SEC = 1.0
+VISION_DETECTION_TIMEOUT_SEC = 12.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
 DEPTH_OBSTACLE_TYPE = "depth_obstacle"

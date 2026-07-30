@@ -29,7 +29,6 @@ DISTANCE_HYSTERESIS_TASKS = {
 }
 
 GPS_TARGET_AVOIDANCE_TASKS = {
-    "njord_task1",
     "njord_task2",
     "teknofest_task2",
 }

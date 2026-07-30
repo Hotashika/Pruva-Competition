@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import math
 import sys
 import types
 from pathlib import Path
@@ -37,6 +38,17 @@ def task1_module(monkeypatch):
     rclpy_node_module.Node = type("Node", (), {})
     rclpy_module.node = rclpy_node_module
 
+    geometry_msgs_module = types.ModuleType("geometry_msgs")
+    geometry_msgs_msg_module = types.ModuleType("geometry_msgs.msg")
+
+    class Twist:
+        def __init__(self):
+            self.linear = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+    geometry_msgs_msg_module.Twist = Twist
+    geometry_msgs_module.msg = geometry_msgs_msg_module
+
     mavros_module = types.ModuleType("mavros_msgs")
     mavros_srv_module = types.ModuleType("mavros_msgs.srv")
     mavros_srv_module.SetMode = type(
@@ -73,6 +85,8 @@ def task1_module(monkeypatch):
     for name, module in {
         "rclpy": rclpy_module,
         "rclpy.node": rclpy_node_module,
+        "geometry_msgs": geometry_msgs_module,
+        "geometry_msgs.msg": geometry_msgs_msg_module,
         "mavros_msgs": mavros_module,
         "mavros_msgs.srv": mavros_srv_module,
         "std_msgs": std_msgs_module,
@@ -99,6 +113,7 @@ def _mission_without_ros(task1_module, heading=0.0):
     mission.topics = types.SimpleNamespace(
         cmd_vel_pub=object(),
         position_target_pub=object(),
+        task2_velocity_pub=FakePublisher(),
     )
     mission.current_lat = 63.4305
     mission.current_lon = 10.3951
@@ -114,10 +129,15 @@ def _mission_without_ros(task1_module, heading=0.0):
     mission.pending_obstacle_time = None
     mission.pending_obstacle_count = 0
     mission.avoid_started_time = None
+    mission.avoidance_phase_started_time = None
+    mission.avoidance_phase = None
+    mission.avoidance_entry_heading = None
+    mission.avoidance_first_leg_bearing = None
     mission.avoid_clear_started_time = None
     mission.active_pass_side = None
-    mission.last_avoidance_linear_x = 0.0
-    mission.last_avoidance_angular_z = 0.0
+    mission.active_obstacle_bearing_deg = None
+    mission.last_avoidance_north_m_s = 0.0
+    mission.last_avoidance_east_m_s = 0.0
     return mission
 
 
@@ -132,29 +152,57 @@ def _detection(obstacle_class, distance=3.0, angle=0.0, **extra):
 
 
 @pytest.mark.parametrize(
-    ("obstacle_class", "heading", "expected_side", "expected_sign"),
+    ("obstacle_class", "heading", "expected_side", "expected_bearing"),
     (
-        ("red_buoys", 0.0, "starboard", 1),
-        ("red_buoys", 90.0, "starboard", 1),
-        ("green_buoys", 0.0, "port", -1),
-        ("green_buoys", 90.0, "port", -1),
+        ("red_buoys", 0.0, "starboard", 45.0),
+        ("red_buoys", 90.0, "starboard", 135.0),
+        ("green_buoys", 0.0, "port", 315.0),
+        ("green_buoys", 90.0, "port", 45.0),
     ),
 )
-def test_buoy_command_uses_vehicle_relative_class_side(
+def test_timed_first_leg_preserves_vehicle_relative_buoy_side(
         task1_module,
         obstacle_class,
         heading,
         expected_side,
-        expected_sign,
+        expected_bearing,
 ):
     mission = _mission_without_ros(task1_module, heading)
 
-    command = mission._calculate_avoidance_command(
-        _detection(obstacle_class)
+    side, bearing = mission._pass_side_and_first_leg_bearing(
+        obstacle_class
     )
 
-    assert command["pass_side"] == expected_side
-    assert command["angular_z"] * expected_sign > 0.0
+    assert side == expected_side
+    assert bearing == pytest.approx(expected_bearing)
+
+
+@pytest.mark.parametrize(
+    ("obstacle_class", "heading", "expected_side", "expected_bearing"),
+    (
+        ("east_buoys", 0.0, "east", 45.0),
+        ("east_buoys", 90.0, "east", 90.0),
+        ("east_buoys", 180.0, "east", 135.0),
+        ("west_buoys", 0.0, "west", 315.0),
+        ("west_buoys", 180.0, "west", 225.0),
+        ("west_buoys", 270.0, "west", 270.0),
+    ),
+)
+def test_timed_first_leg_preserves_cardinal_geographic_side(
+        task1_module,
+        obstacle_class,
+        heading,
+        expected_side,
+        expected_bearing,
+):
+    mission = _mission_without_ros(task1_module, heading)
+
+    side, bearing = mission._pass_side_and_first_leg_bearing(
+        obstacle_class
+    )
+
+    assert side == expected_side
+    assert bearing == pytest.approx(expected_bearing)
 
 
 @pytest.mark.parametrize(
@@ -168,7 +216,7 @@ def test_buoy_command_uses_vehicle_relative_class_side(
         ("west_buoys", 180.0, 0.0, 3.0),
     ),
 )
-def test_cardinal_offset_preserves_geographic_side(
+def test_existing_cardinal_body_offsets_are_preserved(
         task1_module,
         obstacle_class,
         heading,
@@ -177,77 +225,54 @@ def test_cardinal_offset_preserves_geographic_side(
 ):
     mission = _mission_without_ros(task1_module, heading)
 
-    side, forward_m, starboard_m = mission._pass_side_and_body_offset(
+    _side, forward_m, starboard_m = mission._pass_side_and_body_offset(
         obstacle_class
     )
 
-    assert side == ("east" if obstacle_class == "east_buoys" else "west")
     assert forward_m == pytest.approx(expected_forward, abs=1e-6)
     assert starboard_m == pytest.approx(expected_starboard, abs=1e-6)
 
 
-def test_angle_and_depth_change_dynamic_command(task1_module):
-    mission = _mission_without_ros(task1_module)
+def test_timed_avoidance_uses_fixed_two_knot_metric_velocity(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
 
-    far = mission._calculate_avoidance_command(
-        _detection("red_buoys", distance=4.0, angle=0.0)
-    )
-    close = mission._calculate_avoidance_command(
-        _detection("red_buoys", distance=2.0, angle=0.0)
-    )
-    left = mission._calculate_avoidance_command(
-        _detection("red_buoys", distance=3.0, angle=-20.0)
-    )
-    right = mission._calculate_avoidance_command(
-        _detection("red_buoys", distance=3.0, angle=20.0)
+    assert mission._start_avoidance(
+        _detection("red_buoys", distance=2.5, angle=20.0),
+        now=10.0,
     )
 
-    assert close["angular_z"] > far["angular_z"]
-    assert close["linear_x"] < far["linear_x"]
-    assert left["angular_z"] < right["angular_z"]
-
-
-def test_dynamic_avoidance_uses_configured_linear_speed_range(task1_module):
-    mission = _mission_without_ros(task1_module)
-
-    maximum_speed = mission._calculate_avoidance_command(
-        _detection("red_buoys", distance=4.0, angle=0.0)
+    velocity = mission.topics.task2_velocity_pub.messages[-1]
+    assert math.hypot(velocity.linear.x, velocity.linear.y) == pytest.approx(
+        task1_module.TASK_TARGET_SPEED_M_S
     )
-    minimum_speed = mission._calculate_avoidance_command(
-        _detection("red_buoys", distance=1.6, angle=45.0)
+    assert velocity.linear.x == pytest.approx(
+        task1_module.TASK_TARGET_SPEED_M_S / math.sqrt(2.0)
+    )
+    assert velocity.linear.y == pytest.approx(
+        task1_module.TASK_TARGET_SPEED_M_S / math.sqrt(2.0)
     )
 
-    assert task1_module.AVOIDANCE_MIN_LINEAR_SPEED == pytest.approx(0.2)
-    assert task1_module.AVOIDANCE_MAX_LINEAR_SPEED == pytest.approx(0.5)
-    assert 0.2 <= maximum_speed["linear_x"] <= 0.5
-    assert minimum_speed["linear_x"] == pytest.approx(0.2)
 
+def test_green_buoy_timed_leg_keeps_port_direction(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
 
-def test_emergency_distance_stops_forward_motion_and_clamps_turn(task1_module):
-    mission = _mission_without_ros(task1_module)
-
-    command = mission._calculate_avoidance_command(
-        _detection("red_buoys", distance=1.5, angle=45.0)
+    assert mission._start_avoidance(
+        _detection("green_buoys", distance=2.5, angle=-5.0),
+        now=10.0,
     )
 
-    assert command["linear_x"] == 0.0
-    assert abs(command["angular_z"]) <= task1_module.AVOIDANCE_MAX_ANGULAR_Z
+    velocity = mission.topics.task2_velocity_pub.messages[-1]
+    assert mission.active_pass_side == "port"
+    assert velocity.linear.x > 0.0
+    assert velocity.linear.y < 0.0
 
 
-def test_start_avoidance_publishes_cmd_vel_without_gps_target(
+def test_start_avoidance_publishes_metric_velocity_without_gps_target(
         task1_module,
         monkeypatch,
 ):
     mission = _mission_without_ros(task1_module)
-    velocity_commands = []
     gps_targets = []
-    monkeypatch.setattr(
-        task1_module,
-        "publish_cmd_vel",
-        lambda _publisher, linear_x, angular_z: velocity_commands.append(
-            (linear_x, angular_z)
-        ),
-    )
     monkeypatch.setattr(
         task1_module,
         "publish_set_position",
@@ -262,7 +287,8 @@ def test_start_avoidance_publishes_cmd_vel_without_gps_target(
     assert started
     assert mission.state is task1_module.MissionState.AVOIDING
     assert mission.active_pass_side == "starboard"
-    assert len(velocity_commands) == 1
+    assert mission.avoidance_phase == "offset"
+    assert len(mission.topics.task2_velocity_pub.messages) == 1
     assert gps_targets == []
 
 
@@ -348,16 +374,8 @@ def test_real_angle_takes_precedence_over_side_fallback(task1_module):
 
 def test_side_only_detection_confirms_and_starts_avoidance(
         task1_module,
-        monkeypatch,
 ):
     mission = _mission_without_ros(task1_module)
-    commands = []
-    monkeypatch.setattr(
-        task1_module,
-        "publish_cmd_vel",
-        lambda _publisher, linear_x, angular_z:
-        commands.append((linear_x, angular_z)),
-    )
     detection = {
         "class": "red_buoys",
         "confidence": 0.9,
@@ -373,8 +391,9 @@ def test_side_only_detection_confirms_and_starts_avoidance(
     assert confirmed is not None
     assert mission._start_avoidance(confirmed, now=1.1)
     assert mission.state is task1_module.MissionState.AVOIDING
-    assert commands[-1][0] > 0.0
-    assert commands[-1][1] > 0.0
+    velocity = mission.topics.task2_velocity_pub.messages[-1]
+    assert velocity.linear.x > 0.0
+    assert velocity.linear.y > 0.0
 
 
 def test_only_current_four_classes_trigger_avoidance(task1_module):
@@ -461,7 +480,7 @@ def test_active_obstacle_prefers_exact_track_id(task1_module):
     assert matched["track_id"] == 7
 
 
-def test_active_obstacle_accepts_new_track_id_with_bbox_continuity(
+def test_active_obstacle_rejects_changed_track_id_even_with_bbox_continuity(
         task1_module,
 ):
     mission = _mission_without_ros(task1_module)
@@ -485,9 +504,8 @@ def test_active_obstacle_accepts_new_track_id_with_bbox_continuity(
         ),
     ])
 
-    assert matched is not None
-    assert matched["track_id"] == 19
-    assert mission.avoiding_track_id == 19
+    assert matched is None
+    assert mission.avoiding_track_id == 7
 
 
 def test_changed_track_id_rejects_unrelated_obstacle(task1_module):
@@ -516,20 +534,28 @@ def test_changed_track_id_rejects_unrelated_obstacle(task1_module):
     assert mission.avoiding_track_id == 7
 
 
-def test_short_detection_loss_republishes_then_resumes_without_stop(
+def test_identityless_obstacle_matching_survives_heading_change(task1_module):
+    mission = _mission_without_ros(task1_module, heading=0.0)
+    assert mission._start_avoidance(
+        _detection("red_buoys", distance=2.5, angle=10.0),
+        now=10.0,
+    )
+    mission.current_heading = 40.0
+
+    matched = mission._matching_avoidance_obstacle([
+        _detection("red_buoys", distance=2.8, angle=-30.0),
+    ])
+
+    assert matched is not None
+    assert matched["distance"] == pytest.approx(2.8)
+
+
+def test_detection_loss_waits_for_both_timed_legs_then_resumes_without_stop(
         task1_module,
         monkeypatch,
 ):
     mission = _mission_without_ros(task1_module)
-    published = []
     stops = []
-    monkeypatch.setattr(
-        task1_module,
-        "publish_cmd_vel",
-        lambda _publisher, linear_x, angular_z: published.append(
-            (linear_x, angular_z)
-        ),
-    )
     monkeypatch.setattr(
         task1_module,
         "stop_vehicle",
@@ -539,19 +565,19 @@ def test_short_detection_loss_republishes_then_resumes_without_stop(
         _detection("red_buoys", distance=2.5, angle=0.0),
         now=10.0,
     )
-    initial_command = published[-1]
 
-    assert mission._update_active_avoidance([], now=10.1)
+    assert mission._update_active_avoidance([], now=13.99)
     assert mission.state is task1_module.MissionState.AVOIDING
-    assert published[-1] == initial_command
+    assert mission.avoidance_phase == "offset"
 
-    assert mission._update_active_avoidance([], now=10.79)
+    assert mission._update_active_avoidance([], now=14.0)
+    assert mission.state is task1_module.MissionState.AVOIDING
+    assert mission.avoidance_phase == "forward"
+
+    assert mission._update_active_avoidance([], now=16.99)
     assert mission.state is task1_module.MissionState.AVOIDING
 
-    assert mission._update_active_avoidance([], now=10.99)
-    assert mission.state is task1_module.MissionState.AVOIDING
-
-    assert not mission._update_active_avoidance([], now=11.01)
+    assert not mission._update_active_avoidance([], now=17.0)
     assert mission.state is task1_module.MissionState.NAVIGATING
     assert mission.current_target_index == 2
     assert mission.resume_navigation_without_alignment
@@ -569,7 +595,7 @@ def test_clear_view_resumes_same_waypoint_in_same_tick_without_alignment(
     mission._prepare_update = lambda: True
     published_targets = []
     stops = []
-    monkeypatch.setattr(task1_module.time, "monotonic", lambda: 11.01)
+    monkeypatch.setattr(task1_module.time, "monotonic", lambda: 17.0)
     monkeypatch.setattr(
         task1_module,
         "calculate_gps_distance",
@@ -601,7 +627,9 @@ def test_clear_view_resumes_same_waypoint_in_same_tick_without_alignment(
         _detection("red_buoys", distance=2.5, angle=0.0),
         now=10.0,
     )
-    mission.avoid_clear_started_time = 10.1
+    mission.avoidance_phase = "forward"
+    mission.avoidance_phase_started_time = 14.0
+    mission.avoid_clear_started_time = 14.0
 
     mission.update([])
     mission.update([])
@@ -654,18 +682,10 @@ def test_avoidance_starts_only_at_four_metres(
     assert mission.state is task1_module.MissionState.AVOIDING
 
 
-def test_active_invalid_data_uses_short_loss_grace(
+def test_active_invalid_data_keeps_timed_first_leg(
         task1_module,
-        monkeypatch,
 ):
     mission = _mission_without_ros(task1_module)
-    published = []
-    monkeypatch.setattr(
-        task1_module,
-        "publish_cmd_vel",
-        lambda _publisher, linear_x, angular_z:
-        published.append((linear_x, angular_z)),
-    )
     mission._start_avoidance(
         _detection(
             "red_buoys",
@@ -675,7 +695,7 @@ def test_active_invalid_data_uses_short_loss_grace(
         ),
         now=10.0,
     )
-    initial_command = published[-1]
+    initial_count = len(mission.topics.task2_velocity_pub.messages)
     missing_depth = {
         "class": "red_buoys",
         "confidence": 0.9,
@@ -687,29 +707,53 @@ def test_active_invalid_data_uses_short_loss_grace(
     mission._update_active_avoidance([missing_depth], now=10.2)
 
     assert mission.state is task1_module.MissionState.AVOIDING
-    assert mission.avoid_clear_started_time == 10.2
-    assert published[-1] == initial_command
+    assert mission.avoidance_phase == "offset"
+    assert mission.avoid_clear_started_time is None
+    assert len(mission.topics.task2_velocity_pub.messages) == initial_count + 1
 
 
 def test_reacquired_obstacle_resets_clear_confirmation(
         task1_module,
-        monkeypatch,
 ):
     mission = _mission_without_ros(task1_module)
-    monkeypatch.setattr(task1_module, "publish_cmd_vel", lambda *args, **kwargs: None)
     mission._start_avoidance(
         _detection("red_buoys", distance=2.5, angle=0.0, track_id=3),
         now=10.0,
     )
+    mission.avoidance_phase = "forward"
+    mission.avoidance_phase_started_time = 14.0
 
-    mission._update_active_avoidance([], now=10.2)
-    assert mission.avoid_clear_started_time == 10.2
+    mission._update_active_avoidance([], now=14.2)
+    assert mission.avoid_clear_started_time == 14.2
 
     mission._update_active_avoidance(
         [_detection("red_buoys", distance=2.3, angle=3.0, track_id=3)],
-        now=10.4,
+        now=14.4,
     )
     assert mission.avoid_clear_started_time is None
+
+
+def test_obstacle_behind_completes_after_minimum_forward_leg(task1_module):
+    mission = _mission_without_ros(task1_module)
+    mission._start_avoidance(
+        _detection("green_buoys", distance=2.5, angle=0.0, track_id=3),
+        now=10.0,
+    )
+    mission.avoidance_phase = "forward"
+    mission.avoidance_phase_started_time = 14.0
+    behind = _detection(
+        "green_buoys",
+        distance=2.0,
+        angle=120.0,
+        track_id=3,
+        forward_m=-1.2,
+    )
+
+    assert mission._update_active_avoidance([behind], now=16.99)
+    assert mission.state is task1_module.MissionState.AVOIDING
+    assert not mission._update_active_avoidance([behind], now=17.0)
+    assert mission.state is task1_module.MissionState.NAVIGATING
+    assert mission.current_target_index == 2
 
 
 def test_persistent_obstacle_timeout_enters_failsafe_hold(
@@ -719,7 +763,6 @@ def test_persistent_obstacle_timeout_enters_failsafe_hold(
     mission = _mission_without_ros(task1_module)
     failsafe_requests = []
     stops = []
-    monkeypatch.setattr(task1_module, "publish_cmd_vel", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         task1_module,
         "stop_vehicle",
@@ -738,21 +781,22 @@ def test_persistent_obstacle_timeout_enters_failsafe_hold(
 
     assert mission._update_active_avoidance(
         [_detection("red_buoys", distance=2.0, angle=0.0)],
-        now=18.0,
+        now=50.0,
     )
     assert mission.state is task1_module.MissionState.FAILSAFE
     assert failsafe_requests[0][1] is True
     assert stops == [True]
 
 
-def test_decision_payload_reports_dynamic_class_side_and_command(task1_module):
+def test_decision_payload_reports_timed_class_side_and_velocity(task1_module):
     node = task1_module.Task1Node.__new__(task1_module.Task1Node)
     node.task = types.SimpleNamespace(
         state=task1_module.MissionState.AVOIDING,
         active_pass_side="east",
+        avoidance_phase="offset",
         avoiding_class="east_buoys",
-        last_avoidance_linear_x=0.31,
-        last_avoidance_angular_z=0.42,
+        last_avoidance_north_m_s=0.31,
+        last_avoidance_east_m_s=0.42,
         current_target_index=2,
         waypoints=[{}, {}, {}],
     )
@@ -761,7 +805,7 @@ def test_decision_payload_reports_dynamic_class_side_and_command(task1_module):
     task1_module.Task1Node.publish_decision(node)
 
     payload = json.loads(node.decision_pub.messages[-1].data)
-    assert payload["action"] == "Dynamic camera pass on east"
+    assert payload["action"] == "Timed avoidance on east (offset)"
     assert "east_buoys" in payload["reason"]
-    assert "linear=0.31" in payload["reason"]
-    assert "angular=0.42" in payload["reason"]
+    assert "north=0.31m/s" in payload["reason"]
+    assert "east=0.42m/s" in payload["reason"]

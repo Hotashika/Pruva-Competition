@@ -56,7 +56,7 @@ BRIDGE_STATE_TIMEOUT_SEC = 2.0
 # ============================================================
 # VISION PARAMETRELERİ
 # ============================================================
-VISION_DETECTION_TIMEOUT_SEC = 1.0
+VISION_DETECTION_TIMEOUT_SEC = 12.0
 
 # ============================================================
 # KAÇINMA PARAMETRELERİ
