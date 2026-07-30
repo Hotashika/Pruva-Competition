@@ -44,6 +44,25 @@ def _install_ros_stubs():
     sys.modules["rclpy"] = rclpy
     sys.modules["rclpy.node"] = node_module
 
+    geometry_msgs = types.ModuleType("geometry_msgs")
+    geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
+
+    class Vector:
+        def __init__(self):
+            self.x = 0.0
+            self.y = 0.0
+            self.z = 0.0
+
+    class Twist:
+        def __init__(self):
+            self.linear = Vector()
+            self.angular = Vector()
+
+    geometry_msgs_msg.Twist = Twist
+    geometry_msgs.msg = geometry_msgs_msg
+    sys.modules["geometry_msgs"] = geometry_msgs
+    sys.modules["geometry_msgs.msg"] = geometry_msgs_msg
+
     mavros_msgs = types.ModuleType("mavros_msgs")
     mavros_srv = types.ModuleType("mavros_msgs.srv")
 
@@ -71,12 +90,19 @@ def _install_ros_stubs():
     sys.modules["std_msgs.msg"] = std_msgs_msg
 
     utilities = types.ModuleType("utils.mavlink_utilities")
-    utilities.align_heading_to_gps_target = lambda *args, **kwargs: True
+    utilities.calculate_angle_error_deg = (
+        lambda target, current:
+        (float(target) - float(current) + 180.0) % 360.0 - 180.0
+    )
+    utilities.calculate_bearing = lambda *args, **kwargs: 0.0
     utilities.calculate_gps_distance = lambda lat1, lon1, lat2, lon2: 100.0
     utilities.call_set_mode = lambda *args, **kwargs: True
     utilities.call_trigger_service = lambda *args, **kwargs: True
     utilities.create_mission_clients = lambda node: None
-    utilities.create_mission_topics = lambda *args, **kwargs: None
+    utilities.create_mission_topics = lambda *args, **kwargs: types.SimpleNamespace(
+        cmd_vel_pub=StubPublisher(),
+        position_target_pub=StubPublisher(),
+    )
     utilities.parse_bridge_state = lambda text: {
         key.strip(): (
             value.strip().lower() == "true"
@@ -93,11 +119,6 @@ def _install_ros_stubs():
             ("cmd_vel", float(linear_x), float(angular_z))
         )
     )
-    utilities.publish_set_position = (
-        lambda publisher, lat, lon, altitude=20.0: publisher.publish(
-            ("set_position", float(lat), float(lon), float(altitude))
-        )
-    )
     utilities.stop_vehicle = lambda publisher: publisher.publish(("cmd_vel", 0.0, 0.0))
     sys.modules["utils.mavlink_utilities"] = utilities
 
@@ -112,6 +133,8 @@ def _install_ros_stubs():
 _STUB_MODULE_NAMES = (
     "rclpy",
     "rclpy.node",
+    "geometry_msgs",
+    "geometry_msgs.msg",
     "mavros_msgs",
     "mavros_msgs.srv",
     "std_msgs",
@@ -157,6 +180,7 @@ class FakeTopics:
     def __init__(self):
         self.cmd_vel_pub = FakePublisher()
         self.position_target_pub = FakePublisher()
+        self.task2_velocity_pub = FakePublisher()
 
 
 class FakeSetModeClient:
@@ -207,6 +231,29 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             "Buoy angle: ": angle,
         }
 
+    @staticmethod
+    def _depth_obstacle(
+            distance,
+            angle,
+            *,
+            forward_m=None,
+            lateral_m=None,
+            width_m=None,
+    ):
+        detection = {
+            "type": "depth_obstacle",
+            "class": "surface_obstacle_candidate",
+            "distance": distance,
+            "angle": angle,
+        }
+        if forward_m is not None:
+            detection["forward_m"] = forward_m
+        if lateral_m is not None:
+            detection["lateral_m"] = lateral_m
+        if width_m is not None:
+            detection["width_m"] = width_m
+        return detection
+
     def _update(self, distance, angle, now, record=True):
         self._refresh_sensors(now)
         self.mission.update(
@@ -214,20 +261,6 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             now=now,
             record_observation=record,
         )
-
-    @staticmethod
-    def _target_clearance_m(target):
-        mean_lat = math.radians((target["marker_lat"] + target["lat"]) / 2.0)
-        north_m = (
-            math.radians(target["lat"] - target["marker_lat"])
-            * task2.EARTH_RADIUS_M
-        )
-        east_m = (
-            math.radians(target["lon"] - target["marker_lon"])
-            * task2.EARTH_RADIUS_M
-            * math.cos(mean_lat)
-        )
-        return math.hypot(north_m, east_m)
 
     def test_task2_waypoint_loader_discards_qgc_home(self):
         waypoints = task2.load_task2_waypoints("unused.waypoints")
@@ -298,63 +331,44 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self._update(7.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
-        self.assertIsNone(self.mission.avoidance_target)
+        self.assertIsNone(self.mission.avoidance_phase)
 
-    def test_head_on_collision_risk_creates_starboard_gps_target(self):
+    def test_head_on_collision_risk_starts_fixed_starboard_velocity(self):
         self._update(6.0, 0.0, 10.0)
         self._update(5.0, 0.0, 10.3)
         self._update(4.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        target = self.mission.avoidance_target
-        self.assertIsNotNone(target)
-        self.assertEqual("starboard", target["side"])
+        self.assertEqual("starboard", self.mission.avoidance_phase)
+        self.assertEqual(0.0, self.mission.avoidance_entry_heading)
+        velocity = self.topics.task2_velocity_pub.messages[-1]
         self.assertAlmostEqual(
-            task2.AVOIDANCE_PASS_CLEARANCE_M,
-            self._target_clearance_m(target),
-            places=3,
+            task2.TASK_TARGET_SPEED_M_S,
+            math.hypot(velocity.linear.x, velocity.linear.y),
+            places=6,
         )
-        self.assertEqual(
-            ("set_position", target["lat"], target["lon"], 20.0),
-            self.topics.position_target_pub.messages[-1],
+        self.assertEqual([], self.topics.position_target_pub.messages)
+        self.assertAlmostEqual(
+            velocity.linear.x,
+            velocity.linear.y,
+            places=6,
         )
 
-    def test_avoidance_target_is_always_right_of_entry_heading(self):
+    def test_avoidance_bearing_is_always_right_of_entry_heading(self):
         for heading in (0.0, 90.0, 225.0):
             with self.subTest(heading=heading):
-                self.mission.update_heading(heading, now=10.0)
-                target = self.mission._create_starboard_avoidance_target({
-                    "distance": 3.0,
-                    "angle": -30.0,
-                })
-
-                mean_lat = math.radians(
-                    (target["marker_lat"] + target["lat"]) / 2.0
-                )
-                north_m = (
-                    math.radians(target["lat"] - target["marker_lat"])
-                    * task2.EARTH_RADIUS_M
-                )
-                east_m = (
-                    math.radians(target["lon"] - target["marker_lon"])
-                    * task2.EARTH_RADIUS_M
-                    * math.cos(mean_lat)
-                )
-                right_bearing_rad = math.radians((heading + 90.0) % 360.0)
-
-                self.assertEqual("starboard", target["side"])
-                self.assertAlmostEqual(
-                    task2.AVOIDANCE_PASS_CLEARANCE_M
-                    * math.cos(right_bearing_rad),
-                    north_m,
-                    places=3,
-                )
-                self.assertAlmostEqual(
-                    task2.AVOIDANCE_PASS_CLEARANCE_M
-                    * math.sin(right_bearing_rad),
-                    east_m,
-                    places=3,
-                )
+                self.mission.avoidance_entry_heading = heading
+                self.mission.avoidance_phase = "starboard"
+                self.mission._publish_avoidance_velocity()
+                velocity = self.topics.task2_velocity_pub.messages[-1]
+                actual_bearing = math.degrees(math.atan2(
+                    velocity.linear.y,
+                    velocity.linear.x,
+                )) % 360.0
+                expected_bearing = (
+                    heading + task2.AVOIDANCE_STARBOARD_ANGLE_DEG
+                ) % 360.0
+                self.assertAlmostEqual(expected_bearing, actual_bearing)
 
     def test_closing_buoy_is_used_as_collision_target(self):
         for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
@@ -366,13 +380,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             )
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        target = self.mission.avoidance_target
-        self.assertIsNotNone(target)
-        self.assertAlmostEqual(
-            task2.AVOIDANCE_PASS_CLEARANCE_M,
-            self._target_clearance_m(target),
-            places=3,
-        )
+        self.assertEqual("starboard", self.mission.avoidance_phase)
 
     def test_current_buoy_model_classes_are_collision_targets(self):
         expected_classes = {
@@ -418,6 +426,62 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
                     })
                 )
 
+    def test_metric_geometry_is_preserved_for_clearance_detection(self):
+        vessel = self.mission._normalized_vessel(
+            self._depth_obstacle(
+                3.0,
+                0.0,
+                forward_m=4.0,
+                lateral_m=-0.5,
+                width_m=2.0,
+            )
+        )
+
+        self.assertAlmostEqual(4.0, vessel["forward_m"])
+        self.assertAlmostEqual(-0.5, vessel["starboard_m"])
+        self.assertAlmostEqual(2.0, vessel["width_m"])
+        self.assertFalse(self.mission._obstacle_is_behind(vessel))
+
+    def test_active_avoidance_keeps_tracking_the_same_vessel(self):
+        vessel = self.mission._normalized_vessel(
+            self._vessel(4.0, 0.0, track_id=7)
+        )
+        self.mission.avoiding_track_id = 7
+        self.mission.active_obstacle_reference = vessel
+
+        matched = self.mission._matching_avoidance_vessel([
+            self._vessel(1.5, 0.0, track_id=8),
+            self._vessel(3.8, 4.0, track_id=7),
+        ])
+
+        self.assertEqual(7, matched["track_id"])
+        self.assertAlmostEqual(3.8, matched["distance"])
+
+    def test_geometry_matching_survives_heading_change_without_track_id(self):
+        vessel = self.mission._normalized_vessel(
+            self._depth_obstacle(4.0, 0.0)
+        )
+        self.mission.active_obstacle_reference = vessel
+        self.mission.active_obstacle_bearing_deg = 0.0
+        self.mission.update_heading(30.0, now=10.1)
+
+        matched = self.mission._matching_avoidance_vessel([
+            self._depth_obstacle(2.0, 0.0),
+            self._depth_obstacle(4.0, -30.0),
+        ])
+
+        self.assertAlmostEqual(4.0, matched["distance"])
+        self.assertAlmostEqual(-30.0, matched["angle"])
+
+    def test_avoidance_does_not_create_or_publish_a_gps_target(self):
+        self._update(6.0, 0.0, 10.0)
+        self._update(5.0, 0.0, 10.3)
+        self._update(4.0, 0.0, 10.6)
+
+        self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+        self.assertEqual([], self.topics.position_target_pub.messages)
+        self.assertFalse(hasattr(self.mission, "avoidance_target"))
+
     def test_visual_only_segment_is_not_a_collision_target(self):
         self.assertFalse(
             self.mission._is_vessel({
@@ -427,65 +491,123 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             })
         )
 
-    def test_port_side_risk_stands_on_then_uses_starboard_gps_target(self):
+    def test_port_side_risk_stands_on_then_uses_timed_starboard_leg(self):
         self._update(5.0, -25.0, 10.0)
         self._update(4.7, -25.0, 10.3)
         self._update(4.4, -25.0, 10.6)
 
         self.assertEqual(task2.MissionState.STAND_ON, self.mission.state)
-        self.assertIsNone(self.mission.avoidance_target)
+        self.assertIsNone(self.mission.avoidance_phase)
 
         self._update(4.4, -25.0, 13.2, record=False)
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        self.assertEqual("starboard", self.mission.avoidance_target["side"])
-        self.assertTrue(self.topics.position_target_pub.messages)
+        self.assertEqual("starboard", self.mission.avoidance_phase)
+        self.assertTrue(self.topics.task2_velocity_pub.messages)
+        self.assertEqual([], self.topics.position_target_pub.messages)
 
-    def test_avoidance_resumes_same_waypoint_only_after_temporary_target(self):
+    def test_avoidance_runs_starboard_then_forward_before_rejoining(self):
         self._update(6.0, 0.0, 10.0)
         self._update(5.0, 0.0, 10.3)
         self._update(4.0, 0.0, 10.6)
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        target = dict(self.mission.avoidance_target)
+        self.assertEqual("starboard", self.mission.avoidance_phase)
 
-        self._refresh_sensors(11.5)
-        self.mission.update([], now=11.5)
+        transition_time = 10.6 + task2.AVOIDANCE_STARBOARD_DURATION_SEC
+        self._refresh_sensors(transition_time - 0.01)
+        self.mission.update([], now=transition_time - 0.01)
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+        self.assertEqual("starboard", self.mission.avoidance_phase)
 
-        original_distance = task2.calculate_gps_distance
-        task2.calculate_gps_distance = lambda lat1, lon1, lat2, lon2: (
-            0.0
-            if lat2 == target["lat"] and lon2 == target["lon"]
-            else 100.0
+        self._refresh_sensors(transition_time)
+        self.mission.update([], now=transition_time)
+        self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+        self.assertEqual("forward", self.mission.avoidance_phase)
+        forward_velocity = self.topics.task2_velocity_pub.messages[-1]
+        self.assertAlmostEqual(
+            task2.TASK_TARGET_SPEED_M_S,
+            forward_velocity.linear.x,
+            places=6,
         )
-        self.addCleanup(setattr, task2, "calculate_gps_distance", original_distance)
-
-        self._refresh_sensors(12.0)
-        self.mission.update([], now=12.0)
-        self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
-        self.assertIsNone(self.mission.avoidance_target)
+        self.assertAlmostEqual(0.0, forward_velocity.linear.y, places=6)
         self.assertEqual(0, self.mission.current_target_index)
 
-    def test_next_waypoint_waits_then_aligns_before_position_command(self):
+        before_minimum = (
+            transition_time + task2.AVOIDANCE_FORWARD_MIN_DURATION_SEC - 0.01
+        )
+        self._refresh_sensors(before_minimum)
+        self.mission.update([], now=before_minimum)
+        self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+
+        complete_time = (
+            transition_time + task2.AVOIDANCE_FORWARD_MIN_DURATION_SEC
+        )
+        self._refresh_sensors(complete_time)
+        self.mission.update([], now=complete_time)
+        self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
+        self.assertIsNone(self.mission.avoidance_phase)
+        self.assertEqual(0, self.mission.current_target_index)
+
+    def test_forward_leg_extends_while_obstacle_remains_ahead(self):
+        self._update(6.0, 0.0, 10.0)
+        self._update(5.0, 0.0, 10.3)
+        self._update(4.0, 0.0, 10.6)
+        transition_time = 10.6 + task2.AVOIDANCE_STARBOARD_DURATION_SEC
+
+        self._refresh_sensors(transition_time)
+        self.mission.update(
+            [self._vessel(3.0, -45.0)],
+            now=transition_time,
+        )
+        forward_complete = (
+            transition_time + task2.AVOIDANCE_FORWARD_MIN_DURATION_SEC
+        )
+        self._refresh_sensors(forward_complete)
+        self.mission.update(
+            [self._vessel(2.0, -80.0)],
+            now=forward_complete,
+        )
+
+        self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+        self.assertEqual("forward", self.mission.avoidance_phase)
+
+        self._refresh_sensors(forward_complete + 0.1)
+        self.mission.update(
+            [self._vessel(2.0, 180.0)],
+            now=forward_complete + 0.1,
+        )
+        self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
+
+    def test_timed_avoidance_timeout_enters_failsafe(self):
+        self._update(6.0, 0.0, 10.0)
+        self._update(5.0, 0.0, 10.3)
+        self._update(4.0, 0.0, 10.6)
+        timeout_time = 10.6 + task2.AVOIDANCE_TIMEOUT_SEC
+
+        self._refresh_sensors(timeout_time)
+        self.mission.update(
+            [self._vessel(2.0, -80.0)],
+            now=timeout_time,
+        )
+
+        self.assertEqual(task2.MissionState.FAILSAFE, self.mission.state)
+        self.assertTrue(self.mission.hold_mode_requested)
+        self.assertEqual(
+            ("cmd_vel", 0.0, 0.0),
+            self.topics.cmd_vel_pub.messages[-1],
+        )
+
+    def test_next_waypoint_waits_then_uses_task2_velocity(self):
         self.mission.waypoints = [
             {"lat": 10.0, "lon": 20.0, "alt": 0.0, "seq": 1},
             {"lat": 11.0, "lon": 21.0, "alt": 0.0, "seq": 2},
         ]
         original_distance = task2.calculate_gps_distance
-        original_align = task2.align_heading_to_gps_target
-        alignment_ready = {"value": False}
-        alignment_targets = []
 
         def fake_distance(lat1, lon1, lat2, lon2):
             return 0.5 if float(lat2) == 10.0 else 10.0
 
-        def fake_align(*args, **kwargs):
-            alignment_targets.append(kwargs.get("target_name"))
-            return alignment_ready["value"]
-
         task2.calculate_gps_distance = fake_distance
-        task2.align_heading_to_gps_target = fake_align
         self.addCleanup(setattr, task2, "calculate_gps_distance", original_distance)
-        self.addCleanup(setattr, task2, "align_heading_to_gps_target", original_align)
 
         self.mission.update([], now=10.0)
         self.assertEqual(1, self.mission.current_target_index)
@@ -493,23 +615,20 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
 
         self._refresh_sensors(10.5)
         self.mission.update([], now=10.5)
-        self.assertEqual([], alignment_targets)
+        self.assertEqual([], self.topics.task2_velocity_pub.messages)
         self.assertEqual([], self.topics.position_target_pub.messages)
 
         self._refresh_sensors(10.8)
         self.mission.update([], now=10.8)
-        self.assertEqual(["WP1"], alignment_targets)
+        velocity = self.topics.task2_velocity_pub.messages[-1]
+        self.assertAlmostEqual(
+            task2.TASK_TARGET_SPEED_M_S,
+            math.hypot(velocity.linear.x, velocity.linear.y),
+            places=6,
+        )
         self.assertEqual([], self.topics.position_target_pub.messages)
 
-        alignment_ready["value"] = True
-        self._refresh_sensors(10.9)
-        self.mission.update([], now=10.9)
-        self.assertEqual(
-            ("set_position", 11.0, 21.0, 0.0),
-            self.topics.position_target_pub.messages[-1],
-        )
-
-    def test_avoidance_aligns_with_temporary_target(self):
+    def test_avoidance_uses_only_task2_velocity_topic(self):
         self.mission.aligned_target_key = ("WP0", 10.0, 20.0)
 
         self._update(6.0, 0.0, 10.0)
@@ -517,10 +636,42 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self._update(4.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
-        self.assertEqual(
-            "starboard avoidance WP",
-            self.mission.aligned_target_key[0],
+        self.assertIsNone(self.mission.aligned_target_key)
+        velocity = self.topics.task2_velocity_pub.messages[-1]
+        self.assertAlmostEqual(
+            task2.TASK_TARGET_SPEED_M_S,
+            math.hypot(velocity.linear.x, velocity.linear.y),
+            places=6,
         )
+        self.assertAlmostEqual(velocity.linear.x, velocity.linear.y, places=6)
+        self.assertEqual([], self.topics.position_target_pub.messages)
+
+    def test_sharp_turn_reduces_only_task2_metric_velocity(self):
+        original_bearing = task2.calculate_bearing
+        task2.calculate_bearing = lambda *args: 90.0
+        self.addCleanup(
+            setattr,
+            task2,
+            "calculate_bearing",
+            original_bearing,
+        )
+
+        commanded_speed = self.mission._publish_task2_velocity_target(
+            1.0,
+            2.0,
+        )
+        velocity = self.topics.task2_velocity_pub.messages[-1]
+
+        self.assertAlmostEqual(
+            task2.TASK_TARGET_SPEED_M_S
+            * task2.TASK_MIN_TURN_SPEED_FRACTION,
+            commanded_speed,
+            places=6,
+        )
+        self.assertAlmostEqual(0.0, velocity.linear.x, places=6)
+        self.assertAlmostEqual(commanded_speed, velocity.linear.y, places=6)
+        self.assertEqual([], self.topics.cmd_vel_pub.messages)
+        self.assertEqual([], self.topics.position_target_pub.messages)
 
     def test_estimates_relative_and_true_vessel_speed_and_course(self):
         base_latitude = 1.0

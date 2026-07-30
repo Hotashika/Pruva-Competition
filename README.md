@@ -227,6 +227,15 @@ The files remain separate but carry `frame_id`, camera timestamps, ROS
 timestamps, or UTC timestamps so samples from the same test moment can be
 matched during analysis.
 
+Njord Task 2 targets 2 knots (approximately `1.03 m/s`) through its dedicated
+`/cube/task2_velocity` topic. Normal waypoint navigation varies between 40%
+and 100% of that target according to heading error. Collision avoidance does
+not create a temporary GPS target: it commands a fixed 2-knot velocity 45
+degrees to starboard of the entry heading for 4 seconds, then continues on the
+entry heading for at least 3 seconds until the tracked obstacle is behind or
+absent for 1 second. It does not change ArduRover `WP_SPEED` or the behavior of
+other missions.
+
 ### TEKNOFEST
 
 Start Mission Planner interface mode:
@@ -292,6 +301,7 @@ QGroundControl WPL text. Example:
 | `/cube/telemetry` | Aggregated bridge telemetry |
 | `/cube/cmd_vel` | Velocity command input |
 | `/cube/set_position` | Global GPS target input |
+| `/cube/task2_velocity` | Njord Task 2 metric North/East velocity input |
 | `/vision/detections` | JSON-formatted vision detections |
 | `/mission/active_task` | Active detector/mission selection |
 | `/mission_start` | Mission command from the bridge |
