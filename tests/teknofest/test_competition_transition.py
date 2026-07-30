@@ -130,7 +130,13 @@ def _timer_node(competition, state):
     node.task3 = types.SimpleNamespace(
         state="running",
         finished=False,
-        update=lambda detections: updates.append(("task3", detections)),
+        update=lambda detections, **kwargs: updates.append(
+            (
+                "task3",
+                detections,
+                kwargs.get("vision_frame_id"),
+            )
+        ),
     )
     return node, updates, transitions
 
@@ -212,7 +218,13 @@ def test_finished_task3_finishes_competition(monkeypatch):
 
     node.timer_callback()
 
-    assert updates == [("task3", ["detection"])]
+    assert updates == [
+        (
+            "task3",
+            ["detection"],
+            node.last_detection_message_time,
+        )
+    ]
     assert stopped == ["cmd_vel"]
     assert node.competition_state is competition.CompetitionState.FINISHED
     assert node.active_task_name == "finished"
@@ -258,7 +270,13 @@ def test_task3_gps_return_does_not_require_fresh_vision(monkeypatch):
 
     node.timer_callback()
 
-    assert updates == [("task3", [])]
+    assert updates == [
+        (
+            "task3",
+            [],
+            node.last_detection_message_time,
+        )
+    ]
 
 
 def test_task3_competition_failsafe_requests_loiter_not_task1_hold(

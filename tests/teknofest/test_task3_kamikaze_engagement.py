@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import math
 import sys
 import types
@@ -200,11 +201,18 @@ def _target(
 
 def _enter_ram(mission, task3_module, now=0.1, angle=0.0):
     detections = [_target(distance=8.0, angle=angle)]
-    mission.update(detections, now=now)
-    assert mission.state is task3_module.MissionState.ATTACK_CONFIRM
-    mission.update(detections, now=now + 0.1)
+    for index in range(mission.config.confirmation_required):
+        mission.update(
+            detections,
+            now=now + index * 0.1,
+            vision_frame_id=100 + index,
+        )
+        if index < mission.config.confirmation_required - 1:
+            assert mission.state is task3_module.MissionState.ATTACK_CONFIRM
     assert mission.state is task3_module.MissionState.RAM
-    return now + 0.1
+    return now + (
+        mission.config.confirmation_required - 1
+    ) * 0.1
 
 
 def test_target_classes_annotation_is_python38_compatible():
@@ -225,6 +233,26 @@ def test_task3_node_initializes_mission_data_recorder():
         "self.data_recorder = MissionDataRecorder(self, ACTIVE_TASK_NAME)"
         in source
     )
+
+
+def test_task3_node_preserves_vision_frame_id(task3_module):
+    node = task3_module.Task3Node.__new__(task3_module.Task3Node)
+    node.current_detections = []
+    node.current_detection_frame_id = None
+    node.last_detection_time = None
+    node.get_logger = _logger
+    message = types.SimpleNamespace(
+        data=json.dumps({
+            "frame_id": 321,
+            "detections": [_target()],
+        })
+    )
+
+    node.vision_callback(message)
+
+    assert node.current_detection_frame_id == 321
+    assert node.current_detections == [_target()]
+    assert node.last_detection_time is not None
 
 
 @pytest.mark.parametrize(
@@ -264,7 +292,7 @@ def test_target_classes_reject_other_buoy_labels(task3_module, class_name):
     assert mission._select_target([_target(class_name=class_name)]) is None
 
 
-def test_two_consistent_frames_start_direct_ram_without_distance_gate(
+def test_six_distinct_consistent_frames_start_ram_at_low_confirm_speed(
         task3_module,
 ):
     commands = []
@@ -276,16 +304,25 @@ def test_two_consistent_frames_start_direct_ram_without_distance_gate(
     commands.clear()
     target = [_target(distance=8.0, angle=10.0)]
 
-    mission.update(target, now=0.1)
+    mission.update(target, now=0.1, vision_frame_id=100)
 
     assert mission.state is task3_module.MissionState.ATTACK_CONFIRM
-    assert commands[-1][0] == pytest.approx(
-        mission.config.attack_confirm_speed
-    )
+    assert mission.config.attack_confirm_speed == pytest.approx(0.15)
+    assert commands[-1][0] == pytest.approx(0.15)
     assert commands[-1][1] > 0.0
 
-    mission.update(target, now=0.2)
+    for now in (0.2, 0.3, 0.4):
+        mission.update(target, now=now, vision_frame_id=100)
+        assert mission.state is task3_module.MissionState.ATTACK_CONFIRM
+        assert len(mission.confirmation_samples) == 1
+        assert commands[-1][0] == pytest.approx(0.15)
 
+    for frame_id, now in zip(range(101, 105), (0.5, 0.6, 0.7, 0.8)):
+        mission.update(target, now=now, vision_frame_id=frame_id)
+        assert mission.state is task3_module.MissionState.ATTACK_CONFIRM
+
+    assert len(mission.confirmation_samples) == 5
+    mission.update(target, now=0.9, vision_frame_id=105)
     assert mission.state is task3_module.MissionState.RAM
     assert commands[-1][0] == pytest.approx(mission.config.ram_speed)
     assert commands[-1][1] > 0.0
@@ -294,11 +331,65 @@ def test_two_consistent_frames_start_direct_ram_without_distance_gate(
 def test_single_frame_disappearance_resumes_search(task3_module):
     mission = _mission(task3_module)
 
-    mission.update([_target(distance=8.0)], now=0.1)
-    mission.update([], now=0.2)
+    mission.update(
+        [_target(distance=8.0)],
+        now=0.1,
+        vision_frame_id=1,
+    )
+    mission.update([], now=0.2, vision_frame_id=2)
 
     assert mission.state is task3_module.MissionState.SEARCH
     assert mission.impact_count == 0
+    assert mission.search_controller.base_heading == pytest.approx(15.0)
+    assert (
+        mission.search_controller.phase
+        is task3_module.SearchPhase.RETURN_TO_BASE_HEADING
+    )
+
+
+def test_false_target_turn_cannot_reanchor_search_direction(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    mission = _mission(task3_module)
+    mission.update(
+        [_target(distance=8.0, angle=20.0)],
+        now=0.1,
+        vision_frame_id=1,
+    )
+    mission.update_heading(70.0, now=0.2)
+
+    mission.update([], now=0.2, vision_frame_id=2)
+
+    assert mission.state is task3_module.MissionState.SEARCH
+    assert mission.search_controller.base_heading == pytest.approx(15.0)
+    assert (
+        mission.search_controller.phase
+        is task3_module.SearchPhase.RETURN_TO_BASE_HEADING
+    )
+
+    commands.clear()
+    mission.update([], now=0.3)
+
+    assert commands[-1][0] == pytest.approx(0.0)
+    assert commands[-1][1] < 0.0
+
+
+@pytest.mark.parametrize("invalid_heading", [float("nan"), "invalid", None])
+def test_invalid_heading_does_not_replace_last_valid_direction(
+        task3_module,
+        invalid_heading,
+):
+    mission = _mission(task3_module)
+    last_heading_time = mission.last_heading_time
+
+    accepted = mission.update_heading(invalid_heading, now=0.5)
+
+    assert accepted is False
+    assert mission.current_heading == pytest.approx(15.0)
+    assert mission.last_heading_time == pytest.approx(last_heading_time)
 
 
 def test_state_topic_reports_transitions_and_periodic_heartbeat(task3_module):
@@ -332,7 +423,7 @@ def test_direct_attack_has_no_legacy_approach_states_or_config(task3_module):
         "REACQUIRE",
     }.isdisjoint(state_names)
     assert not hasattr(defaults, "approach_distance_required")
-    assert defaults.confirmation_required == 2
+    assert defaults.confirmation_required == 6
 
 
 def test_ram_steers_while_target_visible_and_continues_straight_if_lost(
@@ -733,8 +824,12 @@ def test_negative_motion_is_rejected(task3_module):
 def test_production_defaults_match_direct_attack_plan(task3_module):
     defaults = task3_module.Task3Config()
 
-    assert defaults.confirmation_required == 2
-    assert defaults.attack_confirm_speed == pytest.approx(0.40)
+    assert defaults.search_advance_distance_m == pytest.approx(1.5)
+    assert defaults.search_cross_track_limit_m == pytest.approx(2.0)
+    assert defaults.search_max_sweep_deg == pytest.approx(180.0)
+    assert defaults.confirmation_required == 6
+    assert defaults.confirmation_window_size == 6
+    assert defaults.attack_confirm_speed == pytest.approx(0.15)
     assert defaults.ram_speed == pytest.approx(0.85)
     assert defaults.ram_duration_sec == pytest.approx(2.0)
     assert defaults.post_impact_forward_speed == pytest.approx(0.85)

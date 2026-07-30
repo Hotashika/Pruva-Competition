@@ -85,13 +85,22 @@ class Task3Config:
     search_initial_sweep_deg: float = 20.0
     search_sweep_increment_deg: float = 10.0
     search_max_sweep_deg: float = 180.0
-    search_forward_duration_sec: float = 2.5
+    search_advance_distance_m: float = 1.5
     search_heading_tolerance_deg: float = 2.0
-    search_turn_timeout_min_sec: float = 6.0
+    search_heading_settle_sec: float = 0.3
+    search_heading_kp: float = 0.018
+    search_min_angular_z: float = 0.04
+    search_turn_timeout_sec: float = 25.0
+    search_advance_timeout_sec: float = 15.0
+    search_no_progress_timeout_sec: float = 6.0
+    search_progress_min_m: float = 0.15
+    search_cross_track_limit_m: float = 2.0
+    search_cross_track_kp_deg_per_m: float = 8.0
+    search_advance_heading_limit_deg: float = 25.0
 
-    # İki karelik saldırı teyidi
-    confirmation_window_size: int = 2
-    confirmation_required: int = 2
+    # Altı ayrı karelik düşük hızlı saldırı teyidi
+    confirmation_window_size: int = 6
+    confirmation_required: int = 6
     confirmation_max_gap_sec: float = 0.5
     confirmation_angle_spread_deg: float = 12.0
     confirmation_distance_spread_ratio: float = 0.45
@@ -100,7 +109,7 @@ class Task3Config:
     target_distance_jump_ratio: float = 0.60
     target_bbox_min_iou: float = 0.05
     attack_confirm_timeout_sec: float = 2.0
-    attack_confirm_speed: float = 0.40
+    attack_confirm_speed: float = 0.15
     steering_kp: float = 0.018
     max_angular_z: float = 0.35
 
@@ -129,9 +138,18 @@ class Task3Config:
                 "search_angular_z",
                 "search_initial_sweep_deg",
                 "search_sweep_increment_deg",
-                "search_forward_duration_sec",
+                "search_advance_distance_m",
                 "search_heading_tolerance_deg",
-                "search_turn_timeout_min_sec",
+                "search_heading_settle_sec",
+                "search_heading_kp",
+                "search_min_angular_z",
+                "search_turn_timeout_sec",
+                "search_advance_timeout_sec",
+                "search_no_progress_timeout_sec",
+                "search_progress_min_m",
+                "search_cross_track_limit_m",
+                "search_cross_track_kp_deg_per_m",
+                "search_advance_heading_limit_deg",
                 "attack_confirm_speed",
                 "ram_speed",
                 "ram_duration_sec",
@@ -152,6 +170,19 @@ class Task3Config:
             raise ValueError(
                 "search_max_sweep_deg must be between "
                 "search_initial_sweep_deg and 180"
+            )
+        if self.search_min_angular_z > self.search_angular_z:
+            raise ValueError(
+                "search_min_angular_z cannot exceed search_angular_z"
+            )
+        if (
+                self.search_advance_heading_limit_deg
+                <= self.search_heading_tolerance_deg
+                or self.search_advance_heading_limit_deg >= 90.0
+        ):
+            raise ValueError(
+                "search_advance_heading_limit_deg must be between "
+                "search_heading_tolerance_deg and 90"
             )
         if str(self.loiter_mode).strip().upper() != HOLD_MODE:
             raise ValueError("loiter_mode must be LOITER")
@@ -221,6 +252,7 @@ class Task3KamikazeEngagement:
             maxlen=self.config.confirmation_window_size
         )
         self.confirmation_last_time = None
+        self.confirmation_last_frame_id = None
 
         self.impact_target_gps = None
         self.impact_events = []
@@ -449,7 +481,7 @@ class Task3KamikazeEngagement:
         now = self._now(now)
         self.current_lat = float(lat)
         self.current_lon = float(lon)
-        self.current_heading = float(heading)
+        self.current_heading = float(heading) % 360.0
         self.last_gps_time = now
         self.last_heading_time = now
         self.home_lat = self.current_lat
@@ -463,11 +495,14 @@ class Task3KamikazeEngagement:
         self.last_target_angle = 0.0
         self.confirmation_samples.clear()
         self.confirmation_last_time = None
+        self.confirmation_last_frame_id = None
         self.impact_target_gps = None
         self.impact_events = []
         self.impact_return_departed = False
         self.search_controller.reset_for_entry(
             self.current_heading,
+            self.current_lat,
+            self.current_lon,
             now,
         )
         self.target_data_uncertain = False
@@ -499,8 +534,19 @@ class Task3KamikazeEngagement:
             self.home_lon = self.current_lon
 
     def update_heading(self, heading, now=None):
-        self.current_heading = float(heading)
+        try:
+            heading = float(heading)
+        except (TypeError, ValueError):
+            heading = float("nan")
+        if not math.isfinite(heading):
+            self.logger.warn(
+                "Task 3 geçersiz heading verisi yok sayıldı.",
+                throttle_duration_sec=2.0,
+            )
+            return False
+        self.current_heading = heading % 360.0
         self.last_heading_time = self._now(now)
+        return True
 
     def update_bridge_state(self, state_text, now=None):
         try:
@@ -617,11 +663,26 @@ class Task3KamikazeEngagement:
             self.config.target_filter_alpha,
         )
 
-    def _record_confirmation(self, target, now):
+    def _record_confirmation(self, target, now, frame_id=None):
         if target is None:
             self.confirmation_samples.clear()
             self.confirmation_last_time = None
+            self.confirmation_last_frame_id = None
             return None
+
+        if (
+                frame_id is not None
+                and self.confirmation_last_frame_id is not None
+        ):
+            try:
+                is_new_frame = (
+                    float(frame_id)
+                    > float(self.confirmation_last_frame_id)
+                )
+            except (TypeError, ValueError):
+                is_new_frame = frame_id != self.confirmation_last_frame_id
+            if not is_new_frame:
+                return None
 
         previous = (
             self.confirmation_samples[-1]
@@ -645,6 +706,7 @@ class Task3KamikazeEngagement:
 
         self.confirmation_samples.append(target)
         self.confirmation_last_time = now
+        self.confirmation_last_frame_id = frame_id
         if len(self.confirmation_samples) < self.config.confirmation_required:
             return None
 
@@ -668,34 +730,47 @@ class Task3KamikazeEngagement:
             return None
         return dict(recent[-1])
 
-    def _enter_search(self, now, reason):
-        self.search_controller.enter_search(self.current_heading, now)
+    def _enter_search(self, now, reason, *, recenter=False):
+        self.search_controller.enter_search(
+            self.current_heading,
+            self.current_lat,
+            self.current_lon,
+            now,
+            recenter=recenter,
+        )
         self.confirmation_samples.clear()
         self.confirmation_last_time = None
+        self.confirmation_last_frame_id = None
         self.last_target = None
         self._set_state(MissionState.SEARCH, now, reason)
 
-    def _begin_attack_confirmation(self, target, now):
+    def _begin_attack_confirmation(self, target, now, frame_id=None):
         self.confirmation_samples.clear()
         self.confirmation_samples.append(target)
         self.confirmation_last_time = now
+        self.confirmation_last_frame_id = frame_id
         self.last_target = target
         self.last_target_angle = target["angle"]
         self._set_state(
             MissionState.ATTACK_CONFIRM,
             now,
-            "ilk hedef karesi; ikinci tutarlı kare bekleniyor",
+            f"ilk hedef karesi; {self.config.confirmation_required} "
+            "ayrı tutarlı kare bekleniyor",
         )
         self._publish_motion(
             linear_x=self.config.attack_confirm_speed,
             angular_z=self._steering_command(target["angle"]),
-            reason="moving two-frame attack confirmation",
+            reason=(
+                f"low-speed target confirmation 1/"
+                f"{self.config.confirmation_required}"
+            ),
         )
 
     def _pause_for_uncertain_target_data(self, now, reason):
         self.search_controller.pause(self.current_heading, now)
         self.confirmation_samples.clear()
         self.confirmation_last_time = None
+        self.confirmation_last_frame_id = None
         self.last_target = None
         self._stop()
         if self.state != MissionState.SEARCH:
@@ -713,9 +788,12 @@ class Task3KamikazeEngagement:
         self._stop()
         if not self._ensure_mode(DRIVE_MODE, now):
             return
-        self._enter_search(now, "GUIDED teyit edildi; arama başlıyor")
+        self._enter_search(
+            now,
+            "GUIDED teyit edildi; sabit eksenli arama başlıyor",
+        )
 
-    def _update_search(self, detections, now):
+    def _update_search(self, detections, now, vision_frame_id=None):
         target = self._select_target(detections)
         if self.target_data_uncertain:
             self._pause_for_uncertain_target_data(
@@ -724,10 +802,19 @@ class Task3KamikazeEngagement:
             )
             return
         if target is not None:
-            self._begin_attack_confirmation(target, now)
+            self._begin_attack_confirmation(
+                target,
+                now,
+                frame_id=vision_frame_id,
+            )
             return
 
-        decision = self.search_controller.step(self.current_heading, now)
+        decision = self.search_controller.step(
+            self.current_heading,
+            self.current_lat,
+            self.current_lon,
+            now,
+        )
         if decision.failed:
             self._enter_failsafe(
                 f"Task 3 arama denetleyicisi başarısız: {decision.reason}",
@@ -747,7 +834,12 @@ class Task3KamikazeEngagement:
             reason=decision.reason,
         )
 
-    def _update_attack_confirm(self, detections, now):
+    def _update_attack_confirm(
+            self,
+            detections,
+            now,
+            vision_frame_id=None,
+    ):
         target = self._select_target(detections)
         if self.target_data_uncertain:
             self._pause_for_uncertain_target_data(
@@ -757,10 +849,18 @@ class Task3KamikazeEngagement:
             )
             return
         if target is None:
-            self._enter_search(now, "ikinci hedef karesi gelmedi")
+            self._enter_search(
+                now,
+                "altı karelik teyit sırasında hedef kayboldu",
+                recenter=True,
+            )
             return
 
-        confirmed = self._record_confirmation(target, now)
+        confirmed = self._record_confirmation(
+            target,
+            now,
+            frame_id=vision_frame_id,
+        )
         latest = (
             self.confirmation_samples[-1]
             if self.confirmation_samples
@@ -775,7 +875,8 @@ class Task3KamikazeEngagement:
             self._set_state(
                 MissionState.RAM,
                 now,
-                "iki tutarlı kare; doğrudan RAM",
+                f"{self.config.confirmation_required} ayrı tutarlı kare; "
+                "doğrudan RAM",
             )
             self._publish_motion(
                 linear_x=self.config.ram_speed,
@@ -788,13 +889,21 @@ class Task3KamikazeEngagement:
                 now - self.state_started_at
                 >= self.config.attack_confirm_timeout_sec
         ):
-            self._enter_search(now, "iki karelik saldırı teyidi zaman aşımı")
+            self._enter_search(
+                now,
+                "altı karelik saldırı teyidi zaman aşımı",
+                recenter=True,
+            )
             return
 
         self._publish_motion(
             linear_x=self.config.attack_confirm_speed,
             angular_z=self._steering_command(latest["angle"]),
-            reason="moving two-frame attack confirmation",
+            reason=(
+                f"low-speed target confirmation "
+                f"{len(self.confirmation_samples)}/"
+                f"{self.config.confirmation_required}"
+            ),
         )
 
     def _ram_steering(self, detections):
@@ -1045,7 +1154,13 @@ class Task3KamikazeEngagement:
             "LOITER heartbeat teyit edildi",
         )
 
-    def update(self, detections, now=None, vision_fresh=True):
+    def update(
+            self,
+            detections,
+            now=None,
+            vision_fresh=True,
+            vision_frame_id=None,
+    ):
         now = self._now(now)
         self._publish_state(now)
         if self.state == MissionState.FINISHED:
@@ -1100,10 +1215,18 @@ class Task3KamikazeEngagement:
             self._update_wait_guided_search(now)
             return
         if self.state == MissionState.SEARCH:
-            self._update_search(detections, now)
+            self._update_search(
+                detections,
+                now,
+                vision_frame_id=vision_frame_id,
+            )
             return
         if self.state == MissionState.ATTACK_CONFIRM:
-            self._update_attack_confirm(detections, now)
+            self._update_attack_confirm(
+                detections,
+                now,
+                vision_frame_id=vision_frame_id,
+            )
             return
         if self.state == MissionState.RAM:
             self._update_ram(detections, now)
@@ -1145,6 +1268,7 @@ class Task3Node(Node):
         )
         self.mission_active = False
         self.current_detections = []
+        self.current_detection_frame_id = None
         self.last_detection_time = None
 
         self.vision_sub = self.create_subscription(
@@ -1199,7 +1323,17 @@ class Task3Node(Node):
                     throttle_duration_sec=2.0,
                 )
                 return
+            frame_id = payload.get("frame_id")
+            try:
+                frame_id = int(frame_id)
+            except (TypeError, ValueError):
+                self.get_logger().warn(
+                    "Vision frame_id eksik/geçersiz; kare teyidi bekletiliyor.",
+                    throttle_duration_sec=2.0,
+                )
+                frame_id = -1
             self.current_detections = detections
+            self.current_detection_frame_id = frame_id
             self.last_detection_time = time.monotonic()
         except (json.JSONDecodeError, TypeError) as exc:
             self.get_logger().warn(
@@ -1230,6 +1364,7 @@ class Task3Node(Node):
             self.task.update(
                 detections=self.current_detections,
                 vision_fresh=self.vision_is_fresh(),
+                vision_frame_id=self.current_detection_frame_id,
             )
         except Exception as exc:
             self.get_logger().error(

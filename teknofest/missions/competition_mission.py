@@ -223,7 +223,10 @@ class CompetitionNode(Task1Node):
                     self._transition_to(CompetitionState.PARKUR_3, "task3")
 
             elif self.competition_state == CompetitionState.PARKUR_3:
-                self.task3.update(detections)
+                self.task3.update(
+                    detections,
+                    vision_frame_id=self.last_detection_message_time,
+                )
                 if self.task3.state == Task3State.FAILSAFE:
                     self._enter_competition_failsafe("Task 3 FAILSAFE.")
                 elif self.task3.finished:
