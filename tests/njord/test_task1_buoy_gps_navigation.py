@@ -97,7 +97,7 @@ def task1_module(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
 
     spec = importlib.util.spec_from_file_location(
-        "task1_dynamic_avoidance_test_module",
+        "task1_timed_avoidance_test_module",
         TASK1_PATH,
     )
     module = importlib.util.module_from_spec(spec)
@@ -125,9 +125,6 @@ def _mission_without_ros(task1_module, heading=0.0):
     mission.avoiding_class = None
     mission.avoiding_track_id = None
     mission.active_obstacle_reference = None
-    mission.pending_obstacle = None
-    mission.pending_obstacle_time = None
-    mission.pending_obstacle_count = 0
     mission.avoid_started_time = None
     mission.avoidance_phase_started_time = None
     mission.avoidance_phase = None
@@ -233,7 +230,7 @@ def test_existing_cardinal_body_offsets_are_preserved(
     assert starboard_m == pytest.approx(expected_starboard, abs=1e-6)
 
 
-def test_timed_avoidance_uses_fixed_two_knot_metric_velocity(task1_module):
+def test_timed_avoidance_uses_task1_metric_speed(task1_module):
     mission = _mission_without_ros(task1_module, heading=0.0)
 
     assert mission._start_avoidance(
@@ -243,13 +240,13 @@ def test_timed_avoidance_uses_fixed_two_knot_metric_velocity(task1_module):
 
     velocity = mission.topics.task2_velocity_pub.messages[-1]
     assert math.hypot(velocity.linear.x, velocity.linear.y) == pytest.approx(
-        task1_module.TASK_TARGET_SPEED_M_S
+        task1_module.AVOIDANCE_SPEED_M_S
     )
     assert velocity.linear.x == pytest.approx(
-        task1_module.TASK_TARGET_SPEED_M_S / math.sqrt(2.0)
+        task1_module.AVOIDANCE_SPEED_M_S / math.sqrt(2.0)
     )
     assert velocity.linear.y == pytest.approx(
-        task1_module.TASK_TARGET_SPEED_M_S / math.sqrt(2.0)
+        task1_module.AVOIDANCE_SPEED_M_S / math.sqrt(2.0)
     )
 
 
@@ -372,7 +369,7 @@ def test_real_angle_takes_precedence_over_side_fallback(task1_module):
     assert normalized["angle_deg"] == pytest.approx(7.5)
 
 
-def test_side_only_detection_confirms_and_starts_avoidance(
+def test_side_only_detection_starts_avoidance_immediately(
         task1_module,
 ):
     mission = _mission_without_ros(task1_module)
@@ -383,13 +380,10 @@ def test_side_only_detection_confirms_and_starts_avoidance(
         "Buoy side: ": "right",
     }
 
-    first = mission._nearest_relevant_obstacle([detection])
-    assert mission._confirmed_obstacle(first, now=1.0) is None
-    second = mission._nearest_relevant_obstacle([detection])
-    confirmed = mission._confirmed_obstacle(second, now=1.1)
+    obstacle = mission._nearest_relevant_obstacle([detection])
 
-    assert confirmed is not None
-    assert mission._start_avoidance(confirmed, now=1.1)
+    assert obstacle is not None
+    assert mission._start_avoidance(obstacle, now=1.0)
     assert mission.state is task1_module.MissionState.AVOIDING
     velocity = mission.topics.task2_velocity_pub.messages[-1]
     assert velocity.linear.x > 0.0
@@ -429,30 +423,21 @@ def test_singular_and_plural_class_aliases_are_normalized(task1_module):
     assert singular["distance"] == 2.0
 
 
-def test_confirmation_applies_ema_to_range_and_angle(task1_module):
+def test_single_detection_is_not_delayed_or_filtered(task1_module):
     mission = _mission_without_ros(task1_module)
-    first = mission._normalize_obstacle(
+    obstacle = mission._nearest_relevant_obstacle([
         _detection(
             "green_buoy",
             distance=2.8,
             angle=-10.0,
             bbox=[100, 100, 140, 160],
         )
-    )
-    second = mission._normalize_obstacle(
-        _detection(
-            "green_buoy",
-            distance=2.0,
-            angle=-6.0,
-            bbox=[104, 100, 144, 160],
-        )
-    )
+    ])
 
-    assert mission._confirmed_obstacle(first, now=1.0) is None
-    confirmed = mission._confirmed_obstacle(second, now=1.2)
-
-    assert confirmed["distance"] == pytest.approx(2.48)
-    assert mission._detection_angle_deg(confirmed) == pytest.approx(-8.4)
+    assert obstacle["distance"] == pytest.approx(2.8)
+    assert mission._detection_angle_deg(obstacle) == pytest.approx(-10.0)
+    assert mission._start_avoidance(obstacle, now=1.0)
+    assert mission.state is task1_module.MissionState.AVOIDING
 
 
 def test_active_obstacle_prefers_exact_track_id(task1_module):
@@ -665,18 +650,15 @@ def test_avoidance_starts_only_at_four_metres(
         lambda *args, **kwargs: None,
     )
 
-    for now in (1.0, 1.1):
-        clock["now"] = now
-        mission.update([
-            _detection("red_buoys", distance=4.01, angle=0.0)
-        ])
+    mission.update([
+        _detection("red_buoys", distance=4.01, angle=0.0)
+    ])
     assert mission.state is task1_module.MissionState.NAVIGATING
 
-    for now in (1.2, 1.3):
-        clock["now"] = now
-        mission.update([
-            _detection("red_buoys", distance=4.0, angle=0.0)
-        ])
+    clock["now"] = 1.1
+    mission.update([
+        _detection("red_buoys", distance=4.0, angle=0.0)
+    ])
 
     assert task1_module.AVOIDANCE_START_DISTANCE_M == 4.0
     assert mission.state is task1_module.MissionState.AVOIDING

@@ -115,7 +115,6 @@ def _mission(task2_module):
     mission.aligned_target_key = None
     mission.resume_navigation_without_alignment = False
     mission.yellow_course_acquired = False
-    mission.yellow_initial_search_started_time = None
     mission.waypoint_hold_until = None
     mission.waypoint_hold_name = None
     mission.state = task2_module.MissionState.NAVIGATING
@@ -638,7 +637,7 @@ def test_normal_navigation_publishes_dynamic_yellow_course_target(task2_module):
     assert mission.yellow_course_acquired is True
 
 
-def test_initial_yellow_search_uses_main_waypoint_then_stops(
+def test_missing_yellow_course_keeps_following_main_waypoint(
         task2_module,
         monkeypatch,
 ):
@@ -693,5 +692,5 @@ def test_initial_yellow_search_uses_main_waypoint_then_stops(
         detections=[],
     )
 
-    assert published_targets == [main_target, main_target]
-    assert velocity_commands == [(0.0, 0.0)]
+    assert published_targets == [main_target, main_target, main_target]
+    assert velocity_commands == []

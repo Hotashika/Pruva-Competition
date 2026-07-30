@@ -98,9 +98,6 @@ WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 # ============================================================
 # SARI DUBA PARKUR PARAMETRELERİ
 # ============================================================
-# Gorev basinda iki sari duba bulunamazsa bu sure boyunca ana GPS hedefine git.
-INITIAL_YELLOW_SEARCH_GRACE_SEC = 3.0
-
 # Ikinci en yakin sari dubaya yonelirken uretilecek kisa GPS hedefinin ust mesafesi.
 YELLOW_COURSE_LOOKAHEAD_M = 5.0
 
@@ -179,7 +176,6 @@ class Task2PointTrackingWithObstacleAvoidance:
             target_memory_sec=YELLOW_TARGET_MEMORY_SEC,
         ))
         self.yellow_course_acquired = False
-        self.yellow_initial_search_started_time = None
         self.aligned_target_key = None
         self.resume_navigation_without_alignment = False
         self.waypoint_hold_until = None
@@ -948,40 +944,33 @@ class Task2PointTrackingWithObstacleAvoidance:
                 now=now,
             )
             if course_decision.should_stop:
-                initial_search_active = (
-                    not self.yellow_course_acquired
-                    and course_decision.reason == "fewer_than_two_yellow_buoys"
-                )
-                if initial_search_active:
-                    if self.yellow_initial_search_started_time is None:
-                        self.yellow_initial_search_started_time = now
-                    search_elapsed = now - self.yellow_initial_search_started_time
-                    if search_elapsed < INITIAL_YELLOW_SEARCH_GRACE_SEC:
-                        navigation_status = (
-                            f"initial_yellow_search/{search_elapsed:.1f}s/"
-                            "direct_main_waypoint"
-                        )
-                    else:
-                        initial_search_active = False
-
-                if not initial_search_active:
-                    if self.resume_navigation_without_alignment:
-                        navigation_status = (
-                            "post_avoidance_main_waypoint_fallback/"
-                            f"{course_decision.reason}"
-                        )
-                    else:
-                        publish_cmd_vel(
-                            self.topics.cmd_vel_pub,
-                            linear_x=0.0,
-                            angular_z=0.0,
-                        )
-                        self.logger.warn(
-                            f"Sarı duba parkur hedefi hesaplanamadı "
-                            f"({course_decision.reason}); araç bekletiliyor.",
-                            throttle_duration_sec=1.0,
-                        )
-                        return False
+                if course_decision.reason == "fewer_than_two_yellow_buoys":
+                    navigation_status = (
+                        "yellow_course_unavailable/"
+                        "direct_main_waypoint"
+                    )
+                    self.logger.warn(
+                        "Yeterli sarı duba bulunamadı; ana GPS waypoint'ine "
+                        "devam ediliyor.",
+                        throttle_duration_sec=1.0,
+                    )
+                elif self.resume_navigation_without_alignment:
+                    navigation_status = (
+                        "post_avoidance_main_waypoint_fallback/"
+                        f"{course_decision.reason}"
+                    )
+                else:
+                    publish_cmd_vel(
+                        self.topics.cmd_vel_pub,
+                        linear_x=0.0,
+                        angular_z=0.0,
+                    )
+                    self.logger.warn(
+                        f"Sarı duba parkur hedefi hesaplanamadı "
+                        f"({course_decision.reason}); araç bekletiliyor.",
+                        throttle_duration_sec=1.0,
+                    )
+                    return False
             if (
                     course_decision.target_lat is not None
                     and course_decision.target_lon is not None

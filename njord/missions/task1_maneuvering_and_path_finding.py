@@ -69,19 +69,13 @@ AVOIDANCE_BEHIND_MARGIN_M = 1.0
 AVOIDANCE_MATCH_MAX_BEARING_DELTA_DEG = 45.0
 AVOIDANCE_MATCH_MAX_DISTANCE_DELTA_M = 4.0
 AVOIDANCE_TIMEOUT_SEC = 40.0
-TASK_TARGET_SPEED_KNOTS = 2.0
-TASK_TARGET_SPEED_M_S = TASK_TARGET_SPEED_KNOTS * 0.514444
+AVOIDANCE_SPEED_M_S = 1.0
 
 # ============================================================
 # VISION / ENGEL EŞLEŞTİRME PARAMETRELERİ
 # ============================================================
-VISION_DETECTION_TIMEOUT_SEC = 12.0
+VISION_DETECTION_TIMEOUT_SEC = 1.0
 MIN_OBSTACLE_CONFIDENCE = 0.45
-OBSTACLE_CONFIRMATION_MAX_GAP_SEC = 0.75
-OBSTACLE_FILTER_ALPHA = 0.40
-OBSTACLE_MATCH_MAX_ANGLE_DELTA_DEG = 25.0
-OBSTACLE_MATCH_MAX_DISTANCE_DELTA_M = 2.0
-OBSTACLE_BBOX_MIN_IOU = 0.05
 SIDE_FALLBACK_ANGLE_DEG = 15.0
 RED_BUOY_CLASS = "red_buoys"
 GREEN_BUOY_CLASS = "green_buoys"
@@ -169,9 +163,6 @@ class Task1Maneuvering:
         self.avoiding_class = None  # RELEVANT_OBSTACLE_CLASSES icinden biri veya None
         self.avoiding_track_id = None
         self.active_obstacle_reference = None
-        self.pending_obstacle = None
-        self.pending_obstacle_time = None
-        self.pending_obstacle_count = 0
         self.avoid_started_time = None
         self.avoidance_phase_started_time = None
         self.avoidance_phase = None
@@ -402,158 +393,18 @@ class Task1Maneuvering:
             return "center"
         return None
 
-    @staticmethod
-    def _bbox_iou(first, second):
-        if not (
-                isinstance(first, (list, tuple))
-                and isinstance(second, (list, tuple))
-                and len(first) >= 4
-                and len(second) >= 4
-        ):
-            return None
-        try:
-            ax1, ay1, ax2, ay2 = map(float, first[:4])
-            bx1, by1, bx2, by2 = map(float, second[:4])
-        except (TypeError, ValueError):
-            return None
-        intersection = (
-            max(0.0, min(ax2, bx2) - max(ax1, bx1))
-            * max(0.0, min(ay2, by2) - max(ay1, by1))
-        )
-        union = (
-            max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-            + max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-            - intersection
-        )
-        return intersection / union if union > 0.0 else None
-
-    def _same_obstacle(self, candidate, reference):
-        if reference is None or candidate.get("class") != reference.get("class"):
-            return reference is None
-
-        candidate_track = candidate.get("track_id")
-        reference_track = reference.get("track_id")
-        if candidate_track is not None and reference_track is not None:
-            if candidate_track == reference_track:
-                return True
-
-        bbox_iou = self._bbox_iou(
-            candidate.get("bbox"),
-            reference.get("bbox"),
-        )
-        bbox_match = bbox_iou is not None and bbox_iou >= OBSTACLE_BBOX_MIN_IOU
-
-        angle = self._detection_angle_deg(candidate)
-        reference_angle = self._detection_angle_deg(reference)
-        distance = self._safe_float(candidate.get("distance"))
-        reference_distance = self._safe_float(reference.get("distance"))
-        motion_match = (
-            angle is not None
-            and reference_angle is not None
-            and distance is not None
-            and reference_distance is not None
-            and abs(angle - reference_angle) <= OBSTACLE_MATCH_MAX_ANGLE_DELTA_DEG
-            and abs(distance - reference_distance)
-            <= OBSTACLE_MATCH_MAX_DISTANCE_DELTA_M
-        )
-        return bbox_match or motion_match
-
-    def _obstacle_match_score(self, candidate, reference):
-        if reference is None:
-            return float(candidate["distance"])
-        candidate_track = candidate.get("track_id")
-        reference_track = reference.get("track_id")
-        if candidate_track is not None and reference_track is not None:
-            if candidate_track == reference_track:
-                return 0.0
-            track_penalty = 1.0
-        elif reference_track is not None:
-            track_penalty = 0.5
-        else:
-            track_penalty = 0.0
-
-        bbox_iou = self._bbox_iou(
-            candidate.get("bbox"),
-            reference.get("bbox"),
-        )
-        bbox_penalty = 1.0 if bbox_iou is None else 1.0 - bbox_iou
-        angle = self._detection_angle_deg(candidate)
-        reference_angle = self._detection_angle_deg(reference)
-        angle_penalty = (
-            1.0
-            if angle is None or reference_angle is None
-            else abs(angle - reference_angle) / OBSTACLE_MATCH_MAX_ANGLE_DELTA_DEG
-        )
-        distance_penalty = (
-            abs(float(candidate["distance"]) - float(reference["distance"]))
-            / OBSTACLE_MATCH_MAX_DISTANCE_DELTA_M
-        )
-        return (
-            track_penalty
-            + bbox_penalty
-            + angle_penalty
-            + distance_penalty
-        )
-
-    def _filter_obstacle(self, obstacle, reference):
-        filtered = dict(obstacle)
-        if reference is None:
-            return filtered
-        distance = self._safe_float(obstacle.get("distance"))
-        reference_distance = self._safe_float(reference.get("distance"))
-        if distance is not None and reference_distance is not None:
-            filtered["distance"] = (
-                OBSTACLE_FILTER_ALPHA * distance
-                + (1.0 - OBSTACLE_FILTER_ALPHA) * reference_distance
-            )
-        angle = self._detection_angle_deg(obstacle)
-        reference_angle = self._detection_angle_deg(reference)
-        if angle is not None and reference_angle is not None:
-            filtered["angle_deg"] = (
-                OBSTACLE_FILTER_ALPHA * angle
-                + (1.0 - OBSTACLE_FILTER_ALPHA) * reference_angle
-            )
-        return filtered
-
     def _nearest_relevant_obstacle(self, detections, now=None):
         candidates = []
         for raw in detections or []:
             obj = self._normalize_obstacle(raw)
             if obj is None or obj["confidence"] < MIN_OBSTACLE_CONFIDENCE:
                 continue
-            if (
-                    obj["distance"] is None
-                    or not 0 < obj["distance"] < AVOIDANCE_EXIT_DISTANCE_M
-            ):
+            if obj["distance"] is None or not 0 < obj["distance"] < AVOIDANCE_EXIT_DISTANCE_M:
                 continue
             if self._detection_angle_deg(obj) is None:
                 continue
             candidates.append(obj)
         return min(candidates, key=lambda x: x["distance"]) if candidates else None
-
-    def _confirmed_obstacle(self, obstacle, now):
-        if obstacle is None:
-            self.pending_obstacle = None
-            self.pending_obstacle_count = 0
-            return None
-        previous = getattr(self, "pending_obstacle", None)
-        pending_time = getattr(self, "pending_obstacle_time", None)
-        continuous = (
-            previous is not None
-            and pending_time is not None
-            and now - pending_time <= OBSTACLE_CONFIRMATION_MAX_GAP_SEC
-            and self._same_obstacle(obstacle, previous)
-        )
-        if continuous:
-            obstacle = self._filter_obstacle(obstacle, previous)
-        self.pending_obstacle_count = self.pending_obstacle_count + 1 if continuous else 1
-        self.pending_obstacle = obstacle
-        self.pending_obstacle_time = now
-        if self.pending_obstacle_count < 2:
-            return None
-        self.pending_obstacle = None
-        self.pending_obstacle_count = 0
-        return obstacle
 
     @staticmethod
     def _detection_angle_deg(obstacle):
@@ -571,7 +422,7 @@ class Task1Maneuvering:
         return None
 
     def _pass_side_and_first_leg_bearing(self, obstacle_class):
-        """Mevcut Task 1 geçiş yönünü ilk zamanlı kolun kerterizine çevirir."""
+        """Task 1 geçiş yönünü ilk zamanlı kolun kerterizine çevirir."""
         if self.current_heading is None:
             return None
 
@@ -629,8 +480,8 @@ class Task1Maneuvering:
         """Sabit kerterizde dünya eksenli kuzey/doğu hız hedefi yayımlar."""
         bearing_rad = math.radians(float(target_bearing) % 360.0)
         message = Twist()
-        message.linear.x = TASK_TARGET_SPEED_M_S * math.cos(bearing_rad)
-        message.linear.y = TASK_TARGET_SPEED_M_S * math.sin(bearing_rad)
+        message.linear.x = AVOIDANCE_SPEED_M_S * math.cos(bearing_rad)
+        message.linear.y = AVOIDANCE_SPEED_M_S * math.sin(bearing_rad)
         message.linear.z = 0.0
         message.angular.z = 0.0
         self.topics.task2_velocity_pub.publish(message)
@@ -662,7 +513,7 @@ class Task1Maneuvering:
         self.logger.info(
             "Task 1 timed avoidance: "
             f"phase={self.avoidance_phase}, bearing={target_bearing:.1f}deg, "
-            f"speed={TASK_TARGET_SPEED_M_S:.3f}m/s.",
+            f"speed={AVOIDANCE_SPEED_M_S:.3f}m/s.",
             throttle_duration_sec=1.0,
         )
         return message
@@ -1015,7 +866,7 @@ class Task1Maneuvering:
             f"entry_heading={self.avoidance_entry_heading:.1f}deg, "
             f"pass_side={pass_side}, "
             f"first_leg_bearing={first_leg_bearing:.1f}deg, "
-            f"speed={TASK_TARGET_SPEED_M_S:.3f}m/s."
+            f"speed={AVOIDANCE_SPEED_M_S:.3f}m/s."
         )
         return True
 
@@ -1047,12 +898,8 @@ class Task1Maneuvering:
                 nearest is not None
                 and nearest["distance"] <= AVOIDANCE_START_DISTANCE_M
         ):
-            confirmed = self._confirmed_obstacle(nearest, now)
-            if confirmed is not None:
-                if self._start_avoidance(confirmed, now):
-                    return
-        else:
-            self._confirmed_obstacle(None, now)
+            if self._start_avoidance(nearest, now):
+                return
         # ---------------------------------------------------------
         # 2. WP0 / MISSION BAŞLANGIÇ KONTROLÜ
         # ---------------------------------------------------------
