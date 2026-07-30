@@ -1,4 +1,4 @@
-"""ROS-independent repeated-impact decisions for TEKNOFEST Task 3."""
+"""ROS-independent impact timing for TEKNOFEST Task 3."""
 
 from __future__ import annotations
 
@@ -9,12 +9,9 @@ from typing import Optional
 
 class ImpactAction(Enum):
     RAM_MOTION = auto()
-    CONTACT_HOLD = auto()
-    HOLD = auto()
-    FINISH = auto()
-    FORWARD_CLEAR = auto()
-    FORWARD_CLEAR_MOTION = auto()
-    IMPACT_RETURN = auto()
+    IMPACT_RECORDED = auto()
+    POST_IMPACT_MOTION = auto()
+    RETURN_TO_IMPACT = auto()
 
 
 @dataclass(frozen=True)
@@ -33,43 +30,32 @@ class Task3ImpactController:
     def reset(self):
         self.impact_count = 0
 
-    def ram_decision(self, elapsed) -> ImpactDecision:
+    def register_impact(self) -> int:
+        self.impact_count += 1
+        return self.impact_count
+
+    def ram_decision(self, elapsed, angular_z=0.0) -> ImpactDecision:
         if elapsed < self.config.ram_duration_sec:
             return ImpactDecision(
                 action=ImpactAction.RAM_MOTION,
                 linear_x=self.config.ram_speed,
+                angular_z=float(angular_z),
+                reason="direct ram",
+            )
+        return ImpactDecision(
+            action=ImpactAction.IMPACT_RECORDED,
+            reason="RAM süresi tamamlandı; çarpışma GPS'i kaydediliyor",
+        )
+
+    def post_impact_decision(self, elapsed) -> ImpactDecision:
+        if elapsed < self.config.post_impact_forward_duration_sec:
+            return ImpactDecision(
+                action=ImpactAction.POST_IMPACT_MOTION,
+                linear_x=self.config.post_impact_forward_speed,
                 angular_z=0.0,
-                reason="confirmed ram",
-            )
-
-        self.impact_count += 1
-        return ImpactDecision(
-            action=ImpactAction.CONTACT_HOLD,
-            reason=f"{self.impact_count}. temas komutu tamamlandı",
-        )
-
-    def contact_hold_decision(self, elapsed) -> ImpactDecision:
-        if elapsed < self.config.contact_hold_sec:
-            return ImpactDecision(action=ImpactAction.HOLD)
-        if self.impact_count >= self.config.required_impact_count:
-            return ImpactDecision(
-                action=ImpactAction.FINISH,
-                reason="gerekli temas sayısı tamamlandı",
+                reason="post-impact forward advance",
             )
         return ImpactDecision(
-            action=ImpactAction.FORWARD_CLEAR,
-            reason="yeniden yaklaşmak için ileri ayrılma",
-        )
-
-    def forward_clear_decision(self, elapsed) -> ImpactDecision:
-        if elapsed >= self.config.post_impact_forward_duration_sec:
-            return ImpactDecision(
-                action=ImpactAction.IMPACT_RETURN,
-                reason="ileri ayrılma tamamlandı; kayıtlı hedefe dönülüyor",
-            )
-        return ImpactDecision(
-            action=ImpactAction.FORWARD_CLEAR_MOTION,
-            linear_x=self.config.post_impact_forward_speed,
-            angular_z=0.0,
-            reason="post-contact forward clear",
+            action=ImpactAction.RETURN_TO_IMPACT,
+            reason="ileri çıkış tamamlandı; kayıtlı GPS'e dönülüyor",
         )

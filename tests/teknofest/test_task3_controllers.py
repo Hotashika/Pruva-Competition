@@ -25,9 +25,8 @@ def _controller_config(**overrides):
         "search_turn_timeout_min_sec": 6.0,
         "ram_speed": 0.75,
         "ram_duration_sec": 0.2,
-        "contact_hold_sec": 0.1,
         "required_impact_count": 3,
-        "post_impact_forward_speed": 0.4,
+        "post_impact_forward_speed": 0.85,
         "post_impact_forward_duration_sec": 1.5,
     }
     values.update(overrides)
@@ -180,26 +179,25 @@ def test_search_turn_watchdog_reports_failure():
     assert "watchdog timeout" in decision.reason
 
 
-def test_impact_controller_owns_ram_hold_and_forward_clear_decisions():
+def test_impact_controller_owns_ram_and_post_impact_timing():
     controller = Task3ImpactController(_controller_config())
 
-    ram = controller.ram_decision(elapsed=0.1)
+    ram = controller.ram_decision(elapsed=0.1, angular_z=0.12)
     assert ram.action is ImpactAction.RAM_MOTION
     assert ram.linear_x == pytest.approx(0.75)
+    assert ram.angular_z == pytest.approx(0.12)
 
-    contact = controller.ram_decision(elapsed=0.21)
-    assert contact.action is ImpactAction.CONTACT_HOLD
+    impact = controller.ram_decision(elapsed=0.21)
+    assert impact.action is ImpactAction.IMPACT_RECORDED
+    assert controller.impact_count == 0
+
+    assert controller.register_impact() == 1
     assert controller.impact_count == 1
 
-    hold = controller.contact_hold_decision(elapsed=0.05)
-    assert hold.action is ImpactAction.HOLD
-    forward_clear = controller.contact_hold_decision(elapsed=0.11)
-    assert forward_clear.action is ImpactAction.FORWARD_CLEAR
-
-    forward_motion = controller.forward_clear_decision(elapsed=0.2)
-    assert forward_motion.action is ImpactAction.FORWARD_CLEAR_MOTION
-    assert forward_motion.linear_x == pytest.approx(0.4)
+    forward_motion = controller.post_impact_decision(elapsed=0.2)
+    assert forward_motion.action is ImpactAction.POST_IMPACT_MOTION
+    assert forward_motion.linear_x == pytest.approx(0.85)
     assert forward_motion.angular_z == pytest.approx(0.0)
 
-    impact_return = controller.forward_clear_decision(elapsed=1.5)
-    assert impact_return.action is ImpactAction.IMPACT_RETURN
+    impact_return = controller.post_impact_decision(elapsed=1.5)
+    assert impact_return.action is ImpactAction.RETURN_TO_IMPACT

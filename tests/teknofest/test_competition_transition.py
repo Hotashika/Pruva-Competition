@@ -237,7 +237,54 @@ def test_task3_uses_tighter_vision_stale_limit(monkeypatch):
     node.timer_callback()
 
     assert updates == []
-    assert failures == ["Vision heartbeat kaybı. FAILSAFE + HOLD."]
+    assert failures == ["Vision heartbeat kaybı. FAILSAFE + LOITER."]
+
+
+def test_task3_gps_return_does_not_require_fresh_vision(monkeypatch):
+    competition = _load_competition_module(monkeypatch)
+    node, updates, _ = _timer_node(
+        competition,
+        competition.CompetitionState.PARKUR_3,
+    )
+    node.last_detection_message_time = competition.time.monotonic() - 10.0
+    node._get_fresh_detections = lambda: []
+    node.task3.config = types.SimpleNamespace(
+        vision_detection_timeout_sec=1.0
+    )
+    node.task3.impact_target_gps = {
+        "lat": 37.95125,
+        "lon": 32.50090,
+    }
+
+    node.timer_callback()
+
+    assert updates == [("task3", [])]
+
+
+def test_task3_competition_failsafe_requests_loiter_not_task1_hold(
+        monkeypatch,
+):
+    competition = _load_competition_module(monkeypatch)
+    node = competition.CompetitionNode.__new__(competition.CompetitionNode)
+    node.competition_state = competition.CompetitionState.PARKUR_3
+    node.mission_topics = types.SimpleNamespace(cmd_vel_pub="cmd_vel")
+    node.get_logger = lambda: types.SimpleNamespace(
+        error=lambda *args, **kwargs: None
+    )
+    task1_holds = []
+    task3_loiters = []
+    node.task1 = types.SimpleNamespace(
+        _request_hold_mode=lambda: task1_holds.append(True)
+    )
+    node.task3 = types.SimpleNamespace(
+        request_failsafe_loiter=task3_loiters.append
+    )
+
+    node._enter_competition_failsafe("task3 failure")
+
+    assert node.competition_state is competition.CompetitionState.FAILSAFE
+    assert task1_holds == []
+    assert task3_loiters == ["task3 failure"]
 
 
 def test_competition_file_launch_promotes_repository_utils(monkeypatch):

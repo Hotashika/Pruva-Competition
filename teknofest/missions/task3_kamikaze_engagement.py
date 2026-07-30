@@ -1,13 +1,14 @@
-"""TEKNOFEST Task 3: confirmed buoy search, approach, and repeated impact."""
+"""TEKNOFEST Task 3: direct buoy attack and GPS-anchored repeated impact."""
 
 import json
+import math
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT_TEXT = str(REPO_ROOT)
@@ -16,10 +17,24 @@ while REPO_ROOT_TEXT in sys.path:
 sys.path.insert(0, REPO_ROOT_TEXT)
 
 import rclpy
+from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
 
 from teknofest.missions.utils.mission_data_recorder import MissionDataRecorder
+from teknofest.missions.utils.task3_impact_controller import (
+    ImpactAction,
+    Task3ImpactController,
+)
+from teknofest.missions.utils.task3_search_controller import (
+    SearchPhase,
+    Task3SearchController,
+)
+from teknofest.missions.utils.task3_targeting import (
+    filter_target,
+    select_target,
+    target_is_consistent,
+)
 from utils.mavlink_utilities import (
     calculate_gps_distance,
     call_set_mode,
@@ -28,32 +43,17 @@ from utils.mavlink_utilities import (
     create_mission_topics,
     parse_bridge_state,
     publish_cmd_vel,
+    publish_set_position,
     stop_vehicle,
     wait_for_mission_services,
 )
-from teknofest.missions.utils.task3_impact_controller import (
-    ImpactAction,
-    Task3ImpactController,
-)
-from teknofest.missions.utils.task3_search_controller import (
-    SearchPhase,
-    Task3SearchController,
-    angle_error_deg,
-)
-from teknofest.missions.utils.task3_targeting import (
-    filter_target,
-    median,
-    select_target,
-    target_is_consistent,
-)
 
-# ============================================================
-# GÖREV / NAVİGASYON SABİTLERİ
-# ============================================================
+
 DRIVE_MODE = "GUIDED"
+HOLD_MODE = "LOITER"
 ACTIVE_TASK_NAME = "task3"
+MISSION_STATE_HEARTBEAT_SEC = 1.0
 
-# Task3 yalnızca bu listedeki kırmızı ve turuncu dubaları hedef alır.
 TASK3_TARGET_BUOY_CLASSES = (
     "red_buoy",
     "red_buoys",
@@ -64,21 +64,22 @@ TASK3_TARGET_BUOY_CLASSES = (
 
 @dataclass(frozen=True)
 class Task3Config:
-    # Hedef parametreleri
+    # Hedef
     target_classes: Tuple[str, ...] = TASK3_TARGET_BUOY_CLASSES
     required_impact_count: int = 3
     min_confidence: float = 0.45
 
-    # Güvenlik parametreleri
+    # Güvenlik
     gps_timeout_sec: float = 2.0
     heading_timeout_sec: float = 2.0
     bridge_state_timeout_sec: float = 10.0
-    vision_detection_timeout_sec: float = 3.0
+    vision_detection_timeout_sec: float = 12.0
     geofence_radius_m: float = 25.0
     mission_timeout_sec: float = 240.0
+    mode_transition_timeout_sec: float = 5.0
+    loiter_mode: str = HOLD_MODE
 
-    # Arama parametreleri
-    entry_settle_sec: float = 1.0
+    # Arama
     search_linear_x: float = 0.25
     search_angular_z: float = 0.18
     search_initial_sweep_deg: float = 20.0
@@ -88,77 +89,62 @@ class Task3Config:
     search_heading_tolerance_deg: float = 2.0
     search_turn_timeout_min_sec: float = 6.0
 
-    # Hedef doğrulama parametreleri
+    # İki karelik saldırı teyidi
     confirmation_window_size: int = 2
     confirmation_required: int = 2
     confirmation_max_gap_sec: float = 0.5
-    target_filter_alpha: float = 0.40
     confirmation_angle_spread_deg: float = 12.0
     confirmation_distance_spread_ratio: float = 0.45
-    acquire_timeout_sec: float = 2.0
-
-    # Yaklaşma / dümen parametreleri
-    align_tolerance_deg: float = 8.0
-    realign_threshold_deg: float = 30.0
-    steering_kp: float = 0.018
-    max_angular_z: float = 0.35
-    far_approach_distance_m: float = 4.0
-    final_confirm_distance_m: float = 1.4
-    approach_distance_window_size: int = 7
-    approach_distance_required: int = 5
-    far_approach_speed: float = 0.70
-    medium_approach_speed: float = 0.55
-    near_approach_speed: float = 0.40
-
-    # Hedef sürekliliği parametreleri
-    final_confirmation_required: int = 2
-    final_confirm_forward_speed: float = 0.35
-    final_distance_spread_m: float = 0.35
+    target_filter_alpha: float = 0.40
     target_angle_jump_deg: float = 25.0
     target_distance_jump_ratio: float = 0.60
     target_bbox_min_iou: float = 0.05
-    target_lost_timeout_sec: float = 1.0
-    reacquire_linear_x: float = 0.15
-    reacquire_angular_z: float = 0.16
+    attack_confirm_timeout_sec: float = 2.0
+    attack_confirm_speed: float = 0.40
+    steering_kp: float = 0.018
+    max_angular_z: float = 0.35
 
-    # Temas / geri çekilme parametreleri
+    # Temas ve kayıtlı GPS'e dönüş
     ram_speed: float = 0.85
     ram_duration_sec: float = 2.0
-    contact_hold_sec: float = 0.7
-    retreat_speed: float = 0.25
-    retreat_min_sec: float = 0.6
-    retreat_max_sec: float = 1.5
-    retreat_target_distance_m: float = 2.5
-    retreat_heading_max_angular_z: float = 0.25
+    post_impact_forward_speed: float = 0.85
+    post_impact_forward_duration_sec: float = 2.5
+    impact_return_tolerance_m: float = 1.0
+    impact_return_timeout_sec: float = 20.0
 
     def __post_init__(self):
         if self.required_impact_count < 1:
             raise ValueError("required_impact_count must be at least 1")
-        if self.confirmation_required > self.confirmation_window_size:
-            raise ValueError(
-                "confirmation_required cannot exceed confirmation_window_size"
-            )
-        if self.approach_distance_window_size < 1:
-            raise ValueError(
-                "approach_distance_window_size must be at least 1"
-            )
         if not (
                 1
-                <= self.approach_distance_required
-                <= self.approach_distance_window_size
+                <= self.confirmation_required
+                <= self.confirmation_window_size
         ):
             raise ValueError(
-                "approach_distance_required must be between 1 and "
-                "approach_distance_window_size"
+                "confirmation_required must be between 1 and "
+                "confirmation_window_size"
             )
-        if self.search_linear_x <= 0.0:
-            raise ValueError("search_linear_x must be positive")
-        if self.search_angular_z <= 0.0:
-            raise ValueError("search_angular_z must be positive")
-        if self.search_initial_sweep_deg <= 0.0:
-            raise ValueError("search_initial_sweep_deg must be positive")
-        if self.search_sweep_increment_deg <= 0.0:
-            raise ValueError("search_sweep_increment_deg must be positive")
+        for name in (
+                "search_linear_x",
+                "search_angular_z",
+                "search_initial_sweep_deg",
+                "search_sweep_increment_deg",
+                "search_forward_duration_sec",
+                "search_heading_tolerance_deg",
+                "search_turn_timeout_min_sec",
+                "attack_confirm_speed",
+                "ram_speed",
+                "ram_duration_sec",
+                "post_impact_forward_speed",
+                "post_impact_forward_duration_sec",
+                "impact_return_tolerance_m",
+                "impact_return_timeout_sec",
+                "mode_transition_timeout_sec",
+                "confirmation_max_gap_sec",
+                "attack_confirm_timeout_sec",
+        ):
+            if float(getattr(self, name)) <= 0.0:
+                raise ValueError(f"{name} must be positive")
         if (
                 self.search_max_sweep_deg < self.search_initial_sweep_deg
                 or self.search_max_sweep_deg > 180.0
@@ -167,33 +153,33 @@ class Task3Config:
                 "search_max_sweep_deg must be between "
                 "search_initial_sweep_deg and 180"
             )
-        if self.search_forward_duration_sec <= 0.0:
-            raise ValueError("search_forward_duration_sec must be positive")
-        if self.search_heading_tolerance_deg <= 0.0:
-            raise ValueError("search_heading_tolerance_deg must be positive")
-        if self.search_turn_timeout_min_sec <= 0.0:
-            raise ValueError("search_turn_timeout_min_sec must be positive")
-        if self.final_confirm_forward_speed <= 0.0:
-            raise ValueError("final_confirm_forward_speed must be positive")
+        if str(self.loiter_mode).strip().upper() != HOLD_MODE:
+            raise ValueError("loiter_mode must be LOITER")
 
 
 class MissionState(Enum):
     INIT = auto()
-    ENTRY_SETTLE = auto()
+    WAIT_GUIDED_SEARCH = auto()
     SEARCH = auto()
-    ACQUIRE_CONFIRM = auto()
-    ALIGN = auto()
-    APPROACH = auto()
-    FINAL_CONFIRM = auto()
+    ATTACK_CONFIRM = auto()
     RAM = auto()
-    CONTACT_HOLD = auto()
-    RETREAT = auto()
-    REACQUIRE = auto()
+    POST_IMPACT_ADVANCE = auto()
+    RETURN_TO_IMPACT = auto()
+    FINAL_LOITER = auto()
+    FAILSAFE_LOITER = auto()
     FINISHED = auto()
     FAILSAFE = auto()
 
 
 class Task3KamikazeEngagement:
+    _GUIDED_STATES = {
+        MissionState.SEARCH,
+        MissionState.ATTACK_CONFIRM,
+        MissionState.RAM,
+        MissionState.POST_IMPACT_ADVANCE,
+        MissionState.RETURN_TO_IMPACT,
+    }
+
     def __init__(
             self,
             node,
@@ -226,28 +212,29 @@ class Task3KamikazeEngagement:
         self.mission_started_at = None
         self.state_started_at = None
         self.state = MissionState.INIT
+        self.last_state_publish_at = None
         self.finished = False
 
-        self.impact_count = 0
         self.last_target = None
         self.last_target_angle = 0.0
         self.confirmation_samples = deque(
             maxlen=self.config.confirmation_window_size
         )
         self.confirmation_last_time = None
-        self.distance_history = deque(
-            maxlen=self.config.approach_distance_window_size
-        )
-        self.final_confirmation_samples = deque(
-            maxlen=self.config.final_confirmation_required
-        )
 
-        self.retreat_heading = None
+        self.impact_target_gps = None
+        self.impact_events = []
+        self.impact_return_departed = False
 
         self.target_data_uncertain = False
         self.target_data_uncertain_reason = None
         self.target_rejection_reason = None
         self.last_observed_classes = ()
+
+        self.pending_mode_name = None
+        self.pending_mode_future = None
+        self.pending_mode_started_at = None
+        self.failsafe_reason = None
 
     @property
     def impact_count(self):
@@ -257,25 +244,9 @@ class Task3KamikazeEngagement:
     def impact_count(self, value):
         self.impact_controller.impact_count = int(value)
 
-    @property
-    def retreat_heading(self):
-        return self.impact_controller.retreat_heading
-
-    @retreat_heading.setter
-    def retreat_heading(self, value):
-        self.impact_controller.retreat_heading = value
-
     @staticmethod
     def _now(now):
         return time.monotonic() if now is None else float(now)
-
-    @staticmethod
-    def _angle_error_deg(target_deg, current_deg):
-        return angle_error_deg(target_deg, current_deg)
-
-    @staticmethod
-    def _median(values):
-        return median(values)
 
     def _set_state(self, state, now, reason=None):
         if state == self.state:
@@ -289,9 +260,34 @@ class Task3KamikazeEngagement:
             )
         else:
             self.logger.info(f"Task 3 state: {previous.name} -> {state.name}")
+        self._publish_state(now, force=True)
+
+    def _publish_state(self, now=None, force=False):
+        publisher = getattr(self.topics, "mission_state_pub", None)
+        if publisher is None:
+            return
+        now = self._now(now)
+        if (
+                not force
+                and self.last_state_publish_at is not None
+                and now - self.last_state_publish_at
+                < MISSION_STATE_HEARTBEAT_SEC
+        ):
+            return
+        message = String()
+        message.data = self.state.name
+        publisher.publish(message)
+        self.last_state_publish_at = now
 
     def _stop(self):
         stop_vehicle(self.topics.cmd_vel_pub)
+
+    def _steering_command(self, angle):
+        command = self.config.steering_kp * float(angle)
+        return max(
+            -self.config.max_angular_z,
+            min(self.config.max_angular_z, command),
+        )
 
     def _publish_motion(self, linear_x, angular_z, reason):
         linear_x = max(-1.0, min(1.0, float(linear_x)))
@@ -299,14 +295,9 @@ class Task3KamikazeEngagement:
             -self.config.max_angular_z,
             min(self.config.max_angular_z, float(angular_z)),
         )
-        retreat_allowed = (
-            self.state == MissionState.RETREAT
-            and self.impact_count > 0
-        )
-        if linear_x < 0.0 and not retreat_allowed:
+        if linear_x < 0.0:
             self._enter_failsafe(
-                "Task 3 güvenlik ihlali: doğrulanmış temas dışında "
-                "negatif linear_x engellendi."
+                "Task 3 güvenlik ihlali: negatif linear_x engellendi."
             )
             return False
 
@@ -333,12 +324,126 @@ class Task3KamikazeEngagement:
         )
         return True
 
-    def _enter_failsafe(self, reason):
-        if self.state != MissionState.FAILSAFE:
-            self.logger.error(reason)
-        self.state = MissionState.FAILSAFE
-        self.finished = False
+    def _clear_pending_mode(self):
+        self.pending_mode_name = None
+        self.pending_mode_future = None
+        self.pending_mode_started_at = None
+
+    def _cancel_pending_mode(self):
+        future = self.pending_mode_future
+        if future is not None and not future.done():
+            cancel = getattr(future, "cancel", None)
+            if callable(cancel):
+                cancel()
+        self._clear_pending_mode()
+
+    def _mode_transition_failed(self, desired_mode, reason, now):
+        self._clear_pending_mode()
         self._stop()
+        self.logger.error(reason)
+        if desired_mode == self.config.loiter_mode:
+            self.finished = False
+            self._set_state(MissionState.FAILSAFE, now, reason)
+            return
+        self._enter_failsafe(reason, now=now)
+
+    def _ensure_mode(self, desired_mode, now):
+        desired_mode = str(desired_mode).strip().upper()
+        if self.bridge_mode == desired_mode:
+            if self.pending_mode_name == desired_mode:
+                self._clear_pending_mode()
+            return True
+
+        if (
+                self.pending_mode_name is not None
+                and self.pending_mode_name != desired_mode
+        ):
+            self._cancel_pending_mode()
+
+        if self.pending_mode_name is None:
+            client = getattr(self.clients, "set_mode_client", None)
+            if client is None:
+                self._mode_transition_failed(
+                    desired_mode,
+                    f"Task 3 {desired_mode} modu istenemedi: client yok.",
+                    now,
+                )
+                return False
+            request = SetMode.Request()
+            request.base_mode = 0
+            request.custom_mode = desired_mode
+            try:
+                self.pending_mode_future = client.call_async(request)
+            except Exception as exc:
+                self._mode_transition_failed(
+                    desired_mode,
+                    f"Task 3 {desired_mode} modu istenemedi: {exc}",
+                    now,
+                )
+                return False
+            self.pending_mode_name = desired_mode
+            self.pending_mode_started_at = now
+            self.logger.info(
+                f"Task 3 mode request sent: {desired_mode}; "
+                "heartbeat confirmation waiting."
+            )
+            return False
+
+        future = self.pending_mode_future
+        if future is not None and future.done():
+            try:
+                response = future.result()
+            except Exception as exc:
+                self._mode_transition_failed(
+                    desired_mode,
+                    f"Task 3 {desired_mode} service error: {exc}",
+                    now,
+                )
+                return False
+            if response is None or not bool(
+                    getattr(response, "mode_sent", False)
+            ):
+                self._mode_transition_failed(
+                    desired_mode,
+                    f"Task 3 {desired_mode} mode request was rejected.",
+                    now,
+                )
+                return False
+
+        if (
+                self.pending_mode_started_at is not None
+                and now - self.pending_mode_started_at
+                >= self.config.mode_transition_timeout_sec
+        ):
+            self._mode_transition_failed(
+                desired_mode,
+                f"Task 3 {desired_mode} heartbeat confirmation timed out.",
+                now,
+            )
+        return False
+
+    def _enter_failsafe(self, reason, now=None):
+        now = self._now(now)
+        if self.state not in (
+                MissionState.FAILSAFE_LOITER,
+                MissionState.FAILSAFE,
+        ):
+            self.logger.error(reason)
+        self.failsafe_reason = reason
+        self.finished = False
+        self._cancel_pending_mode()
+        self._stop()
+        self._set_state(
+            MissionState.FAILSAFE_LOITER,
+            now,
+            "FAILSAFE nedeniyle LOITER isteniyor",
+        )
+
+    def request_failsafe_loiter(self, reason, now=None):
+        """Stop immediately and dispatch the Task 3 LOITER request."""
+        now = self._now(now)
+        self._enter_failsafe(reason, now=now)
+        self._update_failsafe_loiter(now)
 
     def reset_for_entry(self, lat, lon, heading, now=None):
         now = self._now(now)
@@ -352,13 +457,15 @@ class Task3KamikazeEngagement:
         self.entry_heading = self.current_heading
         self.mission_started_at = now
         self.finished = False
+        self.failsafe_reason = None
         self.impact_controller.reset()
         self.last_target = None
         self.last_target_angle = 0.0
         self.confirmation_samples.clear()
         self.confirmation_last_time = None
-        self.distance_history.clear()
-        self.final_confirmation_samples.clear()
+        self.impact_target_gps = None
+        self.impact_events = []
+        self.impact_return_departed = False
         self.search_controller.reset_for_entry(
             self.current_heading,
             now,
@@ -367,8 +474,10 @@ class Task3KamikazeEngagement:
         self.target_data_uncertain_reason = None
         self.target_rejection_reason = None
         self.last_observed_classes = ()
-        self.state = MissionState.ENTRY_SETTLE
+        self._cancel_pending_mode()
+        self.state = MissionState.WAIT_GUIDED_SEARCH
         self.state_started_at = now
+        self._publish_state(now, force=True)
         self._stop()
         self.logger.info(
             "Task 3 giriş durumu sıfırlandı: "
@@ -414,52 +523,49 @@ class Task3KamikazeEngagement:
     def _check_navigation(self, now):
         if self.last_gps_time is None or self.last_heading_time is None:
             self._stop()
-            self.logger.info(
-                "Task 3 GPS ve heading verisi bekliyor.",
-                throttle_duration_sec=2.0,
-            )
             return False
         if now - self.last_gps_time > self.config.gps_timeout_sec:
-            self._enter_failsafe("Task 3 GPS watchdog zaman aşımı.")
+            self._enter_failsafe(
+                "Task 3 GPS watchdog zaman aşımı.",
+                now=now,
+            )
             return False
         if now - self.last_heading_time > self.config.heading_timeout_sec:
-            self._enter_failsafe("Task 3 heading watchdog zaman aşımı.")
+            self._enter_failsafe(
+                "Task 3 heading watchdog zaman aşımı.",
+                now=now,
+            )
             return False
         return True
 
     def _check_bridge(self, now):
+        if self.last_bridge_state_time is None:
+            self._stop()
+            return False
         if (
-                self.last_bridge_state_time is not None
-                and now - self.last_bridge_state_time
+                now - self.last_bridge_state_time
                 > self.config.bridge_state_timeout_sec
         ):
-            self._enter_failsafe("Task 3 bridge state watchdog zaman aşımı.")
-            return False
-        if self.bridge_connected is False:
-            self._stop()
-            self.logger.warn(
-                "Task 3 bridge bağlantısı yok; araç bekletiliyor.",
-                throttle_duration_sec=2.0,
+            self._enter_failsafe(
+                "Task 3 bridge state watchdog zaman aşımı.",
+                now=now,
             )
             return False
-        if self.bridge_armed is False:
-            self._stop()
-            self.logger.warn(
-                "Task 3 araç ARM değil; araç bekletiliyor.",
-                throttle_duration_sec=2.0,
+        if self.bridge_connected is not True:
+            self._enter_failsafe(
+                "Task 3 bridge bağlantısı yok.",
+                now=now,
             )
             return False
-        if self.bridge_mode not in (None, DRIVE_MODE):
-            self._stop()
-            self.logger.warn(
-                f"Task 3 bridge mode={self.bridge_mode}; "
-                f"beklenen={DRIVE_MODE}.",
-                throttle_duration_sec=2.0,
+        if self.bridge_armed is not True:
+            self._enter_failsafe(
+                "Task 3 araç ARM değil.",
+                now=now,
             )
             return False
         return True
 
-    def _check_geofence(self):
+    def _check_geofence(self, now):
         if (
                 self.home_lat is None
                 or self.home_lon is None
@@ -476,7 +582,8 @@ class Task3KamikazeEngagement:
         if distance > self.config.geofence_radius_m:
             self._enter_failsafe(
                 f"Task 3 yerel geofence ihlali: "
-                f"{distance:.1f}m > {self.config.geofence_radius_m:.1f}m."
+                f"{distance:.1f}m > {self.config.geofence_radius_m:.1f}m.",
+                now=now,
             )
             return False
         return True
@@ -546,7 +653,7 @@ class Task3KamikazeEngagement:
         ]
         angles = [sample["angle"] for sample in recent]
         distances = [sample["distance"] for sample in recent]
-        distance_median = self._median(distances)
+        distance_median = sorted(distances)[len(distances) // 2]
         distance_spread_ratio = (
             (max(distances) - min(distances)) / max(distance_median, 0.1)
         )
@@ -559,91 +666,72 @@ class Task3KamikazeEngagement:
             self.confirmation_samples.clear()
             self.confirmation_samples.append(target)
             return None
-
         return dict(recent[-1])
 
-    def _wait_for_target_data(self):
-        if not self.target_data_uncertain:
-            return False
-        self._stop()
-        self.logger.warn(
-            f"Task3 target verisi belirsiz: "
-            f"{self.target_data_uncertain_reason}; state={self.state.name}, "
-            f"observed={list(self.last_observed_classes)}, "
-            f"rejected={self.target_rejection_reason}, "
-            f"linear_x=+0.00, angular_z=+0.00. Araç bekletiliyor.",
-            throttle_duration_sec=1.0,
-        )
-        return True
+    def _enter_search(self, now, reason):
+        self.search_controller.enter_search(self.current_heading, now)
+        self.confirmation_samples.clear()
+        self.confirmation_last_time = None
+        self.last_target = None
+        self._set_state(MissionState.SEARCH, now, reason)
 
-    def _begin_acquisition(self, target, now, reason):
-        self._stop()
+    def _begin_attack_confirmation(self, target, now):
         self.confirmation_samples.clear()
         self.confirmation_samples.append(target)
         self.confirmation_last_time = now
         self.last_target = target
         self.last_target_angle = target["angle"]
-        self._set_state(MissionState.ACQUIRE_CONFIRM, now, reason)
-        self.logger.info(
-            f"Task3 decision: state={self.state.name}, reason={reason}, "
-            f"observed={list(self.last_observed_classes)}, "
-            f"target={target['class']}/{target['distance']:.2f}m/"
-            f"{target['angle']:+.1f}deg, rejected=None, "
-            f"linear_x=+0.00, angular_z=+0.00",
-            throttle_duration_sec=0.5,
+        self._set_state(
+            MissionState.ATTACK_CONFIRM,
+            now,
+            "ilk hedef karesi; ikinci tutarlı kare bekleniyor",
+        )
+        self._publish_motion(
+            linear_x=self.config.attack_confirm_speed,
+            angular_z=self._steering_command(target["angle"]),
+            reason="moving two-frame attack confirmation",
         )
 
-    def _enter_search(self, now, reason):
-        self._stop()
-        self.search_controller.enter_search(self.current_heading, now)
+    def _pause_for_uncertain_target_data(self, now, reason):
+        self.search_controller.pause(self.current_heading, now)
         self.confirmation_samples.clear()
         self.confirmation_last_time = None
-        self.distance_history.clear()
-        self.final_confirmation_samples.clear()
         self.last_target = None
-        self._set_state(MissionState.SEARCH, now, reason)
-
-    def _enter_reacquire(self, now, reason):
         self._stop()
-        self.retreat_heading = None
-        if self.last_target is not None:
-            self.last_target_angle = self.last_target["angle"]
-        self.confirmation_samples.clear()
-        self.confirmation_last_time = None
-        self.final_confirmation_samples.clear()
-        self._set_state(MissionState.REACQUIRE, now, reason)
-
-    def _steering_command(self, angle):
-        command = self.config.steering_kp * float(angle)
-        return max(
-            -self.config.max_angular_z,
-            min(self.config.max_angular_z, command),
+        if self.state != MissionState.SEARCH:
+            self._set_state(
+                MissionState.SEARCH,
+                now,
+                reason,
+            )
+        self.logger.warn(
+            f"Task 3 GUIDED arama veri nedeniyle duraklatıldı: {reason}",
+            throttle_duration_sec=1.0,
         )
 
-    def _approach_speed(self, distance):
-        if distance > self.config.far_approach_distance_m:
-            return self.config.far_approach_speed
-        midpoint = (
-            self.config.final_confirm_distance_m
-            + self.config.far_approach_distance_m
-        ) / 2.0
-        if distance > midpoint:
-            return self.config.medium_approach_speed
-        return self.config.near_approach_speed
+    def _update_wait_guided_search(self, now):
+        self._stop()
+        if not self._ensure_mode(DRIVE_MODE, now):
+            return
+        self._enter_search(now, "GUIDED teyit edildi; arama başlıyor")
 
     def _update_search(self, detections, now):
         target = self._select_target(detections)
-        if target is not None:
-            self._begin_acquisition(target, now, "arama sırasında hedef adayı")
+        if self.target_data_uncertain:
+            self._pause_for_uncertain_target_data(
+                now,
+                f"hedef verisi belirsiz: {self.target_data_uncertain_reason}",
+            )
             return
-        if self._wait_for_target_data():
-            self.search_controller.pause(self.current_heading, now)
+        if target is not None:
+            self._begin_attack_confirmation(target, now)
             return
 
         decision = self.search_controller.step(self.current_heading, now)
         if decision.failed:
             self._enter_failsafe(
-                f"Task 3 arama denetleyicisi başarısız: {decision.reason}"
+                f"Task 3 arama denetleyicisi başarısız: {decision.reason}",
+                now=now,
             )
             return
         if decision.phase_changed:
@@ -653,202 +741,125 @@ class Task3KamikazeEngagement:
                 f"sweep={self.search_controller.sweep_deg:.1f}deg, "
                 f"cycle={self.search_controller.cycle_index}."
             )
-
         self._publish_motion(
             linear_x=decision.linear_x,
             angular_z=decision.angular_z,
             reason=decision.reason,
         )
 
-    def _update_acquire(self, detections, now):
-        self._stop()
+    def _update_attack_confirm(self, detections, now):
         target = self._select_target(detections)
-        if self._wait_for_target_data():
-            self._record_confirmation(None, now)
+        if self.target_data_uncertain:
+            self._pause_for_uncertain_target_data(
+                now,
+                f"saldırı teyidinde veri belirsiz: "
+                f"{self.target_data_uncertain_reason}",
+            )
+            return
+        if target is None:
+            self._enter_search(now, "ikinci hedef karesi gelmedi")
             return
 
         confirmed = self._record_confirmation(target, now)
-        if target is not None:
-            latest = (
-                self.confirmation_samples[-1]
-                if self.confirmation_samples
-                else target
-            )
-            self.last_target = latest
-            self.last_target_angle = latest["angle"]
+        latest = (
+            self.confirmation_samples[-1]
+            if self.confirmation_samples
+            else target
+        )
+        self.last_target = latest
+        self.last_target_angle = latest["angle"]
+
         if confirmed is not None:
             self.last_target = confirmed
             self.last_target_angle = confirmed["angle"]
-            self.distance_history.clear()
             self._set_state(
-                MissionState.ALIGN,
+                MissionState.RAM,
                 now,
-                "çok kareli hedef teyidi tamamlandı",
+                "iki tutarlı kare; doğrudan RAM",
             )
-            return
-
-        if now - self.state_started_at >= self.config.acquire_timeout_sec:
-            self._enter_search(now, "hedef adayı teyit edilemedi")
-
-    def _update_align(self, detections, now):
-        target = self._select_target(detections)
-        if self._wait_for_target_data():
-            return
-        if target is None or not self._target_is_consistent(target):
-            self._enter_reacquire(now, "hizalama sırasında hedef kayboldu")
-            return
-        target = self._filter_target(target, self.last_target)
-        self.last_target = target
-        self.last_target_angle = target["angle"]
-
-        if abs(target["angle"]) <= self.config.align_tolerance_deg:
-            self._stop()
-            self.distance_history.clear()
-            self._set_state(
-                MissionState.APPROACH,
-                now,
-                "hedef kamera merkezine hizalandı",
-            )
-            return
-
-        self._publish_motion(
-            linear_x=0.0,
-            angular_z=self._steering_command(target["angle"]),
-            reason="target alignment",
-        )
-
-    def _update_approach(self, detections, now):
-        target = self._select_target(detections)
-        if self._wait_for_target_data():
-            return
-        if target is None or not self._target_is_consistent(target):
-            self._enter_reacquire(now, "yaklaşma sırasında hedef kayboldu")
-            return
-        observed_distance = target["distance"]
-        target = self._filter_target(target, self.last_target)
-        self.last_target = target
-        self.last_target_angle = target["angle"]
-
-        if abs(target["angle"]) > self.config.realign_threshold_deg:
-            self._stop()
-            self._set_state(
-                MissionState.ALIGN,
-                now,
-                "yaklaşma açı hatası büyüdü",
-            )
-            return
-
-        self.distance_history.append(observed_distance)
-        distance = self._median(self.distance_history)
-        close_distance_confirmed = (
-            len(self.distance_history)
-            >= self.config.approach_distance_required
-            and distance <= self.config.final_confirm_distance_m
-        )
-        if close_distance_confirmed:
-            self.final_confirmation_samples.clear()
-            self._set_state(
-                MissionState.FINAL_CONFIRM,
-                now,
-                "yakın mesafe medyanı doğrulandı",
-            )
-            return
-
-        self._publish_motion(
-            linear_x=self._approach_speed(distance),
-            angular_z=self._steering_command(target["angle"]),
-            reason="target approach",
-        )
-
-    def _update_final_confirm(self, detections, now):
-        target = self._select_target(detections)
-        if self._wait_for_target_data():
-            self.final_confirmation_samples.clear()
-            return
-        if target is None or not self._target_is_consistent(target):
-            self._enter_reacquire(now, "son teyitte hedef kayboldu")
-            return
-        observed_target = target
-        target = self._filter_target(target, self.last_target)
-        self.last_target = target
-        self.last_target_angle = target["angle"]
-
-        if abs(observed_target["angle"]) > self.config.align_tolerance_deg:
-            self._stop()
-            self.final_confirmation_samples.clear()
-            self._set_state(
-                MissionState.ALIGN,
-                now,
-                "son teyitte hedef merkezden çıktı",
-            )
-            return
-        if (
-                observed_target["distance"]
-                > self.config.final_confirm_distance_m
-                + self.config.final_distance_spread_m
-        ):
-            self._stop()
-            self.final_confirmation_samples.clear()
-            self._set_state(
-                MissionState.APPROACH,
-                now,
-                "son teyitte hedef uzaklaştı",
-            )
-            return
-
-        self.final_confirmation_samples.append(observed_target)
-        if (
-                len(self.final_confirmation_samples)
-                < self.config.final_confirmation_required
-        ):
             self._publish_motion(
-                linear_x=self.config.final_confirm_forward_speed,
-                angular_z=self._steering_command(target["angle"]),
-                reason="moving final confirmation",
+                linear_x=self.config.ram_speed,
+                angular_z=self._steering_command(confirmed["angle"]),
+                reason="direct ram start",
             )
             return
 
-        distances = [
-            sample["distance"]
-            for sample in self.final_confirmation_samples
-        ]
-        angles = [
-            sample["angle"]
-            for sample in self.final_confirmation_samples
-        ]
         if (
-                max(distances) - min(distances)
-                > self.config.final_distance_spread_m
-                or max(abs(angle) for angle in angles)
-                > self.config.align_tolerance_deg
+                now - self.state_started_at
+                >= self.config.attack_confirm_timeout_sec
         ):
-            self.final_confirmation_samples.clear()
-            self._publish_motion(
-                linear_x=self.config.final_confirm_forward_speed,
-                angular_z=self._steering_command(target["angle"]),
-                reason="moving final confirmation retry",
-            )
+            self._enter_search(now, "iki karelik saldırı teyidi zaman aşımı")
             return
 
-        self.last_target = dict(target)
-        self.last_target["distance"] = self._median(distances)
-        self.last_target["angle"] = self._median(angles)
-        self._set_state(
-            MissionState.RAM,
-            now,
-            f"{self.impact_count + 1}. temas için son teyit tamamlandı",
-        )
         self._publish_motion(
-            linear_x=self.config.ram_speed,
-            angular_z=0.0,
-            reason="confirmed ram start",
+            linear_x=self.config.attack_confirm_speed,
+            angular_z=self._steering_command(latest["angle"]),
+            reason="moving two-frame attack confirmation",
         )
 
-    def _update_ram(self, now):
+    def _ram_steering(self, detections):
+        target = self._select_target(detections)
+        if target is None or self.target_data_uncertain:
+            return 0.0
+        if self.last_target is not None and self._target_is_consistent(target):
+            target = self._filter_target(target, self.last_target)
+        self.last_target = target
+        self.last_target_angle = target["angle"]
+        return self._steering_command(target["angle"])
+
+    def _valid_current_gps(self):
+        return (
+            self.current_lat is not None
+            and self.current_lon is not None
+            and math.isfinite(float(self.current_lat))
+            and math.isfinite(float(self.current_lon))
+            and not (
+                abs(float(self.current_lat)) < 1e-6
+                and abs(float(self.current_lon)) < 1e-6
+            )
+        )
+
+    def _register_impact(self, now, source):
+        if not self._valid_current_gps():
+            self._enter_failsafe(
+                "Task 3 çarpışma GPS'i geçersiz; temas kaydedilemedi.",
+                now=now,
+            )
+            return False
+
+        impact_count = self.impact_controller.register_impact()
+        event = {
+            "lat": float(self.current_lat),
+            "lon": float(self.current_lon),
+            "recorded_at": float(now),
+            "impact_count": impact_count,
+            "source": str(source),
+        }
+        self.impact_events.append(event)
+        if self.impact_target_gps is None:
+            self.impact_target_gps = dict(event)
+            self.logger.info(
+                "Task 3 çarpışma GPS çapası kaydedildi: "
+                f"lat={event['lat']:.7f}, lon={event['lon']:.7f}, "
+                f"impact_count={impact_count}."
+            )
+        else:
+            self.logger.info(
+                "Task 3 kayıtlı GPS'e dönüş teması: "
+                f"lat={event['lat']:.7f}, lon={event['lon']:.7f}, "
+                f"impact_count={impact_count}."
+            )
+        return True
+
+    def _enter_final_loiter(self, now, reason):
+        self._stop()
+        self._set_state(MissionState.FINAL_LOITER, now, reason)
+
+    def _update_ram(self, detections, now):
         elapsed = now - self.state_started_at
         decision = self.impact_controller.ram_decision(
             elapsed,
-            self.current_heading,
+            angular_z=self._ram_steering(detections),
         )
         if decision.action == ImpactAction.RAM_MOTION:
             self._publish_motion(
@@ -858,118 +869,203 @@ class Task3KamikazeEngagement:
             )
             return
 
-        self._stop()
+        if not self._register_impact(now, "initial_ram"):
+            return
+        if self.impact_count >= self.config.required_impact_count:
+            self._enter_final_loiter(now, decision.reason)
+            return
+
         self._set_state(
-            MissionState.CONTACT_HOLD,
+            MissionState.POST_IMPACT_ADVANCE,
             now,
             decision.reason,
         )
+        self._publish_motion(
+            linear_x=self.config.post_impact_forward_speed,
+            angular_z=0.0,
+            reason="post-impact forward advance start",
+        )
 
-    def _update_contact_hold(self, now):
-        self._stop()
-        decision = self.impact_controller.contact_hold_decision(
+    def _publish_impact_return_target(self):
+        publish_set_position(
+            self.topics.position_target_pub,
+            self.impact_target_gps["lat"],
+            self.impact_target_gps["lon"],
+        )
+
+    def _update_post_impact_advance(self, now):
+        decision = self.impact_controller.post_impact_decision(
             now - self.state_started_at
         )
-        if decision.action == ImpactAction.HOLD:
-            return
-        if decision.action == ImpactAction.FINISH:
-            self.finished = True
-            self._set_state(
-                MissionState.FINISHED,
-                now,
-                decision.reason,
+        if decision.action == ImpactAction.POST_IMPACT_MOTION:
+            self._publish_motion(
+                linear_x=decision.linear_x,
+                angular_z=decision.angular_z,
+                reason=decision.reason,
             )
             return
+
+        if self.impact_target_gps is None:
+            self._enter_failsafe(
+                "Task 3 kayıtlı çarpışma GPS'i yok.",
+                now=now,
+            )
+            return
+        self._stop()
+        departure_distance = calculate_gps_distance(
+            self.current_lat,
+            self.current_lon,
+            self.impact_target_gps["lat"],
+            self.impact_target_gps["lon"],
+        )
+        self.impact_return_departed = (
+            departure_distance > self.config.impact_return_tolerance_m
+        )
         self._set_state(
-            MissionState.RETREAT,
+            MissionState.RETURN_TO_IMPACT,
             now,
             decision.reason,
         )
+        self._publish_impact_return_target()
 
-    def _update_retreat(self, detections, now):
-        elapsed = now - self.state_started_at
-        if self.impact_count <= 0:
-            decision = self.impact_controller.retreat_decision(
-                elapsed=elapsed,
-                target_far_enough=False,
-                current_heading=self.current_heading,
+    def _update_return_to_impact(self, now):
+        if self.impact_target_gps is None:
+            self._enter_failsafe(
+                "Task 3 kayıtlı çarpışma GPS'i yok.",
+                now=now,
             )
-            self._enter_failsafe(decision.reason)
+            return
+        if (
+                now - self.state_started_at
+                >= self.config.impact_return_timeout_sec
+        ):
+            self._enter_failsafe(
+                "Task 3 çarpışma GPS'ine dönüş zaman aşımı.",
+                now=now,
+            )
             return
 
-        target = self._select_target(detections)
-        if self._wait_for_target_data():
-            if self.impact_controller.retreat_timeout_reached(elapsed):
-                self._enter_reacquire(
+        distance = calculate_gps_distance(
+            self.current_lat,
+            self.current_lon,
+            self.impact_target_gps["lat"],
+            self.impact_target_gps["lon"],
+        )
+        if distance > self.config.impact_return_tolerance_m:
+            self.impact_return_departed = True
+        if (
+                self.impact_return_departed
+                and distance <= self.config.impact_return_tolerance_m
+        ):
+            if not self._register_impact(now, "gps_return"):
+                return
+            if self.impact_count >= self.config.required_impact_count:
+                self._enter_final_loiter(
                     now,
-                    "geri çekilme veri beklerken zaman sınırına ulaştı",
+                    "gerekli GPS dönüş temasları tamamlandı",
                 )
-            return
-        target_far_enough = (
-            target is not None
-            and target["distance"] >= self.config.retreat_target_distance_m
-        )
-        decision = self.impact_controller.retreat_decision(
-            elapsed=elapsed,
-            target_far_enough=target_far_enough,
-            current_heading=self.current_heading,
-        )
-        if decision.action == ImpactAction.REACQUIRE:
-            if target is not None:
-                self.last_target = target
-                self.last_target_angle = target["angle"]
-            self._enter_reacquire(
+                return
+            self._set_state(
+                MissionState.POST_IMPACT_ADVANCE,
                 now,
-                decision.reason,
+                f"{self.impact_count}. temas; yeniden ileri çıkılıyor",
+            )
+            self._publish_motion(
+                linear_x=self.config.post_impact_forward_speed,
+                angular_z=0.0,
+                reason="next post-impact forward advance",
             )
             return
 
-        self._publish_motion(
-            linear_x=decision.linear_x,
-            angular_z=decision.angular_z,
-            reason=decision.reason,
+        self._publish_impact_return_target()
+        departure_status = (
+            "confirmed"
+            if self.impact_return_departed
+            else "waiting"
+        )
+        self.logger.info(
+            "Task 3 kayıtlı çarpışma GPS'ine dönüyor: "
+            f"remaining={distance:.2f}m, "
+            f"departure={departure_status}, "
+            f"target=({self.impact_target_gps['lat']:.7f}, "
+            f"{self.impact_target_gps['lon']:.7f}).",
+            throttle_duration_sec=1.0,
         )
 
-    def _update_reacquire(self, detections, now):
-        target = self._select_target(detections)
-        if target is not None:
-            self._begin_acquisition(
-                target,
+    def _update_final_loiter(self, now):
+        self._stop()
+        if (
+                self.bridge_connected is not True
+                or self.bridge_armed is not True
+                or self.last_bridge_state_time is None
+                or now - self.last_bridge_state_time
+                > self.config.bridge_state_timeout_sec
+        ):
+            self.logger.error(
+                "Task 3 final LOITER için güncel/operasyonel bridge state yok."
+            )
+            self.finished = False
+            self._set_state(
+                MissionState.FAILSAFE,
                 now,
-                "hedef yeniden bulundu",
+                "final LOITER bridge state doğrulanamadı",
             )
             return
-        if self._wait_for_target_data():
+        if not self._ensure_mode(self.config.loiter_mode, now):
             return
+        self.finished = True
+        self._set_state(
+            MissionState.FINISHED,
+            now,
+            "LOITER heartbeat teyit edildi; görev tamamlandı",
+        )
 
-        if now - self.state_started_at >= self.config.target_lost_timeout_sec:
-            self._enter_search(now, "lokal yeniden arama başarısız")
+    def _update_failsafe_loiter(self, now):
+        self._stop()
+        if (
+                self.bridge_connected is not True
+                or self.last_bridge_state_time is None
+                or now - self.last_bridge_state_time
+                > self.config.bridge_state_timeout_sec
+        ):
+            self.logger.error(
+                "Task 3 FAILSAFE LOITER bridge üzerinden doğrulanamadı."
+            )
+            self._set_state(
+                MissionState.FAILSAFE,
+                now,
+                "failsafe LOITER bridge üzerinden doğrulanamadı",
+            )
             return
-
-        direction = 1.0 if self.last_target_angle >= 0.0 else -1.0
-        self._publish_motion(
-            linear_x=self.config.reacquire_linear_x,
-            angular_z=direction * self.config.reacquire_angular_z,
-            reason="local forward reacquire",
+        if not self._ensure_mode(self.config.loiter_mode, now):
+            return
+        self._set_state(
+            MissionState.FAILSAFE,
+            now,
+            "LOITER heartbeat teyit edildi",
         )
 
     def update(self, detections, now=None, vision_fresh=True):
         now = self._now(now)
+        self._publish_state(now)
         if self.state == MissionState.FINISHED:
             self._stop()
             return
         if self.state == MissionState.FAILSAFE:
             self._stop()
             return
-
-        if not vision_fresh:
-            self._enter_failsafe("Task 3 vision heartbeat zaman aşımı.")
+        if self.state == MissionState.FINAL_LOITER:
+            self._update_final_loiter(now)
             return
+        if self.state == MissionState.FAILSAFE_LOITER:
+            self._update_failsafe_loiter(now)
+            return
+
         if not self._check_navigation(now):
             return
         if not self._check_bridge(now):
             return
-        if not self._check_geofence():
+        if not self._check_geofence(now):
             return
 
         if self.mission_started_at is None:
@@ -980,53 +1076,56 @@ class Task3KamikazeEngagement:
                 now=now,
             )
             return
-        if (
-                now - self.mission_started_at
-                > self.config.mission_timeout_sec
-        ):
-            self._enter_failsafe("Task 3 toplam görev zaman aşımı.")
+        if now - self.mission_started_at > self.config.mission_timeout_sec:
+            self._enter_failsafe(
+                "Task 3 toplam görev zaman aşımı.",
+                now=now,
+            )
             return
 
-        if self.state == MissionState.ENTRY_SETTLE:
-            self._stop()
-            if now - self.state_started_at >= self.config.entry_settle_sec:
-                self._enter_search(now, "Task 2 çıkış pozu sabitlendi")
+        vision_required = self.impact_target_gps is None
+        if vision_required and not vision_fresh:
+            self._enter_failsafe(
+                "Task 3 vision heartbeat zaman aşımı.",
+                now=now,
+            )
+            return
+
+        if self.state in self._GUIDED_STATES:
+            if not self._ensure_mode(DRIVE_MODE, now):
+                self._stop()
+                return
+
+        if self.state == MissionState.WAIT_GUIDED_SEARCH:
+            self._update_wait_guided_search(now)
             return
         if self.state == MissionState.SEARCH:
             self._update_search(detections, now)
             return
-        if self.state == MissionState.ACQUIRE_CONFIRM:
-            self._update_acquire(detections, now)
-            return
-        if self.state == MissionState.ALIGN:
-            self._update_align(detections, now)
-            return
-        if self.state == MissionState.APPROACH:
-            self._update_approach(detections, now)
-            return
-        if self.state == MissionState.FINAL_CONFIRM:
-            self._update_final_confirm(detections, now)
+        if self.state == MissionState.ATTACK_CONFIRM:
+            self._update_attack_confirm(detections, now)
             return
         if self.state == MissionState.RAM:
-            self._update_ram(now)
+            self._update_ram(detections, now)
             return
-        if self.state == MissionState.CONTACT_HOLD:
-            self._update_contact_hold(now)
+        if self.state == MissionState.POST_IMPACT_ADVANCE:
+            self._update_post_impact_advance(now)
             return
-        if self.state == MissionState.RETREAT:
-            self._update_retreat(detections, now)
+        if self.state == MissionState.RETURN_TO_IMPACT:
+            self._update_return_to_impact(now)
             return
-        if self.state == MissionState.REACQUIRE:
-            self._update_reacquire(detections, now)
-            return
-
-        self._enter_failsafe(f"Task 3 beklenmeyen state: {self.state!r}")
+        self._enter_failsafe(
+            f"Task 3 beklenmeyen state: {self.state!r}",
+            now=now,
+        )
 
 
 class Task3Node(Node):
     def __init__(self, config=None):
         super().__init__("task3_kamikaze_engagement_node")
-        self.get_logger().info("Task 3 Kamikaze Engagement düğümü başlatılıyor...")
+        self.get_logger().info(
+            "Task 3 Kamikaze Engagement düğümü başlatılıyor..."
+        )
 
         self.mission_clients = create_mission_clients(self)
         wait_for_mission_services(self, self.mission_clients)
@@ -1140,7 +1239,9 @@ class Task3Node(Node):
                 stop_vehicle(self.mission_topics.cmd_vel_pub)
             except Exception as stop_exc:
                 self.get_logger().error(f"Araç durdurulamadı: {stop_exc}")
-            self.task.state = MissionState.FAILSAFE
+            self.task._enter_failsafe(
+                f"Task 3 timer exception: {exc}",
+            )
 
 
 def main(args=None):
@@ -1150,7 +1251,8 @@ def main(args=None):
     try:
         if not node.wait_for_complete_telemetry(timeout_sec=30.0):
             node.get_logger().error(
-                "Roll/pitch/yaw ve araç telemetrisi hazır değil; Task 3 başlatılmadı."
+                "Roll/pitch/yaw ve araç telemetrisi hazır değil; "
+                "Task 3 başlatılmadı."
             )
             return
 
@@ -1164,7 +1266,7 @@ def main(args=None):
                 node.mission_clients.set_mode_client,
                 DRIVE_MODE,
         ) is False:
-            node.get_logger().error("Mod geçişi başarısız.")
+            node.get_logger().error("Başlangıç GUIDED geçişi başarısız.")
             return
 
         node.get_logger().info("Motorlar FORCE ARM ediliyor...")
@@ -1178,7 +1280,8 @@ def main(args=None):
 
         if not node.wait_for_vision(timeout_sec=5.0):
             node.get_logger().error(
-                "ARM sonrasında güncel vision doğrulanamadı; Task 3 başlatılmadı."
+                "ARM sonrasında güncel vision doğrulanamadı; "
+                "Task 3 başlatılmadı."
             )
             return
 
@@ -1198,7 +1301,7 @@ def main(args=None):
 
         if node.task.finished:
             node.get_logger().info(
-                "Task 3 üç temas tamamlandı; görev başarıyla bitti."
+                "Task 3 üç temas ve final LOITER tamamlandı."
             )
         elif node.task.state == MissionState.FAILSAFE:
             node.get_logger().error("Task 3 FAILSAFE ile sonlandı.")

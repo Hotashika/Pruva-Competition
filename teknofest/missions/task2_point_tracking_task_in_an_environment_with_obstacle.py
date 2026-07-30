@@ -71,7 +71,7 @@ WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task2.waypoints"
 # ROS / VISION PARAMETRELERİ
 # ============================================================
 DETECTION_TOPIC = "/vision/detections"
-VISION_DETECTION_TIMEOUT_SEC = 3.00
+VISION_DETECTION_TIMEOUT_SEC = 12.0
 
 # Görev 2 parkurundaki bütün engeller sarı dubadır. Mevcut buoy.pt modelinin
 # class adı dışında hiçbir tespit engel kaçınmasını tetiklemez.
@@ -111,16 +111,17 @@ YELLOW_TARGET_MEMORY_SEC = 1.0
 # KAÇINMA PARAMETRELERİ
 # ============================================================
 # Sarı duba bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
-AVOIDANCE_START_DISTANCE_M = 2.5
+AVOIDANCE_START_DISTANCE_M = 4.0
 # Aktif engel bu mesafeye çıktığında temiz görüş süresi başlar.
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
-AVOIDANCE_PASS_CLEARANCE_M = 2.5
+AVOIDANCE_PASS_CLEARANCE_M = 3.0
 AVOIDANCE_EMERGENCY_DISTANCE_M = 1.5
 AVOIDANCE_MIN_LINEAR_SPEED = 0.2
 AVOIDANCE_MAX_LINEAR_SPEED = 0.6
-AVOIDANCE_MAX_ANGULAR_Z = 0.7
+AVOIDANCE_MAX_ANGULAR_Z = 0.8
 AVOIDANCE_TURN_SPEED_REDUCTION = 0.5
-AVOIDANCE_CLEAR_DURATION_SEC = 0.2
+AVOIDANCE_MIN_DURATION_SEC = 1.0
+AVOIDANCE_CLEAR_DURATION_SEC = 0.7
 AVOIDANCE_TIMEOUT_SEC = 8.0
 SIDE_FALLBACK_ANGLE_DEG = 15.0
 
@@ -875,8 +876,12 @@ class Task2PointTrackingWithObstacleAvoidance:
         if obstacle is None:
             if self.avoidance_clear_started_time is None:
                 self.avoidance_clear_started_time = now
+            maneuver_elapsed = now - self.avoidance_started_time
             clear_elapsed = now - self.avoidance_clear_started_time
-            if clear_elapsed >= AVOIDANCE_CLEAR_DURATION_SEC:
+            if (
+                    maneuver_elapsed >= AVOIDANCE_MIN_DURATION_SEC
+                    and clear_elapsed >= AVOIDANCE_CLEAR_DURATION_SEC
+            ):
                 self._finish_avoidance()
                 return False
 

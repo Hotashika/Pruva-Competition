@@ -48,22 +48,23 @@ HOLD_MODE_NAME = "HOLD"
 # NAVİGASYON PARAMETRELERİ
 # ============================================================
 WAYPOINT_TOLERANCE_M = 1.0
-WAYPOINT_SETTLE_SEC = 0.75  # Her ana GPS noktasinda kesin durus suresi
-WAYPOINT_HEADING_TOLERANCE_DEG = 15.0  # Kucuk heading farklarinda gereksiz salinimi onler
+WAYPOINT_SETTLE_SEC = 0.50  # Her ana GPS noktasinda kesin durus suresi
+WAYPOINT_HEADING_TOLERANCE_DEG = 22.0  # Kucuk heading farklarinda gereksiz salinimi onler
 
 # ============================================================
 # KAÇINMA PARAMETRELERİ
 # ============================================================
 # Engel bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
-AVOIDANCE_START_DISTANCE_M = 2.5
+AVOIDANCE_START_DISTANCE_M = 4.0
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
-AVOIDANCE_PASS_CLEARANCE_M = 2.5
+AVOIDANCE_PASS_CLEARANCE_M = 3.0
 AVOIDANCE_EMERGENCY_DISTANCE_M = 1.5
-AVOIDANCE_MIN_LINEAR_SPEED = 0.15
-AVOIDANCE_MAX_LINEAR_SPEED = 0.4
+AVOIDANCE_MIN_LINEAR_SPEED = 0.2
+AVOIDANCE_MAX_LINEAR_SPEED = 0.6
 AVOIDANCE_MAX_ANGULAR_Z = 0.7
 AVOIDANCE_TURN_SPEED_REDUCTION = 0.5
-AVOIDANCE_CLEAR_DURATION_SEC = 0.2
+AVOIDANCE_MIN_DURATION_SEC = 1.0
+AVOIDANCE_CLEAR_DURATION_SEC = 0.7
 AVOIDANCE_TIMEOUT_SEC = 8.0
 
 # ============================================================
@@ -863,7 +864,10 @@ class Task1Maneuvering:
                 self.avoid_clear_started_time = now
 
             clear_duration = now - self.avoid_clear_started_time
-            if clear_duration >= AVOIDANCE_CLEAR_DURATION_SEC:
+            if (
+                    elapsed >= AVOIDANCE_MIN_DURATION_SEC
+                    and clear_duration >= AVOIDANCE_CLEAR_DURATION_SEC
+            ):
                 completed_class = self.avoiding_class
                 completed_side = self.active_pass_side
                 self._reset_avoidance_state()
@@ -878,7 +882,9 @@ class Task1Maneuvering:
             self._republish_last_avoidance_command()
             self.logger.info(
                 f"Obstacle temporarily out of frame; holding last dynamic command "
-                f"for clear confirmation ({clear_duration:.2f}/"
+                f"for maneuver/clear confirmation "
+                f"(maneuver={elapsed:.2f}/{AVOIDANCE_MIN_DURATION_SEC:.2f}s, "
+                f"clear={clear_duration:.2f}/"
                 f"{AVOIDANCE_CLEAR_DURATION_SEC:.2f}s).",
                 throttle_duration_sec=0.5,
             )

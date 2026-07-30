@@ -207,7 +207,7 @@ def test_angle_and_depth_change_dynamic_command(task1_module):
     assert left["angular_z"] < right["angular_z"]
 
 
-def test_dynamic_avoidance_uses_reduced_linear_speed_range(task1_module):
+def test_dynamic_avoidance_uses_configured_linear_speed_range(task1_module):
     mission = _mission_without_ros(task1_module)
 
     maximum_speed = mission._calculate_avoidance_command(
@@ -217,10 +217,10 @@ def test_dynamic_avoidance_uses_reduced_linear_speed_range(task1_module):
         _detection("red_buoys", distance=1.6, angle=45.0)
     )
 
-    assert task1_module.AVOIDANCE_MIN_LINEAR_SPEED == pytest.approx(0.15)
-    assert task1_module.AVOIDANCE_MAX_LINEAR_SPEED == pytest.approx(0.4)
-    assert 0.15 <= maximum_speed["linear_x"] <= 0.4
-    assert minimum_speed["linear_x"] == pytest.approx(0.15)
+    assert task1_module.AVOIDANCE_MIN_LINEAR_SPEED == pytest.approx(0.2)
+    assert task1_module.AVOIDANCE_MAX_LINEAR_SPEED == pytest.approx(0.5)
+    assert 0.2 <= maximum_speed["linear_x"] <= 0.5
+    assert minimum_speed["linear_x"] == pytest.approx(0.2)
 
 
 def test_emergency_distance_stops_forward_motion_and_clamps_turn(task1_module):
@@ -545,10 +545,13 @@ def test_short_detection_loss_republishes_then_resumes_without_stop(
     assert mission.state is task1_module.MissionState.AVOIDING
     assert published[-1] == initial_command
 
-    assert mission._update_active_avoidance([], now=10.29)
+    assert mission._update_active_avoidance([], now=10.79)
     assert mission.state is task1_module.MissionState.AVOIDING
 
-    assert not mission._update_active_avoidance([], now=10.31)
+    assert mission._update_active_avoidance([], now=10.99)
+    assert mission.state is task1_module.MissionState.AVOIDING
+
+    assert not mission._update_active_avoidance([], now=11.01)
     assert mission.state is task1_module.MissionState.NAVIGATING
     assert mission.current_target_index == 2
     assert mission.resume_navigation_without_alignment
@@ -566,7 +569,7 @@ def test_clear_view_resumes_same_waypoint_in_same_tick_without_alignment(
     mission._prepare_update = lambda: True
     published_targets = []
     stops = []
-    monkeypatch.setattr(task1_module.time, "monotonic", lambda: 10.31)
+    monkeypatch.setattr(task1_module.time, "monotonic", lambda: 11.01)
     monkeypatch.setattr(
         task1_module,
         "calculate_gps_distance",
@@ -613,7 +616,7 @@ def test_clear_view_resumes_same_waypoint_in_same_tick_without_alignment(
     assert stops == []
 
 
-def test_avoidance_starts_only_at_three_metres(
+def test_avoidance_starts_only_at_four_metres(
         task1_module,
         monkeypatch,
 ):
@@ -637,17 +640,17 @@ def test_avoidance_starts_only_at_three_metres(
     for now in (1.0, 1.1):
         clock["now"] = now
         mission.update([
-            _detection("red_buoys", distance=3.01, angle=0.0)
+            _detection("red_buoys", distance=4.01, angle=0.0)
         ])
     assert mission.state is task1_module.MissionState.NAVIGATING
 
     for now in (1.2, 1.3):
         clock["now"] = now
         mission.update([
-            _detection("red_buoys", distance=3.0, angle=0.0)
+            _detection("red_buoys", distance=4.0, angle=0.0)
         ])
 
-    assert task1_module.AVOIDANCE_START_DISTANCE_M == 3.0
+    assert task1_module.AVOIDANCE_START_DISTANCE_M == 4.0
     assert mission.state is task1_module.MissionState.AVOIDING
 
 

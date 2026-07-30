@@ -179,20 +179,20 @@ def test_only_yellow_buoy_triggers_obstacle_logic(task2_module):
     assert mission.obstacle_data_uncertain is False
 
 
-def test_avoidance_candidate_boundaries_are_two_and_a_half_and_five(
+def test_avoidance_candidate_boundaries_are_four_and_five(
         task2_module,
 ):
     mission = _mission(task2_module)
 
     start_boundary = mission._nearest_relevant_obstacle([
-        _yellow(distance=2.5)
+        _yellow(distance=4.0)
     ])
     clear_boundary = mission._nearest_relevant_obstacle([
         _yellow(distance=5.0)
     ])
 
-    assert task2_module.AVOIDANCE_START_DISTANCE_M == 2.5
-    assert start_boundary["distance"] == 2.5
+    assert task2_module.AVOIDANCE_START_DISTANCE_M == 4.0
+    assert start_boundary["distance"] == 4.0
     assert clear_boundary is None
     assert mission.obstacle_data_uncertain is False
 
@@ -274,8 +274,8 @@ def test_command_changes_dynamically_with_angle_and_depth(task2_module):
 @pytest.mark.parametrize(
     ("side", "angle", "expected_angular_z"),
     [
-        ("center", -89.0, 0.7),
-        ("right", 89.0, -0.7),
+        ("center", -89.0, 0.8),
+        ("right", 89.0, -0.8),
     ],
 )
 def test_emergency_distance_stops_forward_motion_and_clamps_turn(
@@ -491,13 +491,14 @@ def test_clear_view_resumes_same_keeper_in_same_tick_without_alignment(
     assert mission._start_avoidance(_yellow(), now=0.0)
 
     assert mission._update_active_avoidance([], now=0.1)
-    assert mission._update_active_avoidance([], now=0.29)
+    assert mission._update_active_avoidance([], now=0.79)
+    assert mission._update_active_avoidance([], now=0.99)
 
     assert mission.state is task2_module.MissionState.AVOIDING
     assert keeper_calls == []
     assert published_targets == []
 
-    clock["now"] = 0.31
+    clock["now"] = 1.01
     mission.avoidance_clear_started_time = 0.1
     mission.update([])
     mission.update([])
@@ -522,7 +523,7 @@ def test_post_avoidance_blocked_course_falls_back_to_main_waypoint(
     main_target = mission.waypoints[mission.current_target_index]
     published_targets = []
     stops = []
-    clock = {"now": 0.21}
+    clock = {"now": 1.01}
     mission.yellow_course_acquired = True
     mission.course_keeper = types.SimpleNamespace(
         compute=lambda **kwargs: types.SimpleNamespace(
@@ -562,7 +563,7 @@ def test_post_avoidance_blocked_course_falls_back_to_main_waypoint(
     assert stops == []
 
 
-def test_avoidance_does_not_start_above_two_and_a_half_metres(
+def test_avoidance_does_not_start_above_four_metres(
         task2_module,
         monkeypatch,
 ):
@@ -577,7 +578,7 @@ def test_avoidance_does_not_start_above_two_and_a_half_metres(
 
     for now in (1.0, 1.1):
         clock["now"] = now
-        mission.update([_yellow(distance=2.51)])
+        mission.update([_yellow(distance=4.01)])
 
     assert mission.state is task2_module.MissionState.NAVIGATING
 
