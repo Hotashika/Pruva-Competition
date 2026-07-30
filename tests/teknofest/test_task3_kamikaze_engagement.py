@@ -209,10 +209,25 @@ def _enter_ram(mission, task3_module, now=0.1, angle=0.0):
         )
         if index < mission.config.confirmation_required - 1:
             assert mission.state is task3_module.MissionState.ATTACK_CONFIRM
+    assert mission.state is task3_module.MissionState.APPROACH
+
+    approach_started_at = now + mission.config.confirmation_required * 0.1
+    approach_distances = (6.0, 4.0, 2.0, 1.2, 1.10, 1.08, 1.06, 1.05, 1.04)
+    ram_started_at = None
+    for index, distance in enumerate(approach_distances):
+        mission.update(
+            [_target(distance=distance, angle=angle)],
+            now=approach_started_at + index * 0.1,
+            vision_frame_id=200 + index,
+        )
+        if mission.state is task3_module.MissionState.RAM:
+            ram_started_at = approach_started_at + index * 0.1
+            break
+        assert mission.state is task3_module.MissionState.APPROACH
+
     assert mission.state is task3_module.MissionState.RAM
-    return now + (
-        mission.config.confirmation_required - 1
-    ) * 0.1
+    assert ram_started_at is not None
+    return ram_started_at
 
 
 def test_target_classes_annotation_is_python38_compatible():
@@ -292,7 +307,7 @@ def test_target_classes_reject_other_buoy_labels(task3_module, class_name):
     assert mission._select_target([_target(class_name=class_name)]) is None
 
 
-def test_six_distinct_consistent_frames_start_ram_at_low_confirm_speed(
+def test_six_distinct_consistent_frames_start_depth_approach(
         task3_module,
 ):
     commands = []
@@ -323,8 +338,10 @@ def test_six_distinct_consistent_frames_start_ram_at_low_confirm_speed(
 
     assert len(mission.confirmation_samples) == 5
     mission.update(target, now=0.9, vision_frame_id=105)
-    assert mission.state is task3_module.MissionState.RAM
-    assert commands[-1][0] == pytest.approx(mission.config.ram_speed)
+    assert mission.state is task3_module.MissionState.APPROACH
+    assert commands[-1][0] == pytest.approx(
+        mission.config.approach_max_speed
+    )
     assert commands[-1][1] > 0.0
 
 
@@ -410,20 +427,78 @@ def test_state_topic_reports_transitions_and_periodic_heartbeat(task3_module):
     assert publisher.messages[-1] == "ATTACK_CONFIRM"
 
 
-def test_direct_attack_has_no_legacy_approach_states_or_config(task3_module):
+def test_depth_approach_is_part_of_attack_contract(task3_module):
     state_names = {state.name for state in task3_module.MissionState}
     defaults = task3_module.Task3Config()
 
-    assert {
-        "ALIGN",
-        "APPROACH",
-        "FINAL_CONFIRM",
-        "CONTACT_HOLD",
-        "RETREAT",
-        "REACQUIRE",
-    }.isdisjoint(state_names)
-    assert not hasattr(defaults, "approach_distance_required")
+    assert "APPROACH" in state_names
+    assert not hasattr(defaults, "approach_distance_m")
+    assert defaults.approach_contact_window_size == 7
+    assert defaults.approach_contact_required == 5
     assert defaults.confirmation_required == 6
+
+
+def test_far_depth_never_starts_ram(task3_module):
+    mission = _mission(task3_module)
+    far_target = [_target(distance=9.85)]
+
+    for frame_id in range(100, 120):
+        mission.update(
+            far_target,
+            now=0.1 + (frame_id - 100) * 0.1,
+            vision_frame_id=frame_id,
+        )
+
+    assert mission.state is task3_module.MissionState.APPROACH
+    assert mission.impact_count == 0
+
+
+def test_repeated_cached_depth_frame_cannot_start_ram(task3_module):
+    mission = _mission(task3_module)
+    for index in range(mission.config.confirmation_required):
+        mission.update(
+            [_target(distance=8.0)],
+            now=0.1 + index * 0.1,
+            vision_frame_id=100 + index,
+        )
+
+    for index in range(10):
+        mission.update(
+            [_target(distance=1.0)],
+            now=0.8 + index * 0.1,
+            vision_frame_id=200,
+        )
+
+    assert mission.state is task3_module.MissionState.APPROACH
+    assert list(mission.approach_distance_samples) == [1.0]
+    assert mission.impact_count == 0
+
+
+def test_approach_speed_reduces_with_depth(task3_module):
+    commands = []
+    task3_module.publish_cmd_vel = (
+        lambda publisher, linear_x, angular_z:
+        commands.append((linear_x, angular_z))
+    )
+    mission = _mission(task3_module)
+    for index in range(mission.config.confirmation_required):
+        mission.update(
+            [_target(distance=8.0)],
+            now=0.1 + index * 0.1,
+            vision_frame_id=100 + index,
+        )
+    far_speed = commands[-1][0]
+
+    mission.update(
+        [_target(distance=2.0)],
+        now=0.8,
+        vision_frame_id=200,
+    )
+    near_speed = commands[-1][0]
+
+    assert far_speed == pytest.approx(mission.config.approach_max_speed)
+    assert near_speed == pytest.approx(0.24)
+    assert near_speed < far_speed
 
 
 def test_ram_steers_while_target_visible_and_continues_straight_if_lost(
@@ -463,7 +538,11 @@ def test_ram_end_saves_gps_and_immediately_advances(task3_module):
     commands.clear()
 
     impact_time = now + mission.config.ram_duration_sec + 0.01
-    mission.update([], now=impact_time)
+    mission.update(
+        [_target(distance=1.1)],
+        now=impact_time,
+        vision_frame_id=300,
+    )
 
     assert mission.state is task3_module.MissionState.POST_IMPACT_ADVANCE
     assert mission.impact_count == 1
@@ -475,6 +554,20 @@ def test_ram_end_saves_gps_and_immediately_advances(task3_module):
     assert commands[-1] == pytest.approx(
         (mission.config.post_impact_forward_speed, 0.0)
     )
+
+
+def test_ram_end_does_not_record_impact_when_depth_is_far(task3_module):
+    mission = _mission(task3_module)
+    now = _enter_ram(mission, task3_module)
+    mission.update(
+        [_target(distance=9.85)],
+        now=now + mission.config.ram_duration_sec + 0.01,
+        vision_frame_id=300,
+    )
+
+    assert mission.impact_count == 0
+    assert mission.state is task3_module.MissionState.SEARCH
+    assert mission.impact_target_gps is None
 
 
 def test_post_impact_advance_returns_with_global_gps_target(task3_module):
@@ -507,7 +600,7 @@ def test_post_impact_advance_returns_with_global_gps_target(task3_module):
     )
 
 
-def test_return_arrival_counts_next_impact_without_overwriting_anchor(
+def test_return_arrival_reacquires_with_depth_without_counting_impact(
         task3_module,
 ):
     commands = []
@@ -526,6 +619,8 @@ def test_return_arrival_counts_next_impact_without_overwriting_anchor(
     mission.impact_count = 1
     mission.impact_target_gps = dict(anchor)
     mission.impact_return_departed = True
+    mission.search_controller.entry_lat = 37.95000
+    mission.search_controller.entry_lon = 32.49900
     mission.state = task3_module.MissionState.RETURN_TO_IMPACT
     mission.state_started_at = 1.0
     mission.update_gps(anchor["lat"], anchor["lon"], now=1.1)
@@ -537,55 +632,29 @@ def test_return_arrival_counts_next_impact_without_overwriting_anchor(
 
     mission.update([], now=1.1, vision_fresh=False)
 
-    assert mission.impact_count == 2
-    assert mission.state is task3_module.MissionState.POST_IMPACT_ADVANCE
+    assert mission.impact_count == 1
+    assert mission.state is task3_module.MissionState.SEARCH
     assert mission.impact_target_gps == anchor
-    assert mission.impact_events[-1]["source"] == "gps_return"
-    assert commands[-1] == pytest.approx(
-        (mission.config.post_impact_forward_speed, 0.0)
-    )
+    assert mission.impact_events == []
+    assert mission.search_controller.entry_lat == pytest.approx(anchor["lat"])
+    assert mission.search_controller.entry_lon == pytest.approx(anchor["lon"])
 
 
-def test_three_impacts_finish_only_after_loiter_confirmation(task3_module):
+def test_three_impacts_finish_immediately_without_mode_change(task3_module):
     client = _ModeClient()
     mission = _mission(task3_module, mode_client=client)
-    anchor = {
-        "lat": 37.95125,
-        "lon": 32.50090,
-        "recorded_at": 0.5,
-        "impact_count": 1,
-        "source": "initial_ram",
-    }
     mission.impact_count = 2
-    mission.impact_target_gps = dict(anchor)
-    mission.impact_return_departed = True
-    mission.state = task3_module.MissionState.RETURN_TO_IMPACT
-    mission.state_started_at = 1.0
-    mission.update_gps(anchor["lat"], anchor["lon"], now=1.1)
-    mission.update_heading(180.0, now=1.1)
-    mission.update_bridge_state(
-        {"connected": True, "armed": True, "mode": "GUIDED"},
-        now=1.1,
+    now = _enter_ram(mission, task3_module)
+    mission.update(
+        [_target(distance=1.1)],
+        now=now + mission.config.ram_duration_sec + 0.01,
+        vision_frame_id=300,
     )
-
-    mission.update([], now=1.1, vision_fresh=False)
 
     assert mission.impact_count == 3
-    assert mission.state is task3_module.MissionState.FINAL_LOITER
-    assert mission.finished is False
-
-    mission.update([], now=1.2, vision_fresh=False)
-    assert client.requests[-1] == (0, "LOITER")
-    assert mission.finished is False
-
-    mission.update_bridge_state(
-        {"connected": True, "armed": True, "mode": "LOITER"},
-        now=1.3,
-    )
-    mission.update([], now=1.3, vision_fresh=False)
-
     assert mission.state is task3_module.MissionState.FINISHED
     assert mission.finished is True
+    assert all(request != (0, "LOITER") for request in client.requests)
 
 
 def test_return_target_republished_until_one_meter_arrival(task3_module):
@@ -651,7 +720,7 @@ def test_return_does_not_count_again_without_departing_anchor(task3_module):
     assert positions
 
 
-def test_return_timeout_enters_failsafe_and_requests_loiter(task3_module):
+def test_return_timeout_enters_failsafe_without_mode_change(task3_module):
     client = _ModeClient()
     mission = _mission(
         task3_module,
@@ -676,17 +745,8 @@ def test_return_timeout_enters_failsafe_and_requests_loiter(task3_module):
     )
 
     mission.update([], now=1.3, vision_fresh=False)
-    assert mission.state is task3_module.MissionState.FAILSAFE_LOITER
-
-    mission.update([], now=1.4, vision_fresh=False)
-    assert client.requests[-1] == (0, "LOITER")
-
-    mission.update_bridge_state(
-        {"connected": True, "armed": True, "mode": "LOITER"},
-        now=1.5,
-    )
-    mission.update([], now=1.5, vision_fresh=False)
     assert mission.state is task3_module.MissionState.FAILSAFE
+    assert all(request != (0, "LOITER") for request in client.requests)
 
 
 def test_guided_mode_is_required_before_search_motion(task3_module):
@@ -762,14 +822,14 @@ def test_uncertain_target_data_pauses_without_leaving_guided_search(
     assert commands[-1] != pytest.approx((0.0, 0.0))
 
 
-def test_stale_vision_before_first_impact_enters_failsafe_loiter(
+def test_stale_vision_before_first_impact_enters_failsafe(
         task3_module,
 ):
     mission = _mission(task3_module)
 
     mission.update([], now=0.1, vision_fresh=False)
 
-    assert mission.state is task3_module.MissionState.FAILSAFE_LOITER
+    assert mission.state is task3_module.MissionState.FAILSAFE
     assert mission.finished is False
 
 
@@ -817,7 +877,7 @@ def test_negative_motion_is_rejected(task3_module):
     )
 
     assert accepted is False
-    assert mission.state is task3_module.MissionState.FAILSAFE_LOITER
+    assert mission.state is task3_module.MissionState.FAILSAFE
     assert commands == []
 
 
@@ -827,17 +887,25 @@ def test_production_defaults_match_direct_attack_plan(task3_module):
     assert defaults.search_advance_distance_m == pytest.approx(1.5)
     assert defaults.search_cross_track_limit_m == pytest.approx(2.0)
     assert defaults.search_max_sweep_deg == pytest.approx(180.0)
+    assert defaults.vision_detection_timeout_sec == pytest.approx(12.0)
     assert defaults.confirmation_required == 6
     assert defaults.confirmation_window_size == 6
     assert defaults.attack_confirm_speed == pytest.approx(0.15)
+    assert not hasattr(defaults, "approach_distance_m")
+    assert defaults.approach_contact_window_size == 7
+    assert defaults.approach_contact_required == 5
+    assert defaults.approach_contact_spread_m == pytest.approx(0.15)
+    assert defaults.approach_progress_ratio == pytest.approx(0.10)
+    assert defaults.approach_min_speed == pytest.approx(0.12)
+    assert defaults.approach_max_speed == pytest.approx(0.45)
+    assert defaults.impact_distance_growth_ratio == pytest.approx(0.50)
     assert defaults.ram_speed == pytest.approx(0.85)
     assert defaults.ram_duration_sec == pytest.approx(2.0)
     assert defaults.post_impact_forward_speed == pytest.approx(0.85)
-    assert defaults.post_impact_forward_duration_sec == pytest.approx(2.5)
+    assert defaults.post_impact_forward_duration_sec == pytest.approx(3.5)
     assert defaults.impact_return_tolerance_m == pytest.approx(1.0)
     assert defaults.impact_return_timeout_sec == pytest.approx(20.0)
     assert defaults.mode_transition_timeout_sec == pytest.approx(5.0)
-    assert defaults.loiter_mode == "LOITER"
     assert defaults.required_impact_count == 3
 
 

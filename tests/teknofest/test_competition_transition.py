@@ -249,7 +249,7 @@ def test_task3_uses_tighter_vision_stale_limit(monkeypatch):
     node.timer_callback()
 
     assert updates == []
-    assert failures == ["Vision heartbeat kaybı. FAILSAFE + LOITER."]
+    assert failures == ["Vision heartbeat kaybı. FAILSAFE + STOP."]
 
 
 def test_task3_gps_return_does_not_require_fresh_vision(monkeypatch):
@@ -267,6 +267,7 @@ def test_task3_gps_return_does_not_require_fresh_vision(monkeypatch):
         "lat": 37.95125,
         "lon": 32.50090,
     }
+    node.task3.state = types.SimpleNamespace(name="RETURN_TO_IMPACT")
 
     node.timer_callback()
 
@@ -279,7 +280,7 @@ def test_task3_gps_return_does_not_require_fresh_vision(monkeypatch):
     ]
 
 
-def test_task3_competition_failsafe_requests_loiter_not_task1_hold(
+def test_task3_competition_failsafe_stops_without_task1_hold(
         monkeypatch,
 ):
     competition = _load_competition_module(monkeypatch)
@@ -290,19 +291,19 @@ def test_task3_competition_failsafe_requests_loiter_not_task1_hold(
         error=lambda *args, **kwargs: None
     )
     task1_holds = []
-    task3_loiters = []
+    task3_failsafes = []
     node.task1 = types.SimpleNamespace(
         _request_hold_mode=lambda: task1_holds.append(True)
     )
     node.task3 = types.SimpleNamespace(
-        request_failsafe_loiter=task3_loiters.append
+        request_failsafe=task3_failsafes.append
     )
 
     node._enter_competition_failsafe("task3 failure")
 
     assert node.competition_state is competition.CompetitionState.FAILSAFE
     assert task1_holds == []
-    assert task3_loiters == ["task3 failure"]
+    assert task3_failsafes == ["task3 failure"]
 
 
 def test_competition_file_launch_promotes_repository_utils(monkeypatch):

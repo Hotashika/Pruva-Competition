@@ -151,7 +151,7 @@ class CompetitionNode(Task1Node):
         self.competition_state = CompetitionState.FAILSAFE
         stop_vehicle(self.mission_topics.cmd_vel_pub)
         if task3_active:
-            self.task3.request_failsafe_loiter(reason)
+            self.task3.request_failsafe(reason)
         else:
             self.task1._request_hold_mode()
 
@@ -190,20 +190,25 @@ class CompetitionNode(Task1Node):
                     )
                 ),
             )
-            vision_required = (
-                getattr(self.task3, "impact_target_gps", None) is None
-            )
+            task3_state = getattr(self.task3, "state", None)
+            state_name = getattr(task3_state, "name", str(task3_state))
+            vision_required = state_name not in {
+                "POST_IMPACT_ADVANCE",
+                "RETURN_TO_IMPACT",
+                "FINISHED",
+                "FAILSAFE",
+            }
         if (
                 vision_required
                 and (vision_age is None or vision_age > vision_stale_limit)
         ):
-            hold_mode = (
-                "LOITER"
+            failsafe_action = (
+                "STOP"
                 if self.competition_state == CompetitionState.PARKUR_3
                 else "HOLD"
             )
             self._enter_competition_failsafe(
-                f"Vision heartbeat kaybı. FAILSAFE + {hold_mode}."
+                f"Vision heartbeat kaybı. FAILSAFE + {failsafe_action}."
             )
             return
 

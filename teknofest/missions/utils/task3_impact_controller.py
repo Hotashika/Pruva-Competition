@@ -9,7 +9,7 @@ from typing import Optional
 
 class ImpactAction(Enum):
     RAM_MOTION = auto()
-    IMPACT_RECORDED = auto()
+    RAM_COMPLETE = auto()
     POST_IMPACT_MOTION = auto()
     RETURN_TO_IMPACT = auto()
 
@@ -43,8 +43,8 @@ class Task3ImpactController:
                 reason="direct ram",
             )
         return ImpactDecision(
-            action=ImpactAction.IMPACT_RECORDED,
-            reason="RAM süresi tamamlandı; çarpışma GPS'i kaydediliyor",
+            action=ImpactAction.RAM_COMPLETE,
+            reason="RAM süresi tamamlandı; yakın derinlik doğrulaması bekleniyor",
         )
 
     def post_impact_decision(self, elapsed) -> ImpactDecision:

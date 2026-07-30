@@ -50,7 +50,6 @@ from utils.mavlink_utilities import (
 
 
 DRIVE_MODE = "GUIDED"
-HOLD_MODE = "LOITER"
 ACTIVE_TASK_NAME = "task3"
 MISSION_STATE_HEARTBEAT_SEC = 1.0
 
@@ -77,7 +76,6 @@ class Task3Config:
     geofence_radius_m: float = 25.0
     mission_timeout_sec: float = 240.0
     mode_transition_timeout_sec: float = 5.0
-    loiter_mode: str = HOLD_MODE
 
     # Arama
     search_linear_x: float = 0.25
@@ -113,11 +111,23 @@ class Task3Config:
     steering_kp: float = 0.018
     max_angular_z: float = 0.35
 
+    # Derinlik kontrollü yanaşma
+    approach_contact_window_size: int = 7
+    approach_contact_required: int = 5
+    approach_contact_spread_m: float = 0.15
+    approach_progress_ratio: float = 0.10
+    approach_min_progress_m: float = 0.20
+    approach_min_speed: float = 0.12
+    approach_max_speed: float = 0.45
+    approach_speed_kp: float = 0.12
+
     # Temas ve kayıtlı GPS'e dönüş
     ram_speed: float = 0.85
     ram_duration_sec: float = 2.0
+    impact_distance_growth_ratio: float = 0.50
+    impact_distance_growth_margin_m: float = 0.20
     post_impact_forward_speed: float = 0.85
-    post_impact_forward_duration_sec: float = 2.5
+    post_impact_forward_duration_sec: float = 3.5
     impact_return_tolerance_m: float = 1.0
     impact_return_timeout_sec: float = 20.0
 
@@ -132,6 +142,15 @@ class Task3Config:
             raise ValueError(
                 "confirmation_required must be between 1 and "
                 "confirmation_window_size"
+            )
+        if not (
+                1
+                <= self.approach_contact_required
+                <= self.approach_contact_window_size
+        ):
+            raise ValueError(
+                "approach_contact_required must be between 1 and "
+                "approach_contact_window_size"
             )
         for name in (
                 "search_linear_x",
@@ -160,6 +179,14 @@ class Task3Config:
                 "mode_transition_timeout_sec",
                 "confirmation_max_gap_sec",
                 "attack_confirm_timeout_sec",
+                "approach_contact_spread_m",
+                "approach_progress_ratio",
+                "approach_min_progress_m",
+                "approach_min_speed",
+                "approach_max_speed",
+                "approach_speed_kp",
+                "impact_distance_growth_ratio",
+                "impact_distance_growth_margin_m",
         ):
             if float(getattr(self, name)) <= 0.0:
                 raise ValueError(f"{name} must be positive")
@@ -184,8 +211,10 @@ class Task3Config:
                 "search_advance_heading_limit_deg must be between "
                 "search_heading_tolerance_deg and 90"
             )
-        if str(self.loiter_mode).strip().upper() != HOLD_MODE:
-            raise ValueError("loiter_mode must be LOITER")
+        if self.approach_min_speed > self.approach_max_speed:
+            raise ValueError(
+                "approach_min_speed cannot exceed approach_max_speed"
+            )
 
 
 class MissionState(Enum):
@@ -193,11 +222,10 @@ class MissionState(Enum):
     WAIT_GUIDED_SEARCH = auto()
     SEARCH = auto()
     ATTACK_CONFIRM = auto()
+    APPROACH = auto()
     RAM = auto()
     POST_IMPACT_ADVANCE = auto()
     RETURN_TO_IMPACT = auto()
-    FINAL_LOITER = auto()
-    FAILSAFE_LOITER = auto()
     FINISHED = auto()
     FAILSAFE = auto()
 
@@ -206,6 +234,7 @@ class Task3KamikazeEngagement:
     _GUIDED_STATES = {
         MissionState.SEARCH,
         MissionState.ATTACK_CONFIRM,
+        MissionState.APPROACH,
         MissionState.RAM,
         MissionState.POST_IMPACT_ADVANCE,
         MissionState.RETURN_TO_IMPACT,
@@ -253,6 +282,13 @@ class Task3KamikazeEngagement:
         )
         self.confirmation_last_time = None
         self.confirmation_last_frame_id = None
+        self.approach_distance_samples = deque(
+            maxlen=self.config.approach_contact_window_size
+        )
+        self.approach_entry_distance = None
+        self.approach_closest_distance = None
+        self.ram_entry_distance = None
+        self.ram_last_frame_id = None
 
         self.impact_target_gps = None
         self.impact_events = []
@@ -373,10 +409,6 @@ class Task3KamikazeEngagement:
         self._clear_pending_mode()
         self._stop()
         self.logger.error(reason)
-        if desired_mode == self.config.loiter_mode:
-            self.finished = False
-            self._set_state(MissionState.FAILSAFE, now, reason)
-            return
         self._enter_failsafe(reason, now=now)
 
     def _ensure_mode(self, desired_mode, now):
@@ -456,26 +488,21 @@ class Task3KamikazeEngagement:
 
     def _enter_failsafe(self, reason, now=None):
         now = self._now(now)
-        if self.state not in (
-                MissionState.FAILSAFE_LOITER,
-                MissionState.FAILSAFE,
-        ):
+        if self.state != MissionState.FAILSAFE:
             self.logger.error(reason)
         self.failsafe_reason = reason
         self.finished = False
         self._cancel_pending_mode()
         self._stop()
         self._set_state(
-            MissionState.FAILSAFE_LOITER,
+            MissionState.FAILSAFE,
             now,
-            "FAILSAFE nedeniyle LOITER isteniyor",
+            "FAILSAFE; araç durduruldu",
         )
 
-    def request_failsafe_loiter(self, reason, now=None):
-        """Stop immediately and dispatch the Task 3 LOITER request."""
-        now = self._now(now)
+    def request_failsafe(self, reason, now=None):
+        """Stop immediately and enter the terminal Task 3 failsafe state."""
         self._enter_failsafe(reason, now=now)
-        self._update_failsafe_loiter(now)
 
     def reset_for_entry(self, lat, lon, heading, now=None):
         now = self._now(now)
@@ -496,6 +523,12 @@ class Task3KamikazeEngagement:
         self.confirmation_samples.clear()
         self.confirmation_last_time = None
         self.confirmation_last_frame_id = None
+        self.approach_distance_samples.clear()
+        self.approach_entry_distance = None
+        self.approach_closest_distance = None
+        self.approach_last_frame_id = None
+        self.ram_entry_distance = None
+        self.ram_last_frame_id = None
         self.impact_target_gps = None
         self.impact_events = []
         self.impact_return_departed = False
@@ -731,6 +764,7 @@ class Task3KamikazeEngagement:
         return dict(recent[-1])
 
     def _enter_search(self, now, reason, *, recenter=False):
+        self._stop()
         self.search_controller.enter_search(
             self.current_heading,
             self.current_lat,
@@ -741,6 +775,12 @@ class Task3KamikazeEngagement:
         self.confirmation_samples.clear()
         self.confirmation_last_time = None
         self.confirmation_last_frame_id = None
+        self.approach_distance_samples.clear()
+        self.approach_entry_distance = None
+        self.approach_closest_distance = None
+        self.approach_last_frame_id = None
+        self.ram_entry_distance = None
+        self.ram_last_frame_id = None
         self.last_target = None
         self._set_state(MissionState.SEARCH, now, reason)
 
@@ -764,6 +804,47 @@ class Task3KamikazeEngagement:
                 f"low-speed target confirmation 1/"
                 f"{self.config.confirmation_required}"
             ),
+        )
+
+    @staticmethod
+    def _is_new_frame(frame_id, previous_frame_id):
+        if frame_id is None or previous_frame_id is None:
+            return True
+        try:
+            return float(frame_id) > float(previous_frame_id)
+        except (TypeError, ValueError):
+            return frame_id != previous_frame_id
+
+    @staticmethod
+    def _median(values):
+        ordered = sorted(float(value) for value in values)
+        return ordered[len(ordered) // 2]
+
+    def _approach_speed(self, distance):
+        proportional = self.config.approach_speed_kp * float(distance)
+        return max(
+            self.config.approach_min_speed,
+            min(self.config.approach_max_speed, proportional),
+        )
+
+    def _enter_approach(self, target, now):
+        self.approach_distance_samples.clear()
+        self.approach_entry_distance = float(target["distance"])
+        self.approach_closest_distance = float(target["distance"])
+        self.approach_last_frame_id = None
+        self.ram_entry_distance = None
+        self.ram_last_frame_id = None
+        self.last_target = dict(target)
+        self.last_target_angle = target["angle"]
+        self._set_state(
+            MissionState.APPROACH,
+            now,
+            "hedef teyit edildi; derinlik kontrollü yanaşma başlıyor",
+        )
+        self._publish_motion(
+            linear_x=self._approach_speed(target["distance"]),
+            angular_z=self._steering_command(target["angle"]),
+            reason=f"depth approach; distance={target['distance']:.2f}m",
         )
 
     def _pause_for_uncertain_target_data(self, now, reason):
@@ -872,17 +953,7 @@ class Task3KamikazeEngagement:
         if confirmed is not None:
             self.last_target = confirmed
             self.last_target_angle = confirmed["angle"]
-            self._set_state(
-                MissionState.RAM,
-                now,
-                f"{self.config.confirmation_required} ayrı tutarlı kare; "
-                "doğrudan RAM",
-            )
-            self._publish_motion(
-                linear_x=self.config.ram_speed,
-                angular_z=self._steering_command(confirmed["angle"]),
-                reason="direct ram start",
-            )
+            self._enter_approach(confirmed, now)
             return
 
         if (
@@ -906,15 +977,119 @@ class Task3KamikazeEngagement:
             ),
         )
 
-    def _ram_steering(self, detections):
+    def _update_approach(
+            self,
+            detections,
+            now,
+            vision_frame_id=None,
+    ):
         target = self._select_target(detections)
-        if target is None or self.target_data_uncertain:
-            return 0.0
+        if self.target_data_uncertain:
+            self._pause_for_uncertain_target_data(
+                now,
+                f"yanaşmada derinlik verisi belirsiz: "
+                f"{self.target_data_uncertain_reason}",
+            )
+            return
+        if target is None:
+            self._enter_search(
+                now,
+                "derinlik kontrollü yanaşmada hedef kayboldu",
+                recenter=True,
+            )
+            return
+
         if self.last_target is not None and self._target_is_consistent(target):
-            target = self._filter_target(target, self.last_target)
+            filtered = self._filter_target(target, self.last_target)
+            filtered["distance"] = target["distance"]
+            target = filtered
+        elif self.last_target is not None:
+            self._begin_attack_confirmation(
+                target,
+                now,
+                frame_id=vision_frame_id,
+            )
+            return
+
         self.last_target = target
         self.last_target_angle = target["angle"]
-        return self._steering_command(target["angle"])
+
+        if self._is_new_frame(
+                vision_frame_id,
+                self.approach_last_frame_id,
+        ):
+            self.approach_distance_samples.append(target["distance"])
+            self.approach_closest_distance = min(
+                self.approach_closest_distance,
+                float(target["distance"]),
+            )
+            self.approach_last_frame_id = vision_frame_id
+
+        required = self.config.approach_contact_required
+        recent = list(self.approach_distance_samples)[-required:]
+        distance_median = (
+            self._median(recent)
+            if len(recent) >= required
+            else None
+        )
+        required_progress = max(
+            self.config.approach_min_progress_m,
+            self.approach_entry_distance
+            * self.config.approach_progress_ratio,
+        )
+        observed_progress = (
+            self.approach_entry_distance
+            - self.approach_closest_distance
+        )
+        contact_confirmed = (
+            distance_median is not None
+            and observed_progress >= required_progress
+            and max(recent) - min(recent)
+            <= self.config.approach_contact_spread_m
+            and distance_median
+            <= self.approach_closest_distance
+            + self.config.approach_contact_spread_m
+        )
+        if contact_confirmed:
+            self.ram_entry_distance = distance_median
+            self.ram_last_frame_id = None
+            self._set_state(
+                MissionState.RAM,
+                now,
+                "derinlik en yakın noktada kararlı; "
+                f"progress={observed_progress:.2f}m, "
+                f"median={distance_median:.2f}m; RAM başlıyor",
+            )
+            self._publish_motion(
+                linear_x=self.config.ram_speed,
+                angular_z=self._steering_command(target["angle"]),
+                reason="depth-confirmed ram start",
+            )
+            return
+
+        self._publish_motion(
+            linear_x=self._approach_speed(target["distance"]),
+            angular_z=self._steering_command(target["angle"]),
+            reason=(
+                f"depth approach; distance={target['distance']:.2f}m, "
+                f"progress={observed_progress:.2f}/{required_progress:.2f}m, "
+                f"stable_samples={len(recent)}/{required}"
+            ),
+        )
+
+    def _ram_target(self, detections, vision_frame_id=None):
+        target = self._select_target(detections)
+        if target is None or self.target_data_uncertain:
+            return None
+        if self.last_target is not None and self._target_is_consistent(target):
+            filtered = self._filter_target(target, self.last_target)
+            filtered["distance"] = target["distance"]
+            target = filtered
+        self.last_target = target
+        self.last_target_angle = target["angle"]
+        if self._is_new_frame(vision_frame_id, self.ram_last_frame_id):
+            self.ram_last_frame_id = vision_frame_id
+        return target
 
     def _valid_current_gps(self):
         return (
@@ -960,15 +1135,30 @@ class Task3KamikazeEngagement:
             )
         return True
 
-    def _enter_final_loiter(self, now, reason):
+    def _finish_mission(self, now, reason):
         self._stop()
-        self._set_state(MissionState.FINAL_LOITER, now, reason)
+        self._cancel_pending_mode()
+        self.finished = True
+        self._set_state(MissionState.FINISHED, now, reason)
 
-    def _update_ram(self, detections, now):
+    def _update_ram(
+            self,
+            detections,
+            now,
+            vision_frame_id=None,
+    ):
         elapsed = now - self.state_started_at
+        target = self._ram_target(
+            detections,
+            vision_frame_id=vision_frame_id,
+        )
         decision = self.impact_controller.ram_decision(
             elapsed,
-            angular_z=self._ram_steering(detections),
+            angular_z=(
+                self._steering_command(target["angle"])
+                if target is not None
+                else 0.0
+            ),
         )
         if decision.action == ImpactAction.RAM_MOTION:
             self._publish_motion(
@@ -978,10 +1168,35 @@ class Task3KamikazeEngagement:
             )
             return
 
-        if not self._register_impact(now, "initial_ram"):
+        max_allowed_distance = (
+            self.ram_entry_distance
+            * (1.0 + self.config.impact_distance_growth_ratio)
+            + self.config.impact_distance_growth_margin_m
+        )
+        impact_depth_confirmed = (
+            target is not None
+            and target["distance"]
+            <= max_allowed_distance
+        )
+        if not impact_depth_confirmed:
+            latest_distance = (
+                "none"
+                if target is None
+                else f"{target['distance']:.2f}m"
+            )
+            self._enter_search(
+                now,
+                "RAM bitti ancak yakın derinlik teması doğrulamadı; "
+                f"latest={latest_distance}, "
+                f"allowed={max_allowed_distance:.2f}m",
+                recenter=True,
+            )
+            return
+
+        if not self._register_impact(now, "depth_validated_ram"):
             return
         if self.impact_count >= self.config.required_impact_count:
-            self._enter_final_loiter(now, decision.reason)
+            self._finish_mission(now, decision.reason)
             return
 
         self._set_state(
@@ -1066,23 +1281,17 @@ class Task3KamikazeEngagement:
                 self.impact_return_departed
                 and distance <= self.config.impact_return_tolerance_m
         ):
-            if not self._register_impact(now, "gps_return"):
-                return
-            if self.impact_count >= self.config.required_impact_count:
-                self._enter_final_loiter(
-                    now,
-                    "gerekli GPS dönüş temasları tamamlandı",
-                )
-                return
-            self._set_state(
-                MissionState.POST_IMPACT_ADVANCE,
+            self.search_controller.reset_for_entry(
+                self.current_heading,
+                self.current_lat,
+                self.current_lon,
                 now,
-                f"{self.impact_count}. temas; yeniden ileri çıkılıyor",
             )
-            self._publish_motion(
-                linear_x=self.config.post_impact_forward_speed,
-                angular_z=0.0,
-                reason="next post-impact forward advance",
+            self._enter_search(
+                now,
+                "çarpışma GPS bölgesine dönüldü; "
+                "hedef derinlikle yeniden aranıyor",
+                recenter=True,
             )
             return
 
@@ -1101,59 +1310,6 @@ class Task3KamikazeEngagement:
             throttle_duration_sec=1.0,
         )
 
-    def _update_final_loiter(self, now):
-        self._stop()
-        if (
-                self.bridge_connected is not True
-                or self.bridge_armed is not True
-                or self.last_bridge_state_time is None
-                or now - self.last_bridge_state_time
-                > self.config.bridge_state_timeout_sec
-        ):
-            self.logger.error(
-                "Task 3 final LOITER için güncel/operasyonel bridge state yok."
-            )
-            self.finished = False
-            self._set_state(
-                MissionState.FAILSAFE,
-                now,
-                "final LOITER bridge state doğrulanamadı",
-            )
-            return
-        if not self._ensure_mode(self.config.loiter_mode, now):
-            return
-        self.finished = True
-        self._set_state(
-            MissionState.FINISHED,
-            now,
-            "LOITER heartbeat teyit edildi; görev tamamlandı",
-        )
-
-    def _update_failsafe_loiter(self, now):
-        self._stop()
-        if (
-                self.bridge_connected is not True
-                or self.last_bridge_state_time is None
-                or now - self.last_bridge_state_time
-                > self.config.bridge_state_timeout_sec
-        ):
-            self.logger.error(
-                "Task 3 FAILSAFE LOITER bridge üzerinden doğrulanamadı."
-            )
-            self._set_state(
-                MissionState.FAILSAFE,
-                now,
-                "failsafe LOITER bridge üzerinden doğrulanamadı",
-            )
-            return
-        if not self._ensure_mode(self.config.loiter_mode, now):
-            return
-        self._set_state(
-            MissionState.FAILSAFE,
-            now,
-            "LOITER heartbeat teyit edildi",
-        )
-
     def update(
             self,
             detections,
@@ -1169,13 +1325,6 @@ class Task3KamikazeEngagement:
         if self.state == MissionState.FAILSAFE:
             self._stop()
             return
-        if self.state == MissionState.FINAL_LOITER:
-            self._update_final_loiter(now)
-            return
-        if self.state == MissionState.FAILSAFE_LOITER:
-            self._update_failsafe_loiter(now)
-            return
-
         if not self._check_navigation(now):
             return
         if not self._check_bridge(now):
@@ -1198,7 +1347,10 @@ class Task3KamikazeEngagement:
             )
             return
 
-        vision_required = self.impact_target_gps is None
+        vision_required = self.state not in {
+            MissionState.POST_IMPACT_ADVANCE,
+            MissionState.RETURN_TO_IMPACT,
+        }
         if vision_required and not vision_fresh:
             self._enter_failsafe(
                 "Task 3 vision heartbeat zaman aşımı.",
@@ -1228,8 +1380,19 @@ class Task3KamikazeEngagement:
                 vision_frame_id=vision_frame_id,
             )
             return
+        if self.state == MissionState.APPROACH:
+            self._update_approach(
+                detections,
+                now,
+                vision_frame_id=vision_frame_id,
+            )
+            return
         if self.state == MissionState.RAM:
-            self._update_ram(detections, now)
+            self._update_ram(
+                detections,
+                now,
+                vision_frame_id=vision_frame_id,
+            )
             return
         if self.state == MissionState.POST_IMPACT_ADVANCE:
             self._update_post_impact_advance(now)
@@ -1436,7 +1599,7 @@ def main(args=None):
 
         if node.task.finished:
             node.get_logger().info(
-                "Task 3 üç temas ve final LOITER tamamlandı."
+                "Task 3 üç temas tamamlandı."
             )
         elif node.task.state == MissionState.FAILSAFE:
             node.get_logger().error("Task 3 FAILSAFE ile sonlandı.")

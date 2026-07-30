@@ -441,7 +441,7 @@ def test_impact_controller_owns_ram_and_post_impact_timing():
     assert ram.angular_z == pytest.approx(0.12)
 
     impact = controller.ram_decision(elapsed=0.21)
-    assert impact.action is ImpactAction.IMPACT_RECORDED
+    assert impact.action is ImpactAction.RAM_COMPLETE
     assert controller.impact_count == 0
 
     assert controller.register_impact() == 1

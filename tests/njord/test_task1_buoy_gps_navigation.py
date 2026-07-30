@@ -423,6 +423,18 @@ def test_singular_and_plural_class_aliases_are_normalized(task1_module):
     assert singular["distance"] == 2.0
 
 
+@pytest.mark.parametrize("orange_class", ("orange_buoy", "orange_buoys"))
+def test_orange_buoy_is_treated_as_red_buoy(task1_module, orange_class):
+    mission = _mission_without_ros(task1_module)
+
+    normalized = mission._normalize_obstacle(
+        _detection(orange_class, distance=2.0)
+    )
+
+    assert normalized["class"] == task1_module.RED_BUOY_CLASS
+    assert task1_module.BUOY_PASS_SIDES[normalized["class"]] == "starboard"
+
+
 def test_single_detection_is_not_delayed_or_filtered(task1_module):
     mission = _mission_without_ros(task1_module)
     obstacle = mission._nearest_relevant_obstacle([
