@@ -15,6 +15,7 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault("MAVLINK20", "1")
 
 import rclpy
+from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from pymavlink import mavutil
@@ -59,6 +60,8 @@ MISSION_3 = 3
 MISSION_4 = 4
 MISSION_STOP = 90
 MISSION_EMERGENCY = 99
+TASK2_VELOCITY_TOPIC = "/cube/task2_velocity"
+TASK2_MAX_VELOCITY_M_S = 2.0
 VALID_MISSION_COMMANDS = {
     MISSION_IDLE,
     MISSION_1,
@@ -128,6 +131,32 @@ def set_position(connection, destination, boot_time):
             0, 0, 0,
             0, 0, 0,
             1.57, 0.5
+        )
+    )
+
+
+def set_global_velocity(connection, north_m_s, east_m_s, boot_time):
+    """Send a velocity-only target in the global North/East frame."""
+    time_boot_ms = int(1000 * (time.time() - boot_time))
+    velocity_only_mask = 0b110111100111
+    connection.mav.send(
+        mavutil.mavlink.MAVLink_set_position_target_global_int_message(
+            time_boot_ms,
+            connection.target_system,
+            connection.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            velocity_only_mask,
+            0,
+            0,
+            0,
+            float(north_m_s),
+            float(east_m_s),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
     )
 
@@ -283,6 +312,12 @@ class OrangeCubeBridgeNode(Node):
             self,
             self._cmd_vel_callback,
             self._set_position_callback,
+        )
+        self.task2_velocity_sub = self.create_subscription(
+            Twist,
+            TASK2_VELOCITY_TOPIC,
+            self._task2_velocity_callback,
+            10,
         )
         self.telemetry_pub = self.create_publisher(
             String,
@@ -1982,6 +2017,59 @@ class OrangeCubeBridgeNode(Node):
             )
         except Exception as exc:
             self._publish_error(f"Set position hatasi: {exc}")
+
+    def _task2_velocity_callback(self, msg):
+        """Apply Task 2's metric velocity command without changing WP_SPEED."""
+        if not self._has_valid_link():
+            self.get_logger().warn(
+                "MAVLink baglantisi yok. Task 2 velocity komutu yok sayiliyor.",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        if not self._vehicle_ready_for_guided_motion(
+            TASK2_VELOCITY_TOPIC
+        ):
+            return
+
+        north_m_s = float(msg.linear.x)
+        east_m_s = float(msg.linear.y)
+        if not math.isfinite(north_m_s) or not math.isfinite(east_m_s):
+            self._publish_error(
+                "Task 2 velocity hedefi sonlu olmayan deger iceriyor."
+            )
+            return
+
+        speed_m_s = math.hypot(north_m_s, east_m_s)
+        if speed_m_s > TASK2_MAX_VELOCITY_M_S:
+            self._publish_error(
+                "Task 2 velocity hedefi guvenlik sinirini asti: "
+                f"{speed_m_s:.3f}m/s > {TASK2_MAX_VELOCITY_M_S:.3f}m/s"
+            )
+            return
+
+        try:
+            set_global_velocity(
+                self.master,
+                north_m_s,
+                east_m_s,
+                self.boot_time,
+            )
+            self.last_position_target_time = time.time()
+            self.speed_setpoint_m_s = speed_m_s
+            if speed_m_s > 1e-6:
+                self.heading_setpoint_deg = (
+                    math.degrees(math.atan2(east_m_s, north_m_s))
+                    + 360.0
+                ) % 360.0
+            self.get_logger().info(
+                "MAVLink TX Task 2 velocity target: "
+                f"north={north_m_s:.3f}m/s, east={east_m_s:.3f}m/s, "
+                f"speed={speed_m_s:.3f}m/s",
+                throttle_duration_sec=1.0,
+            )
+        except Exception as exc:
+            self._publish_error(f"Task 2 velocity target hatasi: {exc}")
 
     def _cmd_vel_callback(self, msg):
         if not self._has_valid_link():

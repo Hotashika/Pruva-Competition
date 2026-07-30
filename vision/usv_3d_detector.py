@@ -709,6 +709,8 @@ class USV3DObstacleDetector:
         )
         self.last_geometry_error: str | None = None
         self.last_result: FrameResult | None = None
+        self.last_depth_shape: tuple[int, int] | None = None
+        self.last_image_shape: tuple[int, int] | None = None
 
     @staticmethod
     def _positive_float(value, fallback):
@@ -794,9 +796,12 @@ class USV3DObstacleDetector:
         }
 
     def detect(self, bgr_image, depth_array):
+        self.last_image_shape = getattr(bgr_image, "shape", (None, None))[:2]
+        self.last_depth_shape = getattr(depth_array, "shape", None)
         if depth_array is None or getattr(depth_array, "ndim", None) != 2:
             self.last_geometry_error = "Gecerli bir metrik depth karesi yok."
             self.last_result = None
+            self.last_depth_shape = None
             return []
 
         try:
