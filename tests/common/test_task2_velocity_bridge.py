@@ -1,6 +1,5 @@
 import ast
 import types
-import unittest
 from pathlib import Path
 
 
@@ -49,30 +48,25 @@ class _Mav:
         self.messages.append(message)
 
 
-class Task2VelocityBridgeTests(unittest.TestCase):
-    def test_sends_velocity_only_global_target_in_metres_per_second(self):
-        mav = _Mav()
-        connection = types.SimpleNamespace(
-            target_system=1,
-            target_component=2,
-            mav=mav,
-        )
+def test_sends_velocity_only_global_target_in_metres_per_second():
+    mav = _Mav()
+    connection = types.SimpleNamespace(
+        target_system=1,
+        target_component=2,
+        mav=mav,
+    )
 
-        _load_set_global_velocity()(
-            connection,
-            north_m_s=0.8,
-            east_m_s=-0.6,
-            boot_time=10.0,
-        )
+    _load_set_global_velocity()(
+        connection,
+        north_m_s=0.8,
+        east_m_s=-0.6,
+        boot_time=10.0,
+    )
 
-        self.assertEqual(1, len(mav.messages))
-        message = mav.messages[0]
-        self.assertEqual(2000, message[0])
-        self.assertEqual((1, 2, 3), message[1:4])
-        self.assertEqual(0b110111100111, message[4])
-        self.assertEqual((0, 0, 0), message[5:8])
-        self.assertEqual((0.8, -0.6, 0), message[8:11])
-
-
-if __name__ == "__main__":
-    unittest.main()
+    assert len(mav.messages) == 1
+    message = mav.messages[0]
+    assert message[0] == 2000
+    assert message[1:4] == (1, 2, 3)
+    assert message[4] == 0b110111100111
+    assert message[5:8] == (0, 0, 0)
+    assert message[8:11] == (0.8, -0.6, 0)

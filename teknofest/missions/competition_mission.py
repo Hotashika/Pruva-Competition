@@ -147,9 +147,13 @@ class CompetitionNode(Task1Node):
 
     def _enter_competition_failsafe(self, reason):
         self.get_logger().error(reason)
+        task3_active = self.competition_state == CompetitionState.PARKUR_3
         self.competition_state = CompetitionState.FAILSAFE
         stop_vehicle(self.mission_topics.cmd_vel_pub)
-        self.task1._request_hold_mode()
+        if task3_active:
+            self.task3.request_failsafe(reason)
+        else:
+            self.task1._request_hold_mode()
 
     def _finish_competition(self):
         stop_vehicle(self.mission_topics.cmd_vel_pub)
@@ -173,6 +177,7 @@ class CompetitionNode(Task1Node):
             else time.monotonic() - self.last_detection_message_time
         )
         vision_stale_limit = VISION_DETECTION_TIMEOUT_SEC
+        vision_required = True
         if self.competition_state == CompetitionState.PARKUR_3:
             task3_config = getattr(self.task3, "config", None)
             vision_stale_limit = min(
@@ -185,8 +190,26 @@ class CompetitionNode(Task1Node):
                     )
                 ),
             )
-        if vision_age is None or vision_age > vision_stale_limit:
-            self._enter_competition_failsafe("Vision heartbeat kaybı. FAILSAFE + HOLD.")
+            task3_state = getattr(self.task3, "state", None)
+            state_name = getattr(task3_state, "name", str(task3_state))
+            vision_required = state_name not in {
+                "POST_IMPACT_ADVANCE",
+                "RETURN_TO_IMPACT",
+                "FINISHED",
+                "FAILSAFE",
+            }
+        if (
+                vision_required
+                and (vision_age is None or vision_age > vision_stale_limit)
+        ):
+            failsafe_action = (
+                "STOP"
+                if self.competition_state == CompetitionState.PARKUR_3
+                else "HOLD"
+            )
+            self._enter_competition_failsafe(
+                f"Vision heartbeat kaybı. FAILSAFE + {failsafe_action}."
+            )
             return
 
         try:
@@ -205,7 +228,10 @@ class CompetitionNode(Task1Node):
                     self._transition_to(CompetitionState.PARKUR_3, "task3")
 
             elif self.competition_state == CompetitionState.PARKUR_3:
-                self.task3.update(detections)
+                self.task3.update(
+                    detections,
+                    vision_frame_id=self.last_detection_message_time,
+                )
                 if self.task3.state == Task3State.FAILSAFE:
                     self._enter_competition_failsafe("Task 3 FAILSAFE.")
                 elif self.task3.finished:

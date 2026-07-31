@@ -55,6 +55,7 @@ class MissionTopics:
     state_sub: object
     cmd_vel_pub: object
     position_target_pub: object
+    mission_state_pub: object
 
 
 def create_bridge_topics(node, cmd_vel_callback, set_position_callback=None):
@@ -180,6 +181,7 @@ def create_mission_topics(node, gps_callback, heading_callback, state_callback):
         Publisher:
             /cube/cmd_vel
             /cube/set_position
+            /mission/state
     """
 
     gps_sub = node.create_subscription(
@@ -215,12 +217,19 @@ def create_mission_topics(node, gps_callback, heading_callback, state_callback):
         10
     )
 
+    mission_state_pub = node.create_publisher(
+        String,
+        '/mission/state',
+        10
+    )
+
     return MissionTopics(
         gps_sub=gps_sub,
         heading_sub=heading_sub,
         state_sub=state_sub,
         cmd_vel_pub=cmd_vel_pub,
         position_target_pub=position_target_pub,
+        mission_state_pub=mission_state_pub,
     )
 
 

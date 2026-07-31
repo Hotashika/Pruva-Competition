@@ -20,6 +20,7 @@ from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from pymavlink import mavutil
 
+from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu, NavSatFix, BatteryState
 from std_msgs.msg import Float32, Int32, String
 
