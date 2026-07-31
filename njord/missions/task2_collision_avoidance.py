@@ -70,12 +70,16 @@ EARTH_RADIUS_M = 6378137.0
 # KAÇINMA HAREKET PARAMETRELERİ
 # ============================================================
 AVOIDANCE_STARBOARD_ANGLE_DEG = 45.0
+AVOIDANCE_PORT_ANGLE_DEG = 45.0
 AVOIDANCE_STARBOARD_DURATION_SEC = 4.0
 AVOIDANCE_FORWARD_MIN_DURATION_SEC = 3.0
 AVOIDANCE_CLEAR_CONFIRM_SEC = 1.0
 AVOIDANCE_BEHIND_MARGIN_M = 1.0
 AVOIDANCE_MATCH_MAX_BEARING_DELTA_DEG = 45.0
 AVOIDANCE_MATCH_MAX_DISTANCE_DELTA_M = 4.0
+BUOY_DEPTH_MATCH_MAX_ANGLE_DELTA_DEG = 8.0
+BUOY_DEPTH_MATCH_MAX_DISTANCE_DELTA_M = 1.5
+BUOY_DEPTH_MATCH_MIN_BBOX_IOU = 0.05
 TASK_MAX_SPEED_FRACTION = 1.0
 TASK_MIN_TURN_SPEED_FRACTION = 0.4
 AVOIDANCE_TIMEOUT_SEC = 40.0
@@ -105,7 +109,7 @@ STAND_ON_GRACE_SEC = 2.5
 # ============================================================
 # VISION PARAMETRELERİ
 # ============================================================
-VISION_DETECTION_TIMEOUT_SEC = 1.0
+VISION_DETECTION_TIMEOUT_SEC = 12.0
 
 VESSEL_TYPES = {"vessel", "boat", "ship"}
 DEPTH_OBSTACLE_TYPE = "depth_obstacle"
@@ -122,11 +126,13 @@ BUOY_MODEL_TYPES = {
     # Legacy aliases kept for older datasets and recorded detections.
     "green_buoys",
     "red_buoys",
+    "yellow_buoys",
     "north_buoys",
     "east_buoys",
     "south_buoys",
     "west_buoys",
 }
+YELLOW_BUOY_TYPES = {"yellow_buoy", "yellow_buoys"}
 COLLISION_TARGET_ANGLE_KEYS = (
     "Vessel angle: ",
     "Vessel angle",
@@ -460,10 +466,20 @@ class Task2CollisionAvoidance:
         forward_m = cls._finite_float(detection.get("forward_m"))
         starboard_m = cls._finite_float(detection.get("lateral_m"))
         width_m = cls._finite_float(detection.get("width_m"))
+        detector_type = str(detection.get("type", "")).strip().lower()
+        model_class = str(detection.get("class", "")).strip().lower()
+        bbox = detection.get("bbox")
         return {
             "distance": distance_m,
             "angle": angle_deg,
             "track_id": cls._optional_int(detection.get("track_id")),
+            "detector_type": detector_type,
+            "model_class": model_class,
+            "bbox": (
+                list(bbox[:4])
+                if isinstance(bbox, (list, tuple)) and len(bbox) >= 4
+                else None
+            ),
             "forward_m": forward_m,
             "starboard_m": starboard_m,
             "width_m": (
@@ -474,30 +490,98 @@ class Task2CollisionAvoidance:
             "raw": detection,
         }
 
+    @staticmethod
+    def _bbox_iou(first, second):
+        if first is None or second is None:
+            return None
+        try:
+            ax1, ay1, ax2, ay2 = map(float, first[:4])
+            bx1, by1, bx2, by2 = map(float, second[:4])
+        except (TypeError, ValueError):
+            return None
+        intersection = (
+            max(0.0, min(ax2, bx2) - max(ax1, bx1))
+            * max(0.0, min(ay2, by2) - max(ay1, by1))
+        )
+        union = (
+            max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            + max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            - intersection
+        )
+        return intersection / union if union > 0.0 else None
+
+    @staticmethod
+    def _is_buoy_target(vessel):
+        return vessel.get("detector_type") == "buoy"
+
+    @classmethod
+    def _buoy_matches_depth_obstacle(cls, buoy, obstacle):
+        bbox_iou = cls._bbox_iou(
+            buoy.get("bbox"),
+            obstacle.get("bbox"),
+        )
+        distance_delta = abs(buoy["distance"] - obstacle["distance"])
+        if (
+            bbox_iou is not None
+            and bbox_iou >= BUOY_DEPTH_MATCH_MIN_BBOX_IOU
+            and distance_delta <= BUOY_DEPTH_MATCH_MAX_DISTANCE_DELTA_M
+        ):
+            return True
+        return (
+            abs(buoy["angle"] - obstacle["angle"])
+            <= BUOY_DEPTH_MATCH_MAX_ANGLE_DELTA_DEG
+            and distance_delta <= BUOY_DEPTH_MATCH_MAX_DISTANCE_DELTA_M
+        )
+
+    @classmethod
+    def _collision_targets(cls, detections):
+        """Prefer buoy semantics over duplicate generic depth detections."""
+        targets = []
+        for detection in detections or []:
+            target = cls._normalized_vessel(detection)
+            if target is not None and target["distance"] <= MONITOR_DISTANCE_M:
+                targets.append(target)
+
+        buoys = [target for target in targets if cls._is_buoy_target(target)]
+        if not buoys:
+            return targets
+
+        prioritized = list(buoys)
+        for target in targets:
+            if cls._is_buoy_target(target):
+                continue
+            if any(
+                cls._buoy_matches_depth_obstacle(buoy, target)
+                for buoy in buoys
+            ):
+                continue
+            prioritized.append(target)
+        return prioritized
+
     @classmethod
     def _nearest_vessel(cls, detections):
-        vessels = []
-        for detection in detections or []:
-            vessel = cls._normalized_vessel(detection)
-            if vessel is not None and vessel["distance"] <= MONITOR_DISTANCE_M:
-                vessels.append(vessel)
+        vessels = cls._collision_targets(detections)
         return min(vessels, key=lambda item: item["distance"]) if vessels else None
 
     def _matching_avoidance_vessel(self, detections):
         """Keep refreshing from the obstacle that started the maneuver."""
         reference = self.active_obstacle_reference
-        candidates = []
-        for detection in detections or []:
-            candidate = self._normalized_vessel(detection)
-            if (
-                candidate is None
-                or candidate["distance"] > MONITOR_DISTANCE_M
-            ):
-                continue
+        candidates = self._collision_targets(detections)
+        exact_track_match = False
 
-            if self.avoiding_track_id is not None:
-                if candidate.get("track_id") != self.avoiding_track_id:
-                    continue
+        if self.avoiding_track_id is not None:
+            exact_matches = [
+                candidate
+                for candidate in candidates
+                if candidate.get("track_id") == self.avoiding_track_id
+            ]
+            if exact_matches:
+                candidates = exact_matches
+                exact_track_match = True
+
+        scored_candidates = []
+        for candidate in candidates:
+            if exact_track_match:
                 score = 0.0
             elif reference is not None:
                 candidate_bearing = (
@@ -526,12 +610,12 @@ class Task2CollisionAvoidance:
                 )
             else:
                 score = candidate["distance"]
-            candidates.append((score, candidate))
+            scored_candidates.append((score, candidate))
 
-        if not candidates:
+        if not scored_candidates:
             return None
 
-        candidate = min(candidates, key=lambda item: item[0])[1]
+        candidate = min(scored_candidates, key=lambda item: item[0])[1]
         self.active_obstacle_reference = dict(candidate)
         if (
             self.avoiding_track_id is None
@@ -937,6 +1021,8 @@ class Task2CollisionAvoidance:
         target_bearing = self.avoidance_entry_heading
         if self.avoidance_phase == "starboard":
             target_bearing += AVOIDANCE_STARBOARD_ANGLE_DEG
+        elif self.avoidance_phase == "port":
+            target_bearing -= AVOIDANCE_PORT_ANGLE_DEG
         target_bearing %= 360.0
         speed_m_s = self._publish_task2_velocity_bearing(target_bearing)
         self.logger.info(
@@ -973,7 +1059,13 @@ class Task2CollisionAvoidance:
         self.aligned_target_key = None
         self.track.clear()
 
-    def _start_starboard_avoidance(
+    @staticmethod
+    def _avoidance_turn_side(vessel):
+        if vessel.get("model_class") in YELLOW_BUOY_TYPES:
+            return "port"
+        return "starboard"
+
+    def _start_avoidance(
             self,
             vessel,
             now,
@@ -983,7 +1075,7 @@ class Task2CollisionAvoidance:
         self.state = MissionState.AVOIDING
         self.avoid_started_time = now
         self.avoidance_phase_started_time = now
-        self.avoidance_phase = "starboard"
+        self.avoidance_phase = self._avoidance_turn_side(vessel)
         self.avoidance_entry_heading = float(self.current_heading)
         self.avoidance_clear_since = None
         self.stand_on_risk_since = None
@@ -998,13 +1090,19 @@ class Task2CollisionAvoidance:
         dcpa_text = "unknown" if assessment.dcpa_m is None else f"{assessment.dcpa_m:.1f}m"
         self.logger.warn(
             "Collision risk: encounter=%s reason=%s TCPA=%s DCPA=%s; "
-            "starting %.1fdeg starboard-forward maneuver at %.1fkn."
+            "target=%s, starting %.1fdeg %s-forward maneuver at %.1fkn."
             % (
                 encounter,
                 assessment.reason,
                 tcpa_text,
                 dcpa_text,
-                AVOIDANCE_STARBOARD_ANGLE_DEG,
+                vessel.get("model_class") or vessel.get("detector_type"),
+                (
+                    AVOIDANCE_PORT_ANGLE_DEG
+                    if self.avoidance_phase == "port"
+                    else AVOIDANCE_STARBOARD_ANGLE_DEG
+                ),
+                self.avoidance_phase,
                 TASK_TARGET_SPEED_KNOTS,
             )
         )
@@ -1022,13 +1120,14 @@ class Task2CollisionAvoidance:
         total_elapsed = now - self.avoid_started_time
         if total_elapsed >= AVOIDANCE_TIMEOUT_SEC:
             self._enter_failsafe(
-                f"Timed starboard avoidance exceeded "
+                f"Timed {self.avoidance_phase} avoidance exceeded "
                 f"{AVOIDANCE_TIMEOUT_SEC:.1f}s"
             )
             return
 
         phase_elapsed = now - self.avoidance_phase_started_time
-        if self.avoidance_phase == "starboard":
+        if self.avoidance_phase in {"starboard", "port"}:
+            completed_turn = self.avoidance_phase
             if phase_elapsed < AVOIDANCE_STARBOARD_DURATION_SEC:
                 self._publish_avoidance_velocity()
                 return
@@ -1037,7 +1136,7 @@ class Task2CollisionAvoidance:
             self.avoidance_phase_started_time = now
             self.avoidance_clear_since = now if vessel is None else None
             self.logger.info(
-                "Timed starboard leg completed; continuing on the entry "
+                f"Timed {completed_turn} leg completed; continuing on the entry "
                 "heading until the obstacle clears."
             )
             self._publish_avoidance_velocity()
@@ -1164,7 +1263,7 @@ class Task2CollisionAvoidance:
                 )
             )
             if role == "give_way":
-                self._start_starboard_avoidance(
+                self._start_avoidance(
                     vessel,
                     now,
                     encounter,
@@ -1179,7 +1278,7 @@ class Task2CollisionAvoidance:
                 )
             self.state = MissionState.STAND_ON
             if emergency or now - self.stand_on_risk_since >= STAND_ON_GRACE_SEC:
-                self._start_starboard_avoidance(
+                self._start_avoidance(
                     vessel,
                     now,
                     encounter,
@@ -1208,7 +1307,9 @@ class Task2Node(Node):
             f"{TASK_TARGET_SPEED_KNOTS:.1f}kn "
             f"({TASK_TARGET_SPEED_M_S:.3f}m/s). "
             f"Timed avoidance={AVOIDANCE_STARBOARD_ANGLE_DEG:.0f}deg "
-            f"starboard for {AVOIDANCE_STARBOARD_DURATION_SEC:.1f}s, then "
+            "starboard for red/generic targets or "
+            f"{AVOIDANCE_PORT_ANGLE_DEG:.0f}deg port for yellow buoys, for "
+            f"{AVOIDANCE_STARBOARD_DURATION_SEC:.1f}s, then "
             f"forward for at least {AVOIDANCE_FORWARD_MIN_DURATION_SEC:.1f}s. "
             "Only the Task 2 metric-velocity topic is used; WP_SPEED is not "
             "changed."
