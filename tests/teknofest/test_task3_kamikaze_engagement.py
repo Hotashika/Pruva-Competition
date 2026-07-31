@@ -85,6 +85,7 @@ def task3_module(monkeypatch):
 
     mavlink_utilities = types.ModuleType("utils.mavlink_utilities")
     utility_names = (
+        "align_heading_to_gps_target",
         "call_set_mode",
         "call_trigger_service",
         "create_mission_clients",
@@ -212,7 +213,18 @@ def _enter_ram(mission, task3_module, now=0.1, angle=0.0):
     assert mission.state is task3_module.MissionState.APPROACH
 
     approach_started_at = now + mission.config.confirmation_required * 0.1
-    approach_distances = (6.0, 4.0, 2.0, 1.2, 1.10, 1.08, 1.06, 1.05, 1.04)
+    approach_distances = (
+        6.0,
+        4.0,
+        2.0,
+        1.2,
+        1.10,
+        1.08,
+        1.06,
+        1.05,
+        1.04,
+        1.00,
+    )
     ram_started_at = None
     for index, distance in enumerate(approach_distances):
         mission.update(
@@ -434,8 +446,39 @@ def test_depth_approach_is_part_of_attack_contract(task3_module):
     assert "APPROACH" in state_names
     assert not hasattr(defaults, "approach_distance_m")
     assert defaults.approach_contact_window_size == 7
-    assert defaults.approach_contact_required == 5
+    assert defaults.approach_contact_required == 3
+    assert defaults.ram_start_distance_m == pytest.approx(1.0)
     assert defaults.confirmation_required == 6
+
+
+def test_ram_starts_at_one_meter_boundary(task3_module):
+    mission = _mission(task3_module)
+    detections = [_target(distance=8.0)]
+    for index in range(mission.config.confirmation_required):
+        mission.update(
+            detections,
+            now=0.1 + index * 0.1,
+            vision_frame_id=100 + index,
+        )
+
+    assert mission.state is task3_module.MissionState.APPROACH
+
+    for index, distance in enumerate((1.14, 1.12, 1.10, 1.08, 1.01)):
+        mission.update(
+            [_target(distance=distance)],
+            now=0.8 + index * 0.1,
+            vision_frame_id=200 + index,
+        )
+
+    assert mission.state is task3_module.MissionState.APPROACH
+
+    mission.update(
+        [_target(distance=1.0)],
+        now=1.3,
+        vision_frame_id=205,
+    )
+
+    assert mission.state is task3_module.MissionState.RAM
 
 
 def test_far_depth_never_starts_ram(task3_module):
@@ -571,7 +614,12 @@ def test_ram_end_does_not_record_impact_when_depth_is_far(task3_module):
 
 
 def test_post_impact_advance_returns_with_global_gps_target(task3_module):
+    alignments = []
     positions = []
+    task3_module.align_heading_to_gps_target = (
+        lambda *args, **kwargs:
+        alignments.append((args, kwargs)) or False
+    )
     task3_module.publish_set_position = (
         lambda publisher, lat, lon:
         positions.append((publisher, lat, lon))
@@ -594,10 +642,56 @@ def test_post_impact_advance_returns_with_global_gps_target(task3_module):
         vision_fresh=False,
     )
 
-    assert mission.state is task3_module.MissionState.RETURN_TO_IMPACT
-    assert positions[-1] == pytest.approx(
-        ("position_target", 37.95125, 32.50090)
+    assert mission.state is task3_module.MissionState.ALIGN_TO_IMPACT
+    assert alignments
+    assert alignments[-1][0][1:6] == pytest.approx(
+        (37.95125, 32.50090, 15.0, 37.95125, 32.50090)
     )
+    assert alignments[-1][1]["tolerance_deg"] == pytest.approx(
+        mission.config.impact_alignment_tolerance_deg
+    )
+    assert positions == []
+
+
+def test_impact_alignment_rechecks_target_before_next_attack(
+        task3_module,
+):
+    positions = []
+    task3_module.align_heading_to_gps_target = (
+        lambda *args, **kwargs: True
+    )
+    task3_module.publish_set_position = (
+        lambda publisher, lat, lon:
+        positions.append((publisher, lat, lon))
+    )
+    mission = _mission(task3_module)
+    mission.impact_count = 1
+    mission.impact_target_gps = {
+        "lat": 37.95125,
+        "lon": 32.50090,
+        "recorded_at": 0.5,
+        "impact_count": 1,
+        "source": "initial_ram",
+    }
+    mission.state = task3_module.MissionState.ALIGN_TO_IMPACT
+    mission.state_started_at = 1.0
+
+    mission.update([], now=1.1, vision_fresh=True)
+
+    assert mission.state is task3_module.MissionState.SEARCH
+    assert mission.search_controller.base_heading == pytest.approx(15.0)
+    assert positions == []
+
+    mission.update(
+        [_target(distance=3.0)],
+        now=1.2,
+        vision_fresh=True,
+        vision_frame_id=301,
+    )
+
+    assert mission.state is task3_module.MissionState.ATTACK_CONFIRM
+    assert len(mission.confirmation_samples) == 1
+    assert positions == []
 
 
 def test_return_arrival_reacquires_with_depth_without_counting_impact(
@@ -893,16 +987,18 @@ def test_production_defaults_match_direct_attack_plan(task3_module):
     assert defaults.attack_confirm_speed == pytest.approx(0.15)
     assert not hasattr(defaults, "approach_distance_m")
     assert defaults.approach_contact_window_size == 7
-    assert defaults.approach_contact_required == 5
+    assert defaults.approach_contact_required == 3
     assert defaults.approach_contact_spread_m == pytest.approx(0.15)
     assert defaults.approach_progress_ratio == pytest.approx(0.10)
+    assert defaults.ram_start_distance_m == pytest.approx(1.0)
     assert defaults.approach_min_speed == pytest.approx(0.12)
     assert defaults.approach_max_speed == pytest.approx(0.45)
     assert defaults.impact_distance_growth_ratio == pytest.approx(0.50)
     assert defaults.ram_speed == pytest.approx(0.85)
     assert defaults.ram_duration_sec == pytest.approx(2.0)
-    assert defaults.post_impact_forward_speed == pytest.approx(0.85)
-    assert defaults.post_impact_forward_duration_sec == pytest.approx(3.5)
+    assert defaults.post_impact_forward_speed == pytest.approx(0.4)
+    assert defaults.post_impact_forward_duration_sec == pytest.approx(5.0)
+    assert defaults.impact_alignment_tolerance_deg == pytest.approx(8.0)
     assert defaults.impact_return_tolerance_m == pytest.approx(1.0)
     assert defaults.impact_return_timeout_sec == pytest.approx(20.0)
     assert defaults.mode_transition_timeout_sec == pytest.approx(5.0)

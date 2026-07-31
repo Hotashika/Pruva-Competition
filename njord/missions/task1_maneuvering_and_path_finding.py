@@ -84,6 +84,7 @@ EAST_CARDINAL_CLASS = "east_buoys"
 WEST_CARDINAL_CLASS = "west_buoys"
 OBSTACLE_CLASS_ALIASES = {
     "red_buoy": RED_BUOY_CLASS, "red_buoys": RED_BUOY_CLASS,
+    "orange_buoy": RED_BUOY_CLASS, "orange_buoys": RED_BUOY_CLASS,
     "green_buoy": GREEN_BUOY_CLASS, "green_buoys": GREEN_BUOY_CLASS,
     "east_buoy": EAST_CARDINAL_CLASS, "east_buoys": EAST_CARDINAL_CLASS,
     "east_cardinal": EAST_CARDINAL_CLASS,
@@ -316,7 +317,7 @@ class Task1Maneuvering:
 
     # Arac home merkezli izinli alanin disina cikti mi kontrol eder.
     def _check_geofence(self):
-        """Home noktasından çok uzaklaşıldıysa FAILSAFE'e geç. True dönerse sınır içinde."""
+        """Home noktasından çok uzaklaşıldıysa FAILSAFE'e geç. True dönedrse sınır içinde."""
         if self.home_lat is None or self.current_lat is None:
             return True
 

@@ -36,8 +36,8 @@ def _controller_config(**overrides):
         "ram_speed": 0.75,
         "ram_duration_sec": 0.2,
         "required_impact_count": 3,
-        "post_impact_forward_speed": 0.85,
-        "post_impact_forward_duration_sec": 1.5,
+        "post_impact_forward_speed": 0.4,
+        "post_impact_forward_duration_sec": 5.0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -449,8 +449,8 @@ def test_impact_controller_owns_ram_and_post_impact_timing():
 
     forward_motion = controller.post_impact_decision(elapsed=0.2)
     assert forward_motion.action is ImpactAction.POST_IMPACT_MOTION
-    assert forward_motion.linear_x == pytest.approx(0.85)
+    assert forward_motion.linear_x == pytest.approx(0.4)
     assert forward_motion.angular_z == pytest.approx(0.0)
 
-    impact_return = controller.post_impact_decision(elapsed=1.5)
+    impact_return = controller.post_impact_decision(elapsed=5.0)
     assert impact_return.action is ImpactAction.RETURN_TO_IMPACT

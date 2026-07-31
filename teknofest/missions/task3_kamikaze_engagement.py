@@ -36,6 +36,7 @@ from teknofest.missions.utils.task3_targeting import (
     target_is_consistent,
 )
 from utils.mavlink_utilities import (
+    align_heading_to_gps_target,
     calculate_gps_distance,
     call_set_mode,
     call_trigger_service,
@@ -113,10 +114,11 @@ class Task3Config:
 
     # Derinlik kontrollü yanaşma
     approach_contact_window_size: int = 7
-    approach_contact_required: int = 5
+    approach_contact_required: int = 3
     approach_contact_spread_m: float = 0.15
     approach_progress_ratio: float = 0.10
     approach_min_progress_m: float = 0.20
+    ram_start_distance_m: float = 1.0
     approach_min_speed: float = 0.12
     approach_max_speed: float = 0.45
     approach_speed_kp: float = 0.12
@@ -126,8 +128,9 @@ class Task3Config:
     ram_duration_sec: float = 2.0
     impact_distance_growth_ratio: float = 0.50
     impact_distance_growth_margin_m: float = 0.20
-    post_impact_forward_speed: float = 0.85
-    post_impact_forward_duration_sec: float = 3.5
+    post_impact_forward_speed: float = 0.4
+    post_impact_forward_duration_sec: float = 5.0
+    impact_alignment_tolerance_deg: float = 8.0
     impact_return_tolerance_m: float = 1.0
     impact_return_timeout_sec: float = 20.0
 
@@ -174,6 +177,7 @@ class Task3Config:
                 "ram_duration_sec",
                 "post_impact_forward_speed",
                 "post_impact_forward_duration_sec",
+                "impact_alignment_tolerance_deg",
                 "impact_return_tolerance_m",
                 "impact_return_timeout_sec",
                 "mode_transition_timeout_sec",
@@ -182,6 +186,7 @@ class Task3Config:
                 "approach_contact_spread_m",
                 "approach_progress_ratio",
                 "approach_min_progress_m",
+                "ram_start_distance_m",
                 "approach_min_speed",
                 "approach_max_speed",
                 "approach_speed_kp",
@@ -225,6 +230,7 @@ class MissionState(Enum):
     APPROACH = auto()
     RAM = auto()
     POST_IMPACT_ADVANCE = auto()
+    ALIGN_TO_IMPACT = auto()
     RETURN_TO_IMPACT = auto()
     FINISHED = auto()
     FAILSAFE = auto()
@@ -237,6 +243,7 @@ class Task3KamikazeEngagement:
         MissionState.APPROACH,
         MissionState.RAM,
         MissionState.POST_IMPACT_ADVANCE,
+        MissionState.ALIGN_TO_IMPACT,
         MissionState.RETURN_TO_IMPACT,
     }
 
@@ -1049,6 +1056,7 @@ class Task3KamikazeEngagement:
             and distance_median
             <= self.approach_closest_distance
             + self.config.approach_contact_spread_m
+            and target["distance"] <= self.config.ram_start_distance_m
         )
         if contact_confirmed:
             self.ram_entry_distance = distance_median
@@ -1246,11 +1254,47 @@ class Task3KamikazeEngagement:
             departure_distance > self.config.impact_return_tolerance_m
         )
         self._set_state(
-            MissionState.RETURN_TO_IMPACT,
+            MissionState.ALIGN_TO_IMPACT,
             now,
             decision.reason,
         )
-        self._publish_impact_return_target()
+
+        self._update_align_to_impact(now)
+
+    def _update_align_to_impact(self, now):
+        if self.impact_target_gps is None:
+            self._enter_failsafe(
+                "Task 3 kayıtlı çarpışma GPS'i yok.",
+                now=now,
+            )
+            return
+
+        aligned = align_heading_to_gps_target(
+            self.topics.cmd_vel_pub,
+            self.current_lat,
+            self.current_lon,
+            self.current_heading,
+            self.impact_target_gps["lat"],
+            self.impact_target_gps["lon"],
+            logger=self.logger,
+            target_name="Task 3 RAM GPS",
+            tolerance_deg=self.config.impact_alignment_tolerance_deg,
+        )
+        if not aligned:
+            return
+
+        self.search_controller.reset_for_entry(
+            self.current_heading,
+            self.current_lat,
+            self.current_lon,
+            now,
+        )
+        self._enter_search(
+            now,
+            "RAM GPS yönüne hizalandı; hedef görsel olarak "
+            "yeniden doğrulanıyor",
+            recenter=True,
+        )
 
     def _update_return_to_impact(self, now):
         if self.impact_target_gps is None:
@@ -1349,6 +1393,7 @@ class Task3KamikazeEngagement:
 
         vision_required = self.state not in {
             MissionState.POST_IMPACT_ADVANCE,
+            MissionState.ALIGN_TO_IMPACT,
             MissionState.RETURN_TO_IMPACT,
         }
         if vision_required and not vision_fresh:
@@ -1396,6 +1441,9 @@ class Task3KamikazeEngagement:
             return
         if self.state == MissionState.POST_IMPACT_ADVANCE:
             self._update_post_impact_advance(now)
+            return
+        if self.state == MissionState.ALIGN_TO_IMPACT:
+            self._update_align_to_impact(now)
             return
         if self.state == MissionState.RETURN_TO_IMPACT:
             self._update_return_to_impact(now)
