@@ -15,6 +15,7 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault("MAVLINK20", "1")
 
 import rclpy
+from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from pymavlink import mavutil
@@ -2019,29 +2020,31 @@ class OrangeCubeBridgeNode(Node):
             self._publish_error(f"Set position hatasi: {exc}")
 
     def _task2_velocity_callback(self, msg):
-        """Apply a metric North/East velocity target without changing WP_SPEED."""
+        """Apply Task 2's metric velocity command without changing WP_SPEED."""
         if not self._has_valid_link():
             self.get_logger().warn(
-                "MAVLink baglantisi yok. Metric velocity komutu yok sayiliyor.",
+                "MAVLink baglantisi yok. Task 2 velocity komutu yok sayiliyor.",
                 throttle_duration_sec=2.0,
             )
             return
 
-        if not self._vehicle_ready_for_guided_motion(TASK2_VELOCITY_TOPIC):
+        if not self._vehicle_ready_for_guided_motion(
+            TASK2_VELOCITY_TOPIC
+        ):
             return
 
         north_m_s = float(msg.linear.x)
         east_m_s = float(msg.linear.y)
         if not math.isfinite(north_m_s) or not math.isfinite(east_m_s):
             self._publish_error(
-                "Metric velocity hedefi sonlu olmayan deger iceriyor."
+                "Task 2 velocity hedefi sonlu olmayan deger iceriyor."
             )
             return
 
         speed_m_s = math.hypot(north_m_s, east_m_s)
         if speed_m_s > TASK2_MAX_VELOCITY_M_S:
             self._publish_error(
-                "Metric velocity hedefi guvenlik sinirini asti: "
+                "Task 2 velocity hedefi guvenlik sinirini asti: "
                 f"{speed_m_s:.3f}m/s > {TASK2_MAX_VELOCITY_M_S:.3f}m/s"
             )
             return
@@ -2061,13 +2064,13 @@ class OrangeCubeBridgeNode(Node):
                     + 360.0
                 ) % 360.0
             self.get_logger().info(
-                "MAVLink TX metric velocity target: "
+                "MAVLink TX Task 2 velocity target: "
                 f"north={north_m_s:.3f}m/s, east={east_m_s:.3f}m/s, "
                 f"speed={speed_m_s:.3f}m/s",
                 throttle_duration_sec=1.0,
             )
         except Exception as exc:
-            self._publish_error(f"Metric velocity target hatasi: {exc}")
+            self._publish_error(f"Task 2 velocity target hatasi: {exc}")
 
     def _cmd_vel_callback(self, msg):
         if not self._has_valid_link():

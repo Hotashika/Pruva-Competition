@@ -185,7 +185,7 @@ class DetectorRegistryTests(unittest.TestCase):
 class CompetitionProfileContractTests(unittest.TestCase):
     def test_profiles_define_deterministic_startup_detectors(self):
         self.assertEqual(
-            ("buoy", "usv_3d", "ar_tag"),
+            ("buoy", "task2_fusion", "ar_tag"),
             assigned_literal(
                 "njord/config/vision_profile.py",
                 "STARTUP_DETECTORS",

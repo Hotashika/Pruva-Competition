@@ -28,10 +28,7 @@ DISTANCE_HYSTERESIS_TASKS = {
     "teknofest_task2",
 }
 
-GPS_TARGET_AVOIDANCE_TASKS = {
-    "njord_task2",
-    "teknofest_task2",
-}
+GPS_TARGET_AVOIDANCE_TASKS = set()
 
 FORBIDDEN_PARAMETER_NAMES = {
     "AVOID_ENTER_DISTANCE_M",
