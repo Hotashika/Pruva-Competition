@@ -223,13 +223,18 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         return detection
 
     @staticmethod
-    def _buoy(color, distance, angle):
-        return {
+    def _buoy(color, distance, angle, *, bbox=None, track_id=None):
+        detection = {
             "type": "buoy",
-            "class": f"{color}_buoys",
+            "class": f"{color}_buoy",
             "distance": distance,
             "Buoy angle: ": angle,
         }
+        if bbox is not None:
+            detection["bbox"] = bbox
+        if track_id is not None:
+            detection["track_id"] = track_id
+        return detection
 
     @staticmethod
     def _depth_obstacle(
@@ -381,6 +386,96 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertEqual("starboard", self.mission.avoidance_phase)
+
+    def test_closing_yellow_buoy_starts_fixed_port_velocity(self):
+        for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
+            self._refresh_sensors(now)
+            self.mission.update(
+                [self._buoy("yellow", distance, 0.0, track_id=21)],
+                now=now,
+                record_observation=True,
+            )
+
+        self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+        self.assertEqual("port", self.mission.avoidance_phase)
+        velocity = self.topics.task2_velocity_pub.messages[-1]
+        actual_bearing = math.degrees(math.atan2(
+            velocity.linear.y,
+            velocity.linear.x,
+        )) % 360.0
+        self.assertAlmostEqual(
+            360.0 - task2.AVOIDANCE_PORT_ANGLE_DEG,
+            actual_bearing,
+        )
+
+    def test_nearest_distinct_obstacle_has_priority_over_farther_buoy(self):
+        nearest = self.mission._nearest_vessel([
+            self._buoy("red", 4.0, 15.0),
+            self._depth_obstacle(2.0, -20.0),
+        ])
+
+        self.assertEqual("depth_obstacle", nearest["detector_type"])
+        self.assertAlmostEqual(2.0, nearest["distance"])
+
+    def test_buoy_semantics_override_matching_generic_depth_duplicate(self):
+        nearest = self.mission._nearest_vessel([
+            self._buoy(
+                "yellow",
+                3.2,
+                -4.0,
+                bbox=[100, 80, 180, 220],
+                track_id=21,
+            ),
+            {
+                **self._depth_obstacle(3.0, -3.0),
+                "bbox": [110, 100, 170, 215],
+            },
+        ])
+
+        self.assertEqual("buoy", nearest["detector_type"])
+        self.assertEqual("yellow_buoy", nearest["model_class"])
+        self.assertEqual(21, nearest["track_id"])
+
+    def test_yellow_avoidance_without_track_id_ignores_new_closer_red_buoy(self):
+        for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
+            self._refresh_sensors(now)
+            self.mission.update(
+                [self._buoy("yellow", distance, 0.0)],
+                now=now,
+            )
+
+        self._refresh_sensors(10.7)
+        self.mission.update(
+            [
+                self._buoy("red", 1.0, 20.0),
+                self._buoy("yellow", 3.8, 1.0),
+            ],
+            now=10.7,
+        )
+
+        self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+        self.assertEqual("port", self.mission.avoidance_phase)
+        self.assertIsNone(self.mission.avoiding_track_id)
+        self.assertEqual(
+            "yellow_buoy",
+            self.mission.active_obstacle_reference["model_class"],
+        )
+
+    def test_active_buoy_can_fallback_to_matching_depth_obstacle(self):
+        reference = self.mission._normalized_vessel(
+            self._buoy("yellow", 4.0, 0.0, track_id=21)
+        )
+        self.mission.avoiding_track_id = 21
+        self.mission.active_obstacle_reference = reference
+        self.mission.active_obstacle_bearing_deg = 0.0
+
+        matched = self.mission._matching_avoidance_vessel([
+            self._depth_obstacle(3.8, 2.0),
+            self._depth_obstacle(1.0, 80.0),
+        ])
+
+        self.assertEqual("depth_obstacle", matched["detector_type"])
+        self.assertAlmostEqual(3.8, matched["distance"])
 
     def test_current_buoy_model_classes_are_collision_targets(self):
         expected_classes = {

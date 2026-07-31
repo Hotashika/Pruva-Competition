@@ -20,7 +20,9 @@ from vision.task2_fusion_detector import Task2FusionDetector
 
 TASK_DETECTOR_MAP = {
     "task1": {"buoy"},
-    "task2": {"task2_fusion"},
+    # Run the buoy model first so Task 2 can preserve red/yellow semantics
+    # before considering unmatched metric-depth clusters as generic obstacles.
+    "task2": ("buoy", "task2_fusion"),
     "task3": {"ar_tag"},
     "task4": {"buoy"},
 }
