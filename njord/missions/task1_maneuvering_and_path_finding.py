@@ -10,6 +10,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import rclpy
+from geometry_msgs.msg import Twist
 from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -33,6 +34,7 @@ from utils.read_waypoints import parse_qgc_waypoints
 
 WAYPOINT_PATH = WAYPOINT_DIRECTORY / "njord_task1.waypoints"
 ACTIVE_TASK_NAME = "task1"
+AVOIDANCE_VELOCITY_TOPIC = "/cube/task2_velocity"
 
 # ============================================================
 # GÜVENLİK PARAMETRELERİ
@@ -58,21 +60,23 @@ EARTH_RADIUS_M = 6378137.0
 # Engel bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
 AVOIDANCE_START_DISTANCE_M = 3.0
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
-AVOIDANCE_PASS_CLEARANCE_M = 2.5
-AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M = 0.25
-AVOIDANCE_WAYPOINT_TOLERANCE_M = 0.5
-AVOIDANCE_TIMEOUT_SEC = 20.0
-AVOIDANCE_EXIT_FORWARD_DISTANCE_M = 3.0
+AVOIDANCE_TURN_ANGLE_DEG = 45.0
+AVOIDANCE_TURN_DURATION_SEC = 4.0
+AVOIDANCE_FORWARD_MIN_DURATION_SEC = 3.0
+AVOIDANCE_CLEAR_CONFIRM_SEC = 1.0
+AVOIDANCE_TIMEOUT_SEC = 40.0
 AVOIDANCE_BEHIND_MARGIN_M = 1.0
 AVOIDANCE_RETRIGGER_COOLDOWN_SEC = 6.0
 AVOIDANCE_RETRIGGER_RADIUS_M = 2.0
+AVOIDANCE_TARGET_SPEED_KNOTS = 2.0
+AVOIDANCE_TARGET_SPEED_M_S = AVOIDANCE_TARGET_SPEED_KNOTS * 0.514444
 
 # ============================================================
 # VISION / ENGEL EŞLEŞTİRME PARAMETRELERİ
 # ============================================================
-VISION_DETECTION_TIMEOUT_SEC = 1.0
-MIN_OBSTACLE_CONFIDENCE = 0.45
-OBSTACLE_CONFIRMATION_MAX_GAP_SEC = 0.75
+VISION_DETECTION_TIMEOUT_SEC = 12.0
+MIN_OBSTACLE_CONFIDENCE = 0.20
+OBSTACLE_CONFIRMATION_MAX_GAP_SEC = 1.50
 OBSTACLE_FILTER_ALPHA = 0.40
 OBSTACLE_MATCH_MAX_ANGLE_DELTA_DEG = 25.0
 OBSTACLE_MATCH_MAX_DISTANCE_DELTA_M = 2.0
@@ -162,7 +166,10 @@ class Task1Maneuvering:
         self.recently_avoided_obstacles = []
         self.avoidance_phase = None
         self.avoid_started_time = None
-        self.cardinal_pass_target = None  # Aktif samandira/cardinal GPS gecis hedefi
+        self.avoidance_phase_started_time = None
+        self.avoidance_entry_heading = None
+        self.avoidance_clear_since = None
+        self.avoidance_marker_gps = None
         self.aligned_target_key = None
         self.waypoint_hold_until = None
         self.waypoint_hold_name = None
@@ -519,8 +526,14 @@ class Task1Maneuvering:
 
     def _confirmed_obstacle(self, obstacle, now):
         if obstacle is None:
-            self.pending_obstacle = None
-            self.pending_obstacle_count = 0
+            pending_time = getattr(self, "pending_obstacle_time", None)
+            if (
+                    pending_time is None
+                    or now - pending_time > OBSTACLE_CONFIRMATION_MAX_GAP_SEC
+            ):
+                self.pending_obstacle = None
+                self.pending_obstacle_time = None
+                self.pending_obstacle_count = 0
             return None
         previous = getattr(self, "pending_obstacle", None)
         pending_time = getattr(self, "pending_obstacle_time", None)
@@ -589,180 +602,6 @@ class Task1Maneuvering:
         obstacle_east = distance_m * math.sin(obstacle_bearing_rad)
         return obstacle_north, obstacle_east
 
-    def _create_cardinal_pass_target(self, obstacle):
-        """Cardinal marker'in istenen coğrafi tarafinda geçici bir GPS hedefi üretir."""
-        pass_side = CARDINAL_PASS_SIDES.get(obstacle.get("class"))
-        obstacle_offset = self._obstacle_offset_from_detection(obstacle)
-        if pass_side is None or obstacle_offset is None:
-            return None
-
-        obstacle_north, obstacle_east = obstacle_offset
-        marker_gps = self._offset_gps(
-            self.current_lat,
-            self.current_lon,
-            north_m=obstacle_north,
-            east_m=obstacle_east,
-        )
-        pass_east_offset = (
-            AVOIDANCE_PASS_CLEARANCE_M
-            if pass_side == "east"
-            else -AVOIDANCE_PASS_CLEARANCE_M
-        )
-        target_gps = self._offset_gps(
-            marker_gps["lat"],
-            marker_gps["lon"],
-            north_m=0.0,
-            east_m=pass_east_offset,
-        )
-        target_gps.update({
-            "side": pass_side,
-            "pass_type": "cardinal",
-            "phase": "pass",
-            "reference_heading": float(self.current_heading),
-            "marker_lat": marker_gps["lat"],
-            "marker_lon": marker_gps["lon"],
-        })
-        return target_gps
-
-    def _create_buoy_pass_target(self, obstacle, reference_heading=None):
-        """Kirmizi/yesil samandiranin uygun tarafinda gecici GPS hedefi uretir."""
-        pass_side = BUOY_PASS_SIDES.get(obstacle.get("class"))
-        obstacle_offset = self._obstacle_offset_from_detection(obstacle)
-        if pass_side is None or obstacle_offset is None:
-            return None
-
-        obstacle_north, obstacle_east = obstacle_offset
-        marker_gps = self._offset_gps(
-            self.current_lat,
-            self.current_lon,
-            north_m=obstacle_north,
-            east_m=obstacle_east,
-        )
-
-        # Gecis tarafi ilk tespit anindaki heading'e sabitlenir. Vision hedefi
-        # yenilerken aracin donusu hedefi samandiranin etrafinda dondurmez.
-        if reference_heading is None:
-            reference_heading = float(self.current_heading)
-        lateral_bearing = (
-            float(reference_heading) + (90.0 if pass_side == "starboard" else -90.0)
-        ) % 360.0
-        lateral_bearing_rad = math.radians(lateral_bearing)
-        target_gps = self._offset_gps(
-            marker_gps["lat"],
-            marker_gps["lon"],
-            north_m=AVOIDANCE_PASS_CLEARANCE_M * math.cos(lateral_bearing_rad),
-            east_m=AVOIDANCE_PASS_CLEARANCE_M * math.sin(lateral_bearing_rad),
-        )
-        target_gps.update({
-            "side": pass_side,
-            "pass_type": "buoy",
-            "phase": "pass",
-            "reference_heading": float(reference_heading),
-            "marker_lat": marker_gps["lat"],
-            "marker_lon": marker_gps["lon"],
-        })
-        return target_gps
-
-    def _create_obstacle_pass_target(self, obstacle):
-        """Desteklenen samandira veya cardinal icin GPS gecis hedefi uretir."""
-        if obstacle.get("class") in CARDINAL_PASS_SIDES:
-            return self._create_cardinal_pass_target(obstacle)
-        return self._create_buoy_pass_target(obstacle)
-
-    def _create_exit_target(self, target):
-        heading = math.radians(float(target["reference_heading"]))
-        coordinates = self._offset_gps(
-            target["lat"], target["lon"],
-            AVOIDANCE_EXIT_FORWARD_DISTANCE_M * math.cos(heading),
-            AVOIDANCE_EXIT_FORWARD_DISTANCE_M * math.sin(heading),
-        )
-        result = dict(target)
-        result.update(coordinates)
-        result["phase"] = "exit"
-        return result
-
-    def _obstacle_is_behind(self, target):
-        north = math.radians(self.current_lat - target["marker_lat"]) * EARTH_RADIUS_M
-        east = math.radians(self.current_lon - target["marker_lon"]) * EARTH_RADIUS_M
-        heading = math.radians(float(target["reference_heading"]))
-        return north * math.cos(heading) + east * math.sin(heading) >= AVOIDANCE_BEHIND_MARGIN_M
-
-    def _extend_exit_target(self, target):
-        along_track_m = (
-            math.radians(self.current_lat - target["marker_lat"]) * EARTH_RADIUS_M
-            * math.cos(math.radians(float(target["reference_heading"])))
-            + math.radians(self.current_lon - target["marker_lon"])
-            * EARTH_RADIUS_M
-            * math.cos(math.radians(self.current_lat))
-            * math.sin(math.radians(float(target["reference_heading"])))
-        )
-        forward_m = max(
-            1.0,
-            AVOIDANCE_BEHIND_MARGIN_M - along_track_m + AVOIDANCE_WAYPOINT_TOLERANCE_M,
-        )
-        heading = math.radians(float(target["reference_heading"]))
-        coordinates = self._offset_gps(
-            self.current_lat,
-            self.current_lon,
-            north_m=forward_m * math.cos(heading),
-            east_m=forward_m * math.sin(heading),
-        )
-        extended = dict(target)
-        extended.update(coordinates)
-        return extended
-
-    @staticmethod
-    def _pass_clearance_m(target):
-        if target.get("pass_type") == "buoy":
-            return AVOIDANCE_PASS_CLEARANCE_M
-        return AVOIDANCE_PASS_CLEARANCE_M
-
-    @staticmethod
-    def _gps_target_shift_m(old_target, new_target):
-        """Iki yakin GPS hedefi arasindaki yaklasik metre farkini hesaplar."""
-        mean_lat = math.radians((old_target["lat"] + new_target["lat"]) / 2.0)
-        north_m = (
-            math.radians(new_target["lat"] - old_target["lat"])
-            * EARTH_RADIUS_M
-        )
-        east_m = (
-            math.radians(new_target["lon"] - old_target["lon"])
-            * EARTH_RADIUS_M
-            * math.cos(mean_lat)
-        )
-        return math.hypot(north_m, east_m)
-
-    def _refresh_buoy_pass_target(self, detections):
-        """Aktif samandira GPS hedefini her vision guncellemesinde kontrol eder."""
-        target = self.cardinal_pass_target
-        if (
-                target is None
-                or target.get("pass_type") != "buoy"
-                or target.get("phase", "pass") != "pass"
-        ):
-            return
-
-        obstacle = self._matching_avoidance_obstacle(detections)
-        if obstacle is None:
-            return
-
-        refreshed_target = self._create_buoy_pass_target(
-            obstacle,
-            reference_heading=target["reference_heading"],
-        )
-        if refreshed_target is None:
-            return
-
-        target_shift_m = self._gps_target_shift_m(target, refreshed_target)
-        if target_shift_m < AVOIDANCE_TARGET_REFRESH_MIN_SHIFT_M:
-            return
-
-        self.cardinal_pass_target = refreshed_target
-        self.logger.info(
-            f"Buoy GPS pass target refreshed by vision ({target_shift_m:.2f}m shift).",
-            throttle_duration_sec=0.5,
-        )
-
     def _matching_avoidance_obstacle(self, detections):
         """Aktif kaçınma sınıfından hâlâ yakın görünen objeyi döndürür."""
         if self.avoiding_class is None:
@@ -814,57 +653,174 @@ class Task1Maneuvering:
         self.active_obstacle_reference = None
         self.avoidance_phase = None
         self.avoid_started_time = None
-        self.cardinal_pass_target = None
+        self.avoidance_phase_started_time = None
+        self.avoidance_entry_heading = None
+        self.avoidance_clear_since = None
+        self.avoidance_marker_gps = None
         self.aligned_target_key = None
         self.state = MissionState.NAVIGATING
 
-    def _update_cardinal_pass(self, now):
-        """Aktif samandira/cardinal hedefini mevcut GNSS position akisiyla takip eder."""
-        target = self.cardinal_pass_target
-        if target is None:
-            return False
+    @staticmethod
+    def _angular_distance_deg(first, second):
+        return abs((float(first) - float(second) + 180.0) % 360.0 - 180.0)
 
-        elapsed = 0.0 if self.avoid_started_time is None else now - self.avoid_started_time
-        pass_type = target.get("pass_type", "cardinal")
-        if elapsed >= AVOIDANCE_TIMEOUT_SEC:
+    def _avoidance_turn_side(self, obstacle):
+        """Mevcut renk/cardinal geçiş yönlerini süreli manevraya dönüştürür."""
+        obstacle_class = obstacle.get("class")
+        buoy_side = BUOY_PASS_SIDES.get(obstacle_class)
+        if buoy_side is not None:
+            return buoy_side
+
+        cardinal_side = CARDINAL_PASS_SIDES.get(obstacle_class)
+        if cardinal_side is None:
+            return None
+
+        desired_bearing = 90.0 if cardinal_side == "east" else 270.0
+        starboard_bearing = (
+            float(self.current_heading) + AVOIDANCE_TURN_ANGLE_DEG
+        ) % 360.0
+        port_bearing = (
+            float(self.current_heading) - AVOIDANCE_TURN_ANGLE_DEG
+        ) % 360.0
+        starboard_error = self._angular_distance_deg(
+            starboard_bearing,
+            desired_bearing,
+        )
+        port_error = self._angular_distance_deg(port_bearing, desired_bearing)
+        if starboard_error == port_error:
+            return "starboard" if cardinal_side == "east" else "port"
+        return "starboard" if starboard_error < port_error else "port"
+
+    def _publish_avoidance_velocity(self):
+        """Task 2 ile aynı global hız tabanlı süreli kaçınma komutunu yayınlar."""
+        if self.avoidance_entry_heading is None:
             self._enter_failsafe(
-                f"{target['side'].upper()} {pass_type.upper()} PASS TARGET TIMEOUT "
-                f"({elapsed:.1f}s)! FAILSAFE + HOLD.",
+                "Avoidance entry heading is unavailable. FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            return 0.0
+
+        target_bearing = float(self.avoidance_entry_heading)
+        if self.avoidance_phase == "starboard":
+            target_bearing += AVOIDANCE_TURN_ANGLE_DEG
+        elif self.avoidance_phase == "port":
+            target_bearing -= AVOIDANCE_TURN_ANGLE_DEG
+        target_bearing %= 360.0
+
+        bearing_rad = math.radians(target_bearing)
+        message = Twist()
+        message.linear.x = AVOIDANCE_TARGET_SPEED_M_S * math.cos(bearing_rad)
+        message.linear.y = AVOIDANCE_TARGET_SPEED_M_S * math.sin(bearing_rad)
+        message.linear.z = 0.0
+        message.angular.z = 0.0
+        self.topics.avoidance_velocity_pub.publish(message)
+        self.logger.info(
+            "Task 1 timed avoidance: "
+            f"phase={self.avoidance_phase}, bearing={target_bearing:.1f}deg, "
+            f"speed={AVOIDANCE_TARGET_SPEED_M_S:.3f}m/s",
+            throttle_duration_sec=1.0,
+        )
+        return AVOIDANCE_TARGET_SPEED_M_S
+
+    def _obstacle_is_behind(self, obstacle):
+        if obstacle is None:
+            return False
+        distance_m = self._safe_float(obstacle.get("distance"))
+        angle_deg = self._detection_angle_deg(obstacle)
+        if distance_m is None or angle_deg is None:
+            return False
+        forward_m = distance_m * math.cos(math.radians(angle_deg))
+        return forward_m <= -AVOIDANCE_BEHIND_MARGIN_M
+
+    def _remember_avoided_obstacle(self, now):
+        marker_gps = self.avoidance_marker_gps
+        recent = getattr(self, "recently_avoided_obstacles", [])
+        recent.append({
+            "class": self.avoiding_class,
+            "track_id": getattr(self, "avoiding_track_id", None),
+            "marker_lat": None if marker_gps is None else marker_gps["lat"],
+            "marker_lon": None if marker_gps is None else marker_gps["lon"],
+            "expires_at": now + AVOIDANCE_RETRIGGER_COOLDOWN_SEC,
+        })
+        self.recently_avoided_obstacles = recent
+
+    def _update_timed_avoidance(self, obstacle, now):
+        if (
+                self.avoid_started_time is None
+                or self.avoidance_phase_started_time is None
+                or self.avoidance_entry_heading is None
+        ):
+            self._enter_failsafe(
+                "Timed avoidance state is incomplete. FAILSAFE + HOLD.",
                 request_hold=True,
             )
             stop_vehicle(self.topics.cmd_vel_pub)
-            return True
+            return
 
-        target_name = f"{target['side'].upper()} {pass_type} {target.get('phase', 'pass')}"
-        if self._set_position_to_gps_target(
-                target["lat"],
-                target["lon"],
-                target_name,
-                AVOIDANCE_WAYPOINT_TOLERANCE_M,
-        ):
-            if target.get("phase", "pass") == "pass":
-                self.cardinal_pass_target = self._create_exit_target(target)
-                self.avoidance_phase = "exit"
-                self.aligned_target_key = None
-                return True
-            if not self._obstacle_is_behind(target):
-                self.cardinal_pass_target = self._extend_exit_target(target)
-                self.aligned_target_key = None
-                return True
-            recent = getattr(self, "recently_avoided_obstacles", [])
-            recent.append({
-                "class": self.avoiding_class,
-                "track_id": getattr(self, "avoiding_track_id", None),
-                "marker_lat": target["marker_lat"],
-                "marker_lon": target["marker_lon"],
-                "expires_at": now + AVOIDANCE_RETRIGGER_COOLDOWN_SEC,
-            })
-            self.recently_avoided_obstacles = recent
+        total_elapsed = now - self.avoid_started_time
+        if total_elapsed >= AVOIDANCE_TIMEOUT_SEC:
+            self._enter_failsafe(
+                f"Timed {self.avoidance_phase} avoidance exceeded "
+                f"{AVOIDANCE_TIMEOUT_SEC:.1f}s. FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            stop_vehicle(self.topics.cmd_vel_pub)
+            return
+
+        phase_elapsed = now - self.avoidance_phase_started_time
+        if self.avoidance_phase in {"starboard", "port"}:
+            completed_turn = self.avoidance_phase
+            if phase_elapsed < AVOIDANCE_TURN_DURATION_SEC:
+                self._publish_avoidance_velocity()
+                return
+
+            self.avoidance_phase = "forward"
+            self.avoidance_phase_started_time = now
+            self.avoidance_clear_since = now if obstacle is None else None
             self.logger.info(
-                f"{target_name} completed; resuming main GNSS route."
+                f"Timed {completed_turn} leg completed; continuing on the entry "
+                "heading until the obstacle clears."
+            )
+            self._publish_avoidance_velocity()
+            return
+
+        if self.avoidance_phase != "forward":
+            self._enter_failsafe(
+                f"Unknown timed avoidance phase: {self.avoidance_phase}",
+                request_hold=True,
+            )
+            stop_vehicle(self.topics.cmd_vel_pub)
+            return
+
+        obstacle_behind = self._obstacle_is_behind(obstacle)
+        if obstacle is None:
+            if self.avoidance_clear_since is None:
+                self.avoidance_clear_since = now
+        else:
+            self.avoidance_clear_since = None
+
+        detection_clear = (
+            self.avoidance_clear_since is not None
+            and now - self.avoidance_clear_since >= AVOIDANCE_CLEAR_CONFIRM_SEC
+        )
+        minimum_forward_complete = (
+            phase_elapsed >= AVOIDANCE_FORWARD_MIN_DURATION_SEC
+        )
+        if minimum_forward_complete and (obstacle_behind or detection_clear):
+            clear_reason = (
+                "obstacle is behind"
+                if obstacle_behind
+                else "obstacle absent for the clear-confirmation interval"
+            )
+            self._remember_avoided_obstacle(now)
+            self.logger.info(
+                f"Timed avoidance completed ({clear_reason}); resuming the "
+                "same mission waypoint."
             )
             self._reset_avoidance_state()
-        return True
+            return
+
+        self._publish_avoidance_velocity()
 
     def _begin_waypoint_hold(self, waypoint_name):
         """Ana GPS noktasinda araci durdurup heading gecisi icin sabitler."""
@@ -983,53 +939,52 @@ class Task1Maneuvering:
 
     def _update_active_avoidance(self, detections, now):
         """Aktif kaçınmayı günceller; bu tick tüketildiyse True döndürür."""
-        if self.cardinal_pass_target is None:
+        obstacle = self._matching_avoidance_obstacle(detections)
+        self._update_timed_avoidance(obstacle, now)
+        return True
+
+    def _start_avoidance(self, obstacle, now):
+        """Yeni bir engel için Task 2 tipi süreli kaçınmayı başlatır."""
+        obstacle = self._normalize_obstacle(obstacle)
+        angle_deg = (
+            None if obstacle is None else self._detection_angle_deg(obstacle)
+        )
+        if obstacle is None or angle_deg is None:
             self._enter_failsafe(
-                "AVOIDING state has no temporary GPS target. FAILSAFE + HOLD.",
+                "Invalid obstacle detection. FAILSAFE + HOLD.",
                 request_hold=True,
             )
             stop_vehicle(self.topics.cmd_vel_pub)
-            return True
-
-        self._refresh_buoy_pass_target(detections)
-        return self._update_cardinal_pass(now)
-
-    def _start_avoidance(self, obstacle, now):
-        """Yeni bir engel için mevcut kaçınma davranışını başlatır."""
-        obstacle = self._normalize_obstacle(obstacle)
-        if obstacle is None:
-            self._enter_failsafe("Invalid obstacle detection. FAILSAFE + HOLD.", request_hold=True)
             return
+
+        turn_side = self._avoidance_turn_side(obstacle)
+        if turn_side not in {"starboard", "port"}:
+            self._enter_failsafe(
+                f"Avoidance direction could not be selected for "
+                f"{obstacle['class']}. FAILSAFE + HOLD.",
+                request_hold=True,
+            )
+            stop_vehicle(self.topics.cmd_vel_pub)
+            return
+
         self.state = MissionState.AVOIDING
         self.avoiding_class = obstacle["class"]
         self.avoiding_track_id = obstacle.get("track_id")
         self.active_obstacle_reference = obstacle
-        self.avoidance_phase = "pass"
+        self.avoidance_phase = turn_side
         self.avoid_started_time = now
-        self.cardinal_pass_target = self._create_obstacle_pass_target(obstacle)
-
-        if self.cardinal_pass_target is None:
-            self._enter_failsafe(
-                f"Temporary GPS target could not be created for {obstacle['class']}. "
-                "FAILSAFE + HOLD.",
-                request_hold=True,
-            )
-            stop_vehicle(self.topics.cmd_vel_pub)
-            return
-
-        target = self.cardinal_pass_target
-        angle_deg = self._detection_angle_deg(obstacle)
-        side_reference = (
-            "Geographic" if target["pass_type"] == "cardinal"
-            else "Vehicle-relative"
-        )
-        self.logger.info(
+        self.avoidance_phase_started_time = now
+        self.avoidance_entry_heading = float(self.current_heading)
+        self.avoidance_clear_since = None
+        self.avoidance_marker_gps = self._estimated_marker_gps(obstacle)
+        self.aligned_target_key = None
+        self.logger.warn(
             f"{obstacle['class']} ({obstacle['distance']:.1f}m, "
-            f"angle={angle_deg:.1f} deg)! {side_reference} "
-            f"{target['side']} pass "
-            f"target created at ({target['lat']:.7f}, {target['lon']:.7f}), "
-            f"clearance={self._pass_clearance_m(target):.1f}m."
+            f"angle={angle_deg:.1f}deg): starting "
+            f"{AVOIDANCE_TURN_ANGLE_DEG:.0f}deg {turn_side} timed avoidance "
+            f"at {AVOIDANCE_TARGET_SPEED_KNOTS:.1f}kn."
         )
+        self._publish_avoidance_velocity()
 
     def update(self, detections):
         """Güvenlik, kaçınma ve waypoint akışlarının ana kontrol döngüsü."""
@@ -1046,7 +1001,7 @@ class Task1Maneuvering:
         )
 
         # ---------------------------------------------------------
-        # 1. ENGELLERDEN KAÇINMA KONTROLÜ (gecici GPS hedefi)
+        # 1. ENGELLERDEN KAÇINMA KONTROLÜ (süreli global hız manevrası)
         # ---------------------------------------------------------
         now = time.monotonic()
         nearest = self._nearest_relevant_obstacle(detections, now)
@@ -1104,6 +1059,13 @@ class Task1Node(Node):
     def __init__(self):
         super().__init__('task1_mission_node')
         self.get_logger().info("Task 1 (Maneuvering) Node Starting...")
+        self.get_logger().info(
+            "Task 1 timed avoidance: "
+            f"{AVOIDANCE_TURN_ANGLE_DEG:.0f}deg for "
+            f"{AVOIDANCE_TURN_DURATION_SEC:.1f}s at "
+            f"{AVOIDANCE_TARGET_SPEED_KNOTS:.1f}kn, then entry-heading forward "
+            f"for at least {AVOIDANCE_FORWARD_MIN_DURATION_SEC:.1f}s."
+        )
 
         # 1. Servis İstemcilerini (Clients) Oluştur ve Bekle
         self.mission_clients = create_mission_clients(self)
@@ -1115,6 +1077,11 @@ class Task1Node(Node):
             gps_callback=self.gps_callback,
             heading_callback=self.heading_callback,
             state_callback=self.state_callback
+        )
+        self.mission_topics.avoidance_velocity_pub = self.create_publisher(
+            Twist,
+            AVOIDANCE_VELOCITY_TOPIC,
+            10,
         )
 
         self.latest_detections = []
@@ -1161,8 +1128,10 @@ class Task1Node(Node):
         action = None
         reason = None
         if self.task.state == MissionState.AVOIDING:
-            side = "starboard" if self.task.avoid_turn_direction > 0 else "port"
-            action = f"Pass obstacle on {side}"
+            if self.task.avoidance_phase in {"starboard", "port"}:
+                action = f"Pass obstacle on {self.task.avoidance_phase}"
+            elif self.task.avoidance_phase == "forward":
+                action = "Continue forward until obstacle clears"
             obstacle = self.task.avoiding_class or "course marker"
             reason = f"{obstacle} detected on planned route"
         msg = String()
