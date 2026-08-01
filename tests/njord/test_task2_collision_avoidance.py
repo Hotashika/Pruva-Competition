@@ -289,6 +289,66 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertIsNone(node.kinematics_recorder)
         self.assertIsNotNone(node.task.kinematics_callback)
 
+    def test_completed_mission_disarms_before_manual_without_arming(self):
+        events = []
+
+        class CompletionNode:
+            mission_topics = types.SimpleNamespace(cmd_vel_pub=object())
+            mission_clients = types.SimpleNamespace(
+                disarm_client=object(),
+                set_mode_client=object(),
+            )
+
+            def get_logger(self):
+                return FakeLogger()
+
+            def wait_for_vehicle_state(self, **expected):
+                events.append(("wait", expected))
+                return True
+
+        original_stop_vehicle = task2.stop_vehicle
+        original_call_trigger_service = task2.call_trigger_service
+        original_call_set_mode = task2.call_set_mode
+        self.addCleanup(setattr, task2, "stop_vehicle", original_stop_vehicle)
+        self.addCleanup(
+            setattr,
+            task2,
+            "call_trigger_service",
+            original_call_trigger_service,
+        )
+        self.addCleanup(setattr, task2, "call_set_mode", original_call_set_mode)
+
+        task2.stop_vehicle = lambda publisher: events.append(("stop", publisher))
+        task2.call_trigger_service = (
+            lambda node, client, name: events.append(("trigger", name)) or True
+        )
+        task2.call_set_mode = (
+            lambda node, client, mode: events.append(("mode", mode)) or True
+        )
+
+        completed = task2.finalize_completed_mission(CompletionNode())
+
+        self.assertTrue(completed)
+        self.assertEqual("stop", events[0][0])
+        self.assertEqual(("trigger", "DISARM"), events[1])
+        self.assertEqual(
+            ("wait", {"expected_armed": False, "timeout_sec": 6.0}),
+            events[2],
+        )
+        self.assertEqual(("mode", "MANUAL"), events[3])
+        self.assertEqual(
+            (
+                "wait",
+                {
+                    "expected_mode": "MANUAL",
+                    "expected_armed": False,
+                    "timeout_sec": 6.0,
+                },
+            ),
+            events[4],
+        )
+        self.assertFalse(any(event[1:] == ("ARM",) for event in events))
+
     def test_builds_manual_recorder_kinematics_payload(self):
         observation = task2.VesselObservation(
             timestamp=10.0,
@@ -338,10 +398,32 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
         self.assertIsNone(self.mission.avoidance_phase)
 
+    def test_collision_target_is_monitored_only_within_eight_metres(self):
+        at_limit = self.mission._nearest_vessel([
+            self._buoy("red", 8.0, 0.0),
+        ])
+        beyond_limit = self.mission._nearest_vessel([
+            self._buoy("red", 8.01, 0.0),
+        ])
+
+        self.assertIsNotNone(at_limit)
+        self.assertIsNone(beyond_limit)
+
+    def test_closing_target_waits_until_three_metres_before_avoidance(self):
+        self._update(5.0, 0.0, 10.0)
+        self._update(4.0, 0.0, 10.3)
+        self._update(3.01, 0.0, 10.6)
+
+        self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
+
+        self._update(3.0, 0.0, 10.9)
+
+        self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
+
     def test_head_on_collision_risk_starts_fixed_starboard_velocity(self):
-        self._update(6.0, 0.0, 10.0)
-        self._update(5.0, 0.0, 10.3)
-        self._update(4.0, 0.0, 10.6)
+        self._update(5.0, 0.0, 10.0)
+        self._update(4.0, 0.0, 10.3)
+        self._update(3.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertEqual("starboard", self.mission.avoidance_phase)
@@ -376,7 +458,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
                 self.assertAlmostEqual(expected_bearing, actual_bearing)
 
     def test_closing_buoy_is_used_as_collision_target(self):
-        for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
+        for distance, now in ((5.0, 10.0), (4.0, 10.3), (3.0, 10.6)):
             self._refresh_sensors(now)
             self.mission.update(
                 [self._buoy("red", distance, 0.0)],
@@ -387,11 +469,11 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertEqual("starboard", self.mission.avoidance_phase)
 
-    def test_closing_yellow_buoy_starts_fixed_port_velocity(self):
-        for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
+    def test_closing_green_buoy_starts_fixed_port_velocity(self):
+        for distance, now in ((5.0, 10.0), (4.0, 10.3), (3.0, 10.6)):
             self._refresh_sensors(now)
             self.mission.update(
-                [self._buoy("yellow", distance, 0.0, track_id=21)],
+                [self._buoy("green", distance, 0.0, track_id=21)],
                 now=now,
                 record_observation=True,
             )
@@ -420,8 +502,8 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
     def test_buoy_semantics_override_matching_generic_depth_duplicate(self):
         nearest = self.mission._nearest_vessel([
             self._buoy(
-                "yellow",
-                3.2,
+                "green",
+                2.9,
                 -4.0,
                 bbox=[100, 80, 180, 220],
                 track_id=21,
@@ -433,14 +515,14 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         ])
 
         self.assertEqual("buoy", nearest["detector_type"])
-        self.assertEqual("yellow_buoy", nearest["model_class"])
+        self.assertEqual("green_buoy", nearest["model_class"])
         self.assertEqual(21, nearest["track_id"])
 
-    def test_yellow_avoidance_without_track_id_ignores_new_closer_red_buoy(self):
-        for distance, now in ((6.0, 10.0), (5.0, 10.3), (4.0, 10.6)):
+    def test_green_avoidance_without_track_id_ignores_new_closer_red_buoy(self):
+        for distance, now in ((5.0, 10.0), (4.0, 10.3), (3.0, 10.6)):
             self._refresh_sensors(now)
             self.mission.update(
-                [self._buoy("yellow", distance, 0.0)],
+                [self._buoy("green", distance, 0.0)],
                 now=now,
             )
 
@@ -448,7 +530,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.mission.update(
             [
                 self._buoy("red", 1.0, 20.0),
-                self._buoy("yellow", 3.8, 1.0),
+                self._buoy("green", 2.8, 1.0),
             ],
             now=10.7,
         )
@@ -457,39 +539,41 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertEqual("port", self.mission.avoidance_phase)
         self.assertIsNone(self.mission.avoiding_track_id)
         self.assertEqual(
-            "yellow_buoy",
+            "green_buoy",
             self.mission.active_obstacle_reference["model_class"],
         )
 
     def test_active_buoy_can_fallback_to_matching_depth_obstacle(self):
         reference = self.mission._normalized_vessel(
-            self._buoy("yellow", 4.0, 0.0, track_id=21)
+            self._buoy("green", 3.0, 0.0, track_id=21)
         )
         self.mission.avoiding_track_id = 21
         self.mission.active_obstacle_reference = reference
         self.mission.active_obstacle_bearing_deg = 0.0
 
         matched = self.mission._matching_avoidance_vessel([
-            self._depth_obstacle(3.8, 2.0),
+            self._depth_obstacle(2.8, 2.0),
             self._depth_obstacle(1.0, 80.0),
         ])
 
         self.assertEqual("depth_obstacle", matched["detector_type"])
-        self.assertAlmostEqual(3.8, matched["distance"])
+        self.assertAlmostEqual(2.8, matched["distance"])
 
-    def test_current_buoy_model_classes_are_collision_targets(self):
-        expected_classes = {
-            "red_buoy",
-            "green_buoy",
-            "black_buoy",
-            "orange_buoy",
-            "yellow_buoy",
-        }
+    def test_task2_red_and_green_buoys_are_collision_targets(self):
+        expected_classes = {"red_buoy", "green_buoy"}
 
         self.assertTrue(expected_classes.issubset(task2.BUOY_MODEL_TYPES))
         for model_class in expected_classes:
             with self.subTest(model_class=model_class):
                 self.assertTrue(
+                    self.mission._is_vessel(
+                        {"type": "buoy", "class": model_class}
+                    )
+                )
+
+        for model_class in ("black_buoy", "orange_buoy", "yellow_buoy"):
+            with self.subTest(ignored_model_class=model_class):
+                self.assertFalse(
                     self.mission._is_vessel(
                         {"type": "buoy", "class": model_class}
                     )
@@ -569,9 +653,9 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertAlmostEqual(-30.0, matched["angle"])
 
     def test_avoidance_does_not_create_or_publish_a_gps_target(self):
-        self._update(6.0, 0.0, 10.0)
-        self._update(5.0, 0.0, 10.3)
-        self._update(4.0, 0.0, 10.6)
+        self._update(5.0, 0.0, 10.0)
+        self._update(4.0, 0.0, 10.3)
+        self._update(3.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertEqual([], self.topics.position_target_pub.messages)
@@ -587,23 +671,23 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         )
 
     def test_port_side_risk_stands_on_then_uses_timed_starboard_leg(self):
-        self._update(5.0, -25.0, 10.0)
-        self._update(4.7, -25.0, 10.3)
-        self._update(4.4, -25.0, 10.6)
+        self._update(3.2, -25.0, 10.0)
+        self._update(3.1, -25.0, 10.3)
+        self._update(3.0, -25.0, 10.6)
 
         self.assertEqual(task2.MissionState.STAND_ON, self.mission.state)
         self.assertIsNone(self.mission.avoidance_phase)
 
-        self._update(4.4, -25.0, 13.2, record=False)
+        self._update(3.0, -25.0, 13.2, record=False)
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertEqual("starboard", self.mission.avoidance_phase)
         self.assertTrue(self.topics.task2_velocity_pub.messages)
         self.assertEqual([], self.topics.position_target_pub.messages)
 
     def test_avoidance_runs_starboard_then_forward_before_rejoining(self):
-        self._update(6.0, 0.0, 10.0)
-        self._update(5.0, 0.0, 10.3)
-        self._update(4.0, 0.0, 10.6)
+        self._update(5.0, 0.0, 10.0)
+        self._update(4.0, 0.0, 10.3)
+        self._update(3.0, 0.0, 10.6)
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertEqual("starboard", self.mission.avoidance_phase)
 
@@ -643,9 +727,9 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertEqual(0, self.mission.current_target_index)
 
     def test_forward_leg_extends_while_obstacle_remains_ahead(self):
-        self._update(6.0, 0.0, 10.0)
-        self._update(5.0, 0.0, 10.3)
-        self._update(4.0, 0.0, 10.6)
+        self._update(5.0, 0.0, 10.0)
+        self._update(4.0, 0.0, 10.3)
+        self._update(3.0, 0.0, 10.6)
         transition_time = 10.6 + task2.AVOIDANCE_STARBOARD_DURATION_SEC
 
         self._refresh_sensors(transition_time)
@@ -673,9 +757,9 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         self.assertEqual(task2.MissionState.NAVIGATING, self.mission.state)
 
     def test_timed_avoidance_timeout_enters_failsafe(self):
-        self._update(6.0, 0.0, 10.0)
-        self._update(5.0, 0.0, 10.3)
-        self._update(4.0, 0.0, 10.6)
+        self._update(5.0, 0.0, 10.0)
+        self._update(4.0, 0.0, 10.3)
+        self._update(3.0, 0.0, 10.6)
         timeout_time = 10.6 + task2.AVOIDANCE_TIMEOUT_SEC
 
         self._refresh_sensors(timeout_time)
@@ -726,9 +810,9 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
     def test_avoidance_uses_only_task2_velocity_topic(self):
         self.mission.aligned_target_key = ("WP0", 10.0, 20.0)
 
-        self._update(6.0, 0.0, 10.0)
-        self._update(5.0, 0.0, 10.3)
-        self._update(4.0, 0.0, 10.6)
+        self._update(5.0, 0.0, 10.0)
+        self._update(4.0, 0.0, 10.3)
+        self._update(3.0, 0.0, 10.6)
 
         self.assertEqual(task2.MissionState.AVOIDING, self.mission.state)
         self.assertIsNone(self.mission.aligned_target_key)
@@ -773,7 +857,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
         for index, now in enumerate((10.0, 10.5, 11.0)):
             elapsed = now - 10.0
             own_north_m = 0.4 * elapsed
-            target_north_m = 10.0 - 0.6 * elapsed
+            target_north_m = 8.0 - 0.6 * elapsed
             relative_distance_m = target_north_m - own_north_m
             latitude = base_latitude + math.degrees(
                 own_north_m / task2.EARTH_RADIUS_M
@@ -810,7 +894,7 @@ class Task2CollisionAvoidanceTests(unittest.TestCase):
             )
         )
         for index, (distance, now) in enumerate(
-            ((10.0, 10.0), (9.5, 10.5), (9.0, 11.0))
+            ((8.0, 10.0), (7.5, 10.5), (7.0, 11.0))
         ):
             self._refresh_sensors(now)
             self.mission.update(
