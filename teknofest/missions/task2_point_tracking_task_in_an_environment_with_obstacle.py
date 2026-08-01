@@ -2,7 +2,7 @@
 """
 TEKNOFEST Görev 2
 -----------------
-Waypoint takibi + sarı dubalardan açı/derinlik tabanlı dinamik kaçınma.
+Waypoint takibi + parkur dubalarından açı/derinlik tabanlı dinamik kaçınma.
 
 Beklenen kamera topic'i:
     /vision/detections   (std_msgs/String, JSON)
@@ -61,8 +61,10 @@ from utils.mavlink_utilities import (
 )
 from utils.read_waypoints import parse_qgc_waypoints
 from teknofest.missions.utils.yellow_buoy_course_keeper import (
+    YELLOW_BUOY_CLASS_NAMES,
     YellowBuoyCourseConfig,
     YellowBuoyCourseKeeper,
+    detection_class_name,
 )
 
 WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task2.waypoints"
@@ -73,9 +75,9 @@ WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task2.waypoints"
 DETECTION_TOPIC = "/vision/detections"
 VISION_DETECTION_TIMEOUT_SEC = 12.0
 
-# Görev 2 parkurundaki bütün engeller sarı dubadır. Mevcut buoy.pt modelinin
-# class adı dışında hiçbir tespit engel kaçınmasını tetiklemez.
-OBSTACLE_CLASS_NAMES = ("yellow_buoy",)
+# Test sahasında sarı, yeşil, kırmızı ve turuncu parkur dubalarının
+# tamamı aynı engelden kaçınma davranışını tetikler.
+OBSTACLE_CLASS_NAMES = YELLOW_BUOY_CLASS_NAMES
 MIN_OBSTACLE_CONFIDENCE = 0.45
 
 # ============================================================
@@ -578,7 +580,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             if obstacle["confidence"] < MIN_OBSTACLE_CONFIDENCE:
                 continue
 
-            if OBSTACLE_CLASS_NAMES and obstacle["class"] not in OBSTACLE_CLASS_NAMES:
+            if detection_class_name(obstacle) not in OBSTACLE_CLASS_NAMES:
                 continue
 
             distance = obstacle["distance"]
@@ -588,7 +590,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             if distance >= AVOIDANCE_EXIT_DISTANCE_M:
                 continue
 
-            # Yakın sarı dubanın açısı/yönü yoksa ilerlemek güvenli değildir.
+            # Yakın parkur dubasının açısı/yönü yoksa ilerlemek güvenli değildir.
             if obstacle["side"] is None or obstacle["angle"] is None:
                 self.obstacle_data_uncertain = True
                 continue
@@ -631,7 +633,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             obstacle = self._normalize_detection(raw)
             if (
                     obstacle is None
-                    or obstacle["class"] not in OBSTACLE_CLASS_NAMES
+                    or detection_class_name(obstacle) not in OBSTACLE_CLASS_NAMES
                     or obstacle["confidence"] < MIN_OBSTACLE_CONFIDENCE
             ):
                 continue
@@ -832,7 +834,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.logger.info(
             f"Engel kesintisiz {AVOIDANCE_CLEAR_DURATION_SEC:.1f}s temiz. "
             f"{completed_side} taraftan dinamik geçiş tamamlandı; "
-            "durmadan aynı ana waypoint ve sarı duba parkur takibine dönülüyor."
+            "durmadan aynı ana waypoint ve duba parkur takibine dönülüyor."
         )
 
     def _avoidance_timed_out(self, now=None):
@@ -862,7 +864,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             )
             self.last_angular_z = 0.0
             self.logger.warn(
-                "Aktif kaçınmada sarı duba verisi belirsiz; araç veri "
+                "Aktif kaçınmada parkur dubası verisi belirsiz; araç veri "
                 "düzelene kadar durduruldu.",
                 throttle_duration_sec=1.0,
             )
@@ -1083,7 +1085,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         if self.obstacle_data_uncertain:
             stop_vehicle(self.topics.cmd_vel_pub)
             self.logger.warn(
-                "Yakın sarı duba görüldü fakat mesafe/yön güvenilir değil; "
+                "Yakın parkur dubası görüldü fakat mesafe/yön güvenilir değil; "
                 "araç veri düzelene kadar bekletiliyor.",
                 throttle_duration_sec=1.0,
             )
@@ -1506,6 +1508,11 @@ def main(args=None):
                 node,
                 node.mission_clients.disarm_client,
                 "DISARM",
+            )
+            call_set_mode(
+                node,
+                node.mission_clients.set_mode_client,
+                "MANUAL",
             )
         except Exception:  # noqa: BLE001
             pass

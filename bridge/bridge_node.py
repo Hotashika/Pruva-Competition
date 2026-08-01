@@ -2090,8 +2090,18 @@ class OrangeCubeBridgeNode(Node):
         self.cmd_vel_ignored_reported = False
         self.last_position_target_time = 0.0
 
-        linear_x = max(-1.0, min(1.0, float(msg.linear.x)))
-        angular_z = max(-1.0, min(1.0, float(msg.angular.z)))
+        linear_x = float(msg.linear.x)
+        angular_z = float(msg.angular.z)
+        if not math.isfinite(linear_x) or not math.isfinite(angular_z):
+            self._neutralize_outputs()
+            self._publish_error(
+                "/cube/cmd_vel command contains a non-finite value; "
+                "outputs were neutralized."
+            )
+            return
+
+        linear_x = max(-1.0, min(1.0, linear_x))
+        angular_z = max(-1.0, min(1.0, angular_z))
 
         target_yaw_rad = (self.yaw if self.yaw is not None else 0.0) + angular_z
         self.last_target_q = self._yaw_to_mavlink_quaternion(target_yaw_rad)

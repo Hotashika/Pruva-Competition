@@ -1,8 +1,9 @@
-"""İkinci en yakın sarı dubaya yönelen dinamik parkur hedefi üretir.
+"""İkinci en yakın parkur dubasına yönelen dinamik hedef üretir.
 
-Modül ROS'a bağlı değildir. Her ``compute`` çağrısında geçerli sarı duba
-tespitlerini mesafeye göre yeniden sıralar, ikinci sıradaki dubanın kamera
-açısını araç heading'iyle birleştirir ve kısa bir GPS hedefi döndürür.
+Modül ROS'a bağlı değildir. Her ``compute`` çağrısında geçerli sarı,
+yeşil, kırmızı ve turuncu duba tespitlerini mesafeye göre yeniden sıralar,
+ikinci sıradaki dubanın kamera açısını araç heading'iyle birleştirir ve
+kısa bir GPS hedefi döndürür.
 """
 
 from __future__ import annotations
@@ -29,11 +30,36 @@ YELLOW_BUOY_CLASS_NAMES = frozenset(
     {
         "yellow",
         "yellow_buoy",
+        "yellow_buoys",
         "yellowbuoy",
         "yellow_marker",
         "sari",
         "sari_duba",
         "sari_samandira",
+        "green",
+        "green_buoy",
+        "green_buoys",
+        "greenbuoy",
+        "green_marker",
+        "yesil",
+        "yesil_duba",
+        "yesil_samandira",
+        "red",
+        "red_buoy",
+        "red_buoys",
+        "redbuoy",
+        "red_marker",
+        "kirmizi",
+        "kirmizi_duba",
+        "kirmizi_samandira",
+        "orange",
+        "orange_buoy",
+        "orange_buoys",
+        "orangebuoy",
+        "orange_marker",
+        "turuncu",
+        "turuncu_duba",
+        "turuncu_samandira",
     }
 )
 
@@ -50,7 +76,7 @@ def detection_class_name(detection) -> str:
 
 
 def is_yellow_buoy_detection(detection) -> bool:
-    """Tespit sarı parkur dubasıysa True döndürür."""
+    """Tespit desteklenen renklerden bir parkur dubasıysa True döndürür."""
     return detection_class_name(detection) in YELLOW_BUOY_CLASS_NAMES
 
 
@@ -128,7 +154,7 @@ class _YellowBuoy:
 
 
 class YellowBuoyCourseKeeper:
-    """Her iterasyonda ikinci en yakın sarı dubayı rota referansı yapar."""
+    """Her iterasyonda ikinci en yakın parkur dubasını rota referansı yapar."""
 
     def __init__(self, config: Optional[YellowBuoyCourseConfig] = None):
         self.config = config or YellowBuoyCourseConfig()
@@ -243,7 +269,7 @@ class YellowBuoyCourseKeeper:
             current_heading,
             now=None,
     ) -> YellowBuoyCourseDecision:
-        """İkinci en yakın geçerli sarı dubaya doğru kısa GPS hedefi üretir."""
+        """İkinci en yakın geçerli parkur dubasına doğru GPS hedefi üretir."""
         now = time.monotonic() if now is None else float(now)
         numeric_inputs = (current_lat, current_lon, current_heading)
         if any(_safe_float(value) is None for value in numeric_inputs):

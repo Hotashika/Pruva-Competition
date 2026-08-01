@@ -28,10 +28,29 @@ def keeper_without_smoothing():
     )
 
 
-def test_yellow_class_aliases_are_recognized():
-    assert is_yellow_buoy_detection({"class": "yellow_buoy"})
-    assert is_yellow_buoy_detection({"label": "Sarı Duba"})
-    assert not is_yellow_buoy_detection({"class": "orange_buoy"})
+@pytest.mark.parametrize(
+    "class_name",
+    [
+        "yellow_buoy",
+        "yellow_buoys",
+        "Sarı Duba",
+        "green_buoy",
+        "green_buoys",
+        "Yeşil Duba",
+        "red_buoy",
+        "red_buoys",
+        "Kırmızı Duba",
+        "orange_buoy",
+        "orange_buoys",
+        "Turuncu Duba",
+    ],
+)
+def test_supported_course_buoy_class_aliases_are_recognized(class_name):
+    assert is_yellow_buoy_detection({"class": class_name})
+
+
+def test_unrelated_class_is_not_recognized_as_course_buoy():
+    assert not is_yellow_buoy_detection({"class": "blue_boat"})
 
 
 def test_second_nearest_buoy_is_selected_after_distance_sorting():
@@ -54,6 +73,25 @@ def test_second_nearest_buoy_is_selected_after_distance_sorting():
     assert decision.relative_bearing_deg == pytest.approx(24.0)
     assert decision.target_lat > CURRENT_LAT
     assert decision.target_lon > CURRENT_LON
+
+
+def test_different_buoy_colors_share_the_same_course_selection():
+    decision = keeper_without_smoothing().compute(
+        [
+            yellow(3.0, -10.0, class_name="green_buoy"),
+            yellow(7.0, 24.0, class_name="red_buoy"),
+            yellow(11.0, -30.0, class_name="orange_buoy"),
+        ],
+        CURRENT_LAT,
+        CURRENT_LON,
+        0.0,
+        now=10.0,
+    )
+
+    assert decision.status == "live"
+    assert decision.candidate_count == 3
+    assert decision.selected_distance_m == pytest.approx(7.0)
+    assert decision.relative_bearing_deg == pytest.approx(24.0)
 
 
 def test_target_is_reselected_on_every_iteration():
@@ -91,7 +129,7 @@ def test_invalid_candidates_do_not_affect_second_nearest_selection():
             yellow(2.0, None),
             yellow(4.0, -12.0),
             yellow(8.0, 18.0),
-            yellow(3.0, 0.0, class_name="orange_buoy"),
+            yellow(3.0, 0.0, class_name="blue_boat"),
         ],
         CURRENT_LAT,
         CURRENT_LON,
