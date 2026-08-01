@@ -152,7 +152,7 @@ class Task3Config:
     docking_state_topic: str = "/njord/task3/docking_state"
     active_task_topic: str = "/mission/active_task"
     min_tag_confidence: float = 0.20
-    qr_detection_timeout_sec: float = 1.0
+    qr_detection_timeout_sec: float = 12.0
     allowed_payloads: Tuple[str, ...] = ("middle_berth_1", "middle_berth_2", "middle_parallel")
 
     # Görsel hizalama parametreleri

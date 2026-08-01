@@ -58,7 +58,7 @@ WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 # VISION PARAMETRELERİ
 # ============================================================
 DETECTION_TOPIC = "/vision/detections"
-VISION_DETECTION_TIMEOUT_SEC = 3.00
+VISION_DETECTION_TIMEOUT_SEC = 12.0
 
 
 class MissionState(Enum):

@@ -25,6 +25,8 @@ DETECTOR_SPECS = {
     },
 }
 
+STARTUP_DETECTORS = ("buoy",)
+
 QR_TOPIC = None
 QR_TASK = None
 AR_CONFIRMED_HZ_ENV = None

@@ -42,8 +42,15 @@ def test_competition_points_are_named_in_required_order(tmp_path):
 
 
 def test_default_competition_source_is_teknofest_waypoints():
-    assert GN_WAYPOINT_PATH.name == "teknofest.waypoints"
-    assert GN_WAYPOINT_PATH.parent.name == "teknofest"
+    expected_path = (
+        Path(__file__).resolve().parents[2]
+        / "waypoints"
+        / "teknofest"
+        / "teknofest.waypoints"
+    )
+
+    assert GN_WAYPOINT_PATH == expected_path
+    assert GN_WAYPOINT_PATH.is_file()
 
 
 def test_competition_routes_use_gn_boundaries():

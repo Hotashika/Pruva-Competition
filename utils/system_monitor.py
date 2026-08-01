@@ -38,6 +38,8 @@ class SystemMonitorNode(Node):
         self.battery_time = None
         self.active_task = None
         self.task_time = None
+        self.mission_state = None
+        self.mission_state_time = None
         self.mission_status = (
             "Waiting for Mission Manager"
             if subscribe_mission_status
@@ -51,6 +53,7 @@ class SystemMonitorNode(Node):
         self.create_subscription(Float32, "/cube/gps/heading", self._heading_callback, 10)
         self.create_subscription(BatteryState, "/cube/battery", self._battery_callback, 10)
         self.create_subscription(String, "/mission/active_task", self._task_callback, 10)
+        self.create_subscription(String, "/mission/state", self._mission_state_callback, 10)
         if subscribe_mission_status:
             self.create_subscription(
                 String, "/mission_manager/status", self._status_callback, 10
@@ -90,6 +93,13 @@ class SystemMonitorNode(Node):
     def _status_callback(self, message):
         self.mission_status = message.data.strip()
         self._event(self.mission_status)
+
+    def _mission_state_callback(self, message):
+        state = message.data.strip() or None
+        if state != self.mission_state:
+            self._event(f"Mission state: {state or 'None'}")
+        self.mission_state = state
+        self.mission_state_time = time.monotonic()
 
     def _error_callback(self, message):
         self.last_error = message.data.strip() or "Unknown error"
@@ -175,10 +185,15 @@ def _draw(screen, node, title):
 
     _safe_add(screen, 8, 1, "Active task")
     _safe_add(screen, 8, 18, node.active_task or "NONE", curses.A_BOLD)
-    _safe_add(screen, 9, 1, "Mission status")
-    _safe_add(screen, 9, 18, node.mission_status)
-    _safe_add(screen, 10, 1, "Last error")
-    _safe_add(screen, 10, 18, node.last_error, curses.color_pair(3) if node.last_error != "None" else 0)
+    mission_state_text = node.mission_state or "WAITING"
+    if node.mission_state is not None and not node._fresh(node.mission_state_time):
+        mission_state_text = f"{node.mission_state} (STALE)"
+    _safe_add(screen, 9, 1, "Mission state")
+    _safe_add(screen, 9, 18, mission_state_text, curses.A_BOLD)
+    _safe_add(screen, 10, 1, "Mission status")
+    _safe_add(screen, 10, 18, node.mission_status)
+    _safe_add(screen, 11, 1, "Last error")
+    _safe_add(screen, 11, 18, node.last_error, curses.color_pair(3) if node.last_error != "None" else 0)
 
     _safe_add(screen, 12, 0, separator)
     _safe_add(screen, 13, 1, "RECENT EVENTS", curses.A_BOLD)

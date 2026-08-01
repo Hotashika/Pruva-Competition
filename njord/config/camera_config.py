@@ -9,7 +9,7 @@ import pyzed.sl as sl
 # -----------------------------------------------------------------------------
 
 # Resolution
-CAMERA_RESOLUTION = sl.RESOLUTION.HD720
+CAMERA_RESOLUTION = sl.RESOLUTION.HD1080
 
 RESOLUTION_MAP = {
     sl.RESOLUTION.HD2K: (2208, 1242),
