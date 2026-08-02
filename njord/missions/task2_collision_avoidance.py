@@ -49,6 +49,7 @@ KINEMATICS_TOPIC = "/task2/kinematics"
 ACTIVE_TASK_NAME = "task2"
 TASK2_VELOCITY_TOPIC = "/cube/task2_velocity"
 HOLD_MODE_NAME = "HOLD"
+MANUAL_MODE_NAME = "MANUAL"
 
 # ============================================================
 # GÜVENLİK PARAMETRELERİ
@@ -71,7 +72,7 @@ EARTH_RADIUS_M = 6378137.0
 # ============================================================
 AVOIDANCE_STARBOARD_ANGLE_DEG = 45.0
 AVOIDANCE_PORT_ANGLE_DEG = 45.0
-AVOIDANCE_STARBOARD_DURATION_SEC = 4.0
+AVOIDANCE_STARBOARD_DURATION_SEC = 2.0
 AVOIDANCE_FORWARD_MIN_DURATION_SEC = 3.0
 AVOIDANCE_CLEAR_CONFIRM_SEC = 1.0
 AVOIDANCE_BEHIND_MARGIN_M = 1.0
@@ -92,8 +93,8 @@ TASK_TARGET_SPEED_M_S = TASK_TARGET_SPEED_KNOTS * 0.514444
 # ============================================================
 # Vessel monitoring and collision-risk thresholds. These are competition
 # defaults, not fixed COLREG distances, and should be tuned during water tests.
-MONITOR_DISTANCE_M = 12.0
-AVOIDANCE_START_DISTANCE_M = 4.5
+MONITOR_DISTANCE_M = 8.0
+AVOIDANCE_START_DISTANCE_M = 3.0
 EMERGENCY_DISTANCE_M = 2.5
 SAFE_DCPA_M = 2.5
 MAX_TCPA_SEC = 15.0
@@ -117,22 +118,14 @@ FUSED_OBSTACLE_TYPE = "fused_obstacle"
 SEGMENTATION_DEPTH_OBSTACLE_TYPE = "seg_depth_obstacle"
 DEPTH_OBSTACLE_CLASS = "surface_obstacle_candidate"
 BUOY_MODEL_TYPES = {
-    # Class names embedded in the current buoy.pt model.
+    # Task 2 course-marker classes.
     "red_buoy",
     "green_buoy",
-    "black_buoy",
-    "orange_buoy",
-    "yellow_buoy",
     # Legacy aliases kept for older datasets and recorded detections.
     "green_buoys",
     "red_buoys",
-    "yellow_buoys",
-    "north_buoys",
-    "east_buoys",
-    "south_buoys",
-    "west_buoys",
 }
-YELLOW_BUOY_TYPES = {"yellow_buoy", "yellow_buoys"}
+GREEN_BUOY_TYPES = {"green_buoy", "green_buoys"}
 COLLISION_TARGET_ANGLE_KEYS = (
     "Vessel angle: ",
     "Vessel angle",
@@ -790,7 +783,8 @@ class Task2CollisionAvoidance:
                 dcpa = math.hypot(cpa_forward, cpa_starboard)
 
         if (
-            tcpa is not None
+            latest.distance_m <= AVOIDANCE_START_DISTANCE_M
+            and tcpa is not None
             and dcpa is not None
             and 0.0 <= tcpa <= MAX_TCPA_SEC
             and dcpa <= SAFE_DCPA_M
@@ -1061,7 +1055,7 @@ class Task2CollisionAvoidance:
 
     @staticmethod
     def _avoidance_turn_side(vessel):
-        if vessel.get("model_class") in YELLOW_BUOY_TYPES:
+        if vessel.get("model_class") in GREEN_BUOY_TYPES:
             return "port"
         return "starboard"
 
@@ -1308,7 +1302,7 @@ class Task2Node(Node):
             f"({TASK_TARGET_SPEED_M_S:.3f}m/s). "
             f"Timed avoidance={AVOIDANCE_STARBOARD_ANGLE_DEG:.0f}deg "
             "starboard for red/generic targets or "
-            f"{AVOIDANCE_PORT_ANGLE_DEG:.0f}deg port for yellow buoys, for "
+            f"{AVOIDANCE_PORT_ANGLE_DEG:.0f}deg port for green buoys, for "
             f"{AVOIDANCE_STARBOARD_DURATION_SEC:.1f}s, then "
             f"forward for at least {AVOIDANCE_FORWARD_MIN_DURATION_SEC:.1f}s. "
             "Only the Task 2 metric-velocity topic is used; WP_SPEED is not "
@@ -1639,6 +1633,58 @@ class Task2Node(Node):
         super().destroy_node()
 
 
+def finalize_completed_mission(node):
+    """Stop, disarm, then leave the completed vehicle disarmed in MANUAL."""
+    node.get_logger().info("Task 2 finished. Stopping vehicle.")
+    stop_vehicle(node.mission_topics.cmd_vel_pub)
+
+    node.get_logger().info("Disarming vehicle...")
+    if call_trigger_service(
+        node,
+        node.mission_clients.disarm_client,
+        "DISARM",
+    ) is False:
+        node.get_logger().error(
+            "Task 2 completion DISARM failed; MANUAL mode was not requested."
+        )
+        return False
+
+    if not node.wait_for_vehicle_state(
+        expected_armed=False,
+        timeout_sec=6.0,
+    ):
+        node.get_logger().error(
+            "Task 2 completion DISARM was not confirmed; MANUAL mode was not "
+            "requested."
+        )
+        return False
+
+    node.get_logger().info("Vehicle is disarmed. Switching to MANUAL mode...")
+    if call_set_mode(
+        node,
+        node.mission_clients.set_mode_client,
+        MANUAL_MODE_NAME,
+    ) is False:
+        node.get_logger().error(
+            "Task 2 completion MANUAL mode request failed; vehicle remains "
+            "disarmed."
+        )
+        return False
+
+    if not node.wait_for_vehicle_state(
+        expected_mode=MANUAL_MODE_NAME,
+        expected_armed=False,
+        timeout_sec=6.0,
+    ):
+        node.get_logger().error(
+            "MANUAL/disarmed state was not confirmed after Task 2 completion."
+        )
+        return False
+
+    node.get_logger().info("Task 2 complete: vehicle is disarmed in MANUAL mode.")
+    return True
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = Task2Node()
@@ -1728,10 +1774,7 @@ def main(args=None):
                 )
             return
 
-        node.get_logger().info("Task 2 finished. Stopping vehicle.")
-        stop_vehicle(node.mission_topics.cmd_vel_pub)
-        node.get_logger().info("Disarming vehicle...")
-        call_trigger_service(node, node.mission_clients.disarm_client, "DISARM")
+        finalize_completed_mission(node)
     except KeyboardInterrupt:
         node.get_logger().info("Task 2 interrupted manually.")
         node.mission_active = False
