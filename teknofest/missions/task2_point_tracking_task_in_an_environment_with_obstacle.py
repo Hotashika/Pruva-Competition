@@ -113,18 +113,18 @@ BUOY_TARGET_MEMORY_SEC = 1.0
 # KAÇINMA PARAMETRELERİ
 # ============================================================
 # Sarı duba bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
-AVOIDANCE_START_DISTANCE_M = 3.0
+AVOIDANCE_START_DISTANCE_M = 4.0
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
-AVOIDANCE_TURN_ANGLE_DEG = 30.0
-AVOIDANCE_TURN_DURATION_SEC = 2.0
-AVOIDANCE_FORWARD_MIN_DURATION_SEC = 1.5
+AVOIDANCE_TURN_ANGLE_DEG = 45.0
+AVOIDANCE_TURN_DURATION_SEC = 4.0
+AVOIDANCE_FORWARD_MIN_DURATION_SEC = 3.0
 AVOIDANCE_CLEAR_CONFIRM_SEC = 1.0
 AVOIDANCE_TIMEOUT_SEC = 40.0
 AVOIDANCE_BEHIND_MARGIN_M = 1.0
 # Hız profili eski TEKNOFEST dinamik kaçınma davranışından korunur.
 AVOIDANCE_PASS_CLEARANCE_M = 3.0
-# Bu mesafenin altında da manevra minimum hızla devam eder.
-AVOIDANCE_MIN_SPEED_DISTANCE_M = 1.5
+# Selçuk dalındaki manevra profili: duba acil mesafedeyse ileri hızı kes.
+AVOIDANCE_EMERGENCY_DISTANCE_M = 1.5
 AVOIDANCE_MIN_LINEAR_SPEED = 0.2
 AVOIDANCE_MAX_LINEAR_SPEED = 0.6
 AVOIDANCE_MAX_ANGULAR_Z = 0.8
@@ -595,9 +595,8 @@ class Task2PointTrackingWithObstacleAvoidance:
                 continue
 
             distance = obstacle["distance"]
-            # Derinliği olmayan/geçersiz tespit manevrayı veya GPS seyrini
-            # durdurmaz; yalnızca engel adayı olarak kullanılmaz.
             if distance is None or distance <= 0.0:
+                self.obstacle_data_uncertain = True
                 continue
             if distance >= AVOIDANCE_EXIT_DISTANCE_M:
                 continue
@@ -709,6 +708,9 @@ class Task2PointTrackingWithObstacleAvoidance:
         angle_deg = self._safe_float(obstacle.get("angle"))
         if distance is None or distance <= 0.0 or angle_deg is None:
             return self.last_avoidance_speed_m_s
+        if distance <= AVOIDANCE_EMERGENCY_DISTANCE_M:
+            return 0.0
+
         angle_rad = math.radians(angle_deg)
         target_forward = distance * math.cos(angle_rad)
         target_starboard = distance * math.sin(angle_rad)
@@ -724,10 +726,10 @@ class Task2PointTrackingWithObstacleAvoidance:
         )
         distance_ratio = self._clamp(
             (
-                distance - AVOIDANCE_MIN_SPEED_DISTANCE_M
+                distance - AVOIDANCE_EMERGENCY_DISTANCE_M
             ) / (
                 AVOIDANCE_START_DISTANCE_M
-                - AVOIDANCE_MIN_SPEED_DISTANCE_M
+                - AVOIDANCE_EMERGENCY_DISTANCE_M
             ),
             0.0,
             1.0,
@@ -884,9 +886,8 @@ class Task2PointTrackingWithObstacleAvoidance:
             self._enter_failsafe("Kaçınma zaman aşımı; FAILSAFE + HOLD.")
             return True
 
-        # Yönü belirsiz yakın duba temiz görüş değildir: araç durur,
-        # clear sayacı sıfırlanır. Eksik derinlik ise adaydan elenir ve
-        # süreli manevra son geçerli hızla devam eder.
+        # Eksik derinlik/yön temiz görüş değildir: araç durur, clear
+        # sayacı sıfırlanır.
         self._nearest_relevant_obstacle(detections, now=now)
         if self.obstacle_data_uncertain:
             self.avoidance_clear_started_time = None
@@ -897,7 +898,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             )
             self.last_angular_z = 0.0
             self.logger.warn(
-                "Aktif kaçınmada sarı dubanın yönü belirsiz; araç veri "
+                "Aktif kaçınmada sarı duba verisi belirsiz; araç veri "
                 "düzelene kadar durduruldu.",
                 throttle_duration_sec=1.0,
             )
