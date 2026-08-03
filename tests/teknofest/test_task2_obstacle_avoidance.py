@@ -510,6 +510,50 @@ def test_short_detection_loss_holds_last_command_and_reacquisition_continues(
     assert len(mission.topics.avoidance_velocity_pub.messages) == 3
 
 
+def test_selcuk_manoeuvre_turns_then_moves_forward_and_resumes_route(
+        task2_module,
+):
+    mission = _mission(task2_module)
+    detection = _yellow(distance=2.5, side="left", angle=-10.0)
+    assert mission._start_avoidance(detection, now=0.0)
+    expected_speed = mission.last_avoidance_speed_m_s
+
+    assert mission._update_active_avoidance([], now=0.1)
+    assert mission.avoidance_phase == "right"
+    assert mission.avoidance_clear_started_time is None
+
+    assert mission._update_active_avoidance(
+        [_yellow(distance=2.2, side="left", angle=-6.0)],
+        now=3.9,
+    )
+    assert mission.avoidance_phase == "right"
+
+    assert mission._update_active_avoidance([], now=4.0)
+    assert mission.avoidance_phase == "forward"
+    forward = mission.topics.avoidance_velocity_pub.messages[-1]
+    assert forward.linear.x == pytest.approx(expected_speed)
+    assert forward.linear.y == pytest.approx(0.0, abs=1e-9)
+
+    assert mission._update_active_avoidance([], now=6.9)
+    assert mission.state is task2_module.MissionState.AVOIDING
+    assert not mission._update_active_avoidance([], now=7.0)
+    assert mission.state is task2_module.MissionState.NAVIGATING
+    assert mission.avoidance_phase is None
+
+
+def test_selcuk_forward_phase_finishes_when_obstacle_is_behind(task2_module):
+    mission = _mission(task2_module)
+    obstacle = _yellow(distance=2.5, side="left", angle=-10.0)
+    assert mission._start_avoidance(obstacle, now=0.0)
+    assert mission._update_active_avoidance([obstacle], now=4.0)
+
+    behind = _yellow(distance=1.5, side="left", angle=180.0)
+    mission.active_obstacle_reference = mission._normalize_detection(behind)
+
+    assert not mission._update_active_avoidance([behind], now=7.0)
+    assert mission.state is task2_module.MissionState.NAVIGATING
+
+
 def test_uncertain_depth_stops_active_manoeuvre(task2_module):
     mission = _mission(task2_module)
     velocity_commands = []
