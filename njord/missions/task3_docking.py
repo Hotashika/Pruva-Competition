@@ -15,65 +15,27 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import rclpy
-from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Float32, String
 
 from njord.core.mission_decision import DECISION_TOPIC, mission_decision_json
-try:
-    from utils.mavlink_utilities import (
-        call_set_mode,
-        call_trigger_service,
-        calculate_gps_distance,
-        create_mission_clients,
-        create_mission_topics,
-        publish_cmd_vel,
-        publish_set_position,
-        stop_vehicle,
-        wait_for_mission_services,
-    )
-except Exception:  # pragma: no cover - repo dışında statik inceleme için fallback
-    call_set_mode = None
-    call_trigger_service = None
-    create_mission_clients = None
-    create_mission_topics = None
-    wait_for_mission_services = None
-
-
-    def publish_cmd_vel(pub: Any, linear_x: float = 0.0, angular_z: float = 0.0) -> None:
-        msg = Twist()
-        msg.linear.x = float(linear_x)
-        msg.angular.z = float(angular_z)
-        pub.publish(msg)
-
-
-    def stop_vehicle(pub: Any) -> None:
-        publish_cmd_vel(pub, 0.0, 0.0)
-
-
-    def publish_set_position(pub: Any, lat: float, lon: float, altitude: float = 20.0) -> None:
-        msg = NavSatFix()
-        msg.latitude = float(lat)
-        msg.longitude = float(lon)
-        msg.altitude = float(altitude)
-        pub.publish(msg)
-
-
-    def calculate_gps_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        radius_m = 6378137.0
-        phi1 = math.radians(lat1)
-        phi2 = math.radians(lat2)
-        d_phi = math.radians(lat2 - lat1)
-        d_lam = math.radians(lon2 - lon1)
-        a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lam / 2) ** 2
-        return 2 * radius_m * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+from utils.mavlink_utilities import (
+    call_set_mode,
+    call_trigger_service,
+    calculate_gps_distance,
+    create_mission_clients,
+    create_mission_topics,
+    publish_cmd_vel,
+    publish_set_position,
+    stop_vehicle,
+    wait_for_mission_services,
+)
 
 
 ACTIVE_TASK_NAME = "task3"
 HOLD_MODE_NAME = "HOLD"
 MIN_VALID_ABS_COORD = 1e-6
-REAL_RUN_ACK_VALUE = "YES_I_ACCEPT_REAL_ROBOT_RISK"
 
 
 class DockingState(Enum):
@@ -82,6 +44,9 @@ class DockingState(Enum):
     SEARCH_DOCK = auto()
     ALIGN_TO_TAG = auto()
     FINAL_APPROACH = auto()
+    PARALLEL_TURN_FIRST = auto()
+    PARALLEL_SHIFT_FORWARD = auto()
+    PARALLEL_TURN_FINAL = auto()
     HOLD_POSITION = auto()
     REVERSE_EXIT = auto()
     GO_TO_EXIT_POINT = auto()
@@ -112,6 +77,8 @@ class ModeConfig:
 
     # Manevra parametreleri
     reverse_seconds: float = 3.0
+    reverse_after_hold: bool = True
+    stop_distance_m: float = 1.20
     stop_area_ratio: float = 0.060
     search_timeout_seconds: float = 20.0
     final_approach_timeout_seconds: float = 18.0
@@ -130,12 +97,8 @@ class ModeConfig:
 @dataclass
 class Task3Config:
     # Çalıştırma / araç yönetimi parametreleri
-    dry_run: bool = True
     auto_start: bool = True
-    arm_vehicle: bool = True
-    set_guided_mode: bool = True
     require_gps_for_visual_docking: bool = False
-    real_run_acknowledged: bool = False
 
     # Güvenlik parametreleri
     gps_timeout_sec: float = 2.0
@@ -166,6 +129,28 @@ class Task3Config:
     final_linear_speed: float = 0.5
     reverse_linear_speed: float = -0.14
 
+    # ZED derinlik duruşu. Mesafe alanı mevcut değilse geriye dönük
+    # uyumluluk için bbox alan eşiği kullanılır.
+    camera_to_bow_offset_m: float = 0.20
+    depth_stop_window_size: int = 5
+    depth_stop_required_count: int = 3
+    depth_stop_max_age_sec: float = 1.0
+
+    # Paralel park, test_paralel.py algoritmasındaki heading kontrollü
+    # 90 derece sol dönüşü uygular.
+    parallel_maneuver_enabled: bool = True
+    parallel_turn_direction: str = "left"
+    parallel_first_turn_deg: float = 90.0
+    parallel_total_turn_deg: float = 90.0
+    parallel_turn_tolerance_deg: float = 4.0
+    parallel_turn_kp: float = 0.015
+    parallel_turn_min_yaw: float = 0.10
+    parallel_turn_max_yaw: float = 0.20
+    parallel_turn_linear_speed: float = 0.0
+    parallel_turn_timeout_sec: float = 30.0
+    parallel_shift_speed: float = 0.0
+    parallel_shift_seconds: float = 0.0
+
     # Detection doğrulama parametreleri
     max_frame_age_ms: float = 500.0
     require_qr_confirmation: bool = True
@@ -190,19 +175,33 @@ def _coerce_float(value: Any) -> Optional[float]:
     return number
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
+def _task3_mode_from_environment() -> Optional[str]:
+    raw = os.getenv("TASK3_DOCKING_MODE") or os.getenv("TASK3_SEQUENCE")
+    normalized = str(raw or "").strip().lower()
+    aliases = {
+        "seri": "normal",
+        "serial": "normal",
+        "normal": "normal",
+        "paralel": "parallel",
+        "parallel": "parallel",
+    }
+    return aliases.get(normalized)
+
+
+def _payloads_from_environment(default: Tuple[str, ...]) -> Tuple[str, ...]:
+    raw = os.getenv("TASK3_ALLOWED_PAYLOADS", "").strip()
+    if not raw:
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    payloads = tuple(
+        payload
+        for payload in (normalize_payload(item) for item in raw.split(","))
+        if payload
+    )
+    return tuple(dict.fromkeys(payloads)) or default
 
 
 def create_default_config() -> Task3Config:
     cfg = Task3Config()
-    cfg.dry_run = _env_bool("TASK3_DRY_RUN", cfg.dry_run)
-    cfg.arm_vehicle = _env_bool("TASK3_ARM_VEHICLE", cfg.arm_vehicle)
-    cfg.set_guided_mode = _env_bool("TASK3_SET_GUIDED_MODE", cfg.set_guided_mode)
-    cfg.real_run_acknowledged = os.environ.get("TASK3_REAL_RUN_ACK") == REAL_RUN_ACK_VALUE
     cfg.modes = {
         "normal": ModeConfig(
             name="normal",
@@ -210,6 +209,7 @@ def create_default_config() -> Task3Config:
             berth_width_m=2.0,
             berth_length_m=2.0,
             reverse_seconds=3.0,
+            reverse_after_hold=True,
             stop_area_ratio=0.060,
             final_approach_timeout_seconds=18.0,
             target_payloads=("middle_berth_1", "middle_berth_2"),
@@ -220,11 +220,32 @@ def create_default_config() -> Task3Config:
             berth_width_m=2.0,
             berth_length_m=4.0,
             reverse_seconds=2.0,
+            reverse_after_hold=True,
             stop_area_ratio=0.045,
             final_approach_timeout_seconds=16.0,
             target_payloads=("middle_parallel",),
         ),
     }
+
+    selected_mode = _task3_mode_from_environment()
+    if selected_mode is not None:
+        cfg.sequence = (selected_mode,)
+        default_payloads = cfg.modes[selected_mode].target_payloads
+        cfg.allowed_payloads = _payloads_from_environment(default_payloads)
+        cfg.modes[selected_mode].target_payloads = tuple(
+            payload
+            for payload in cfg.allowed_payloads
+            if payload in default_payloads
+        ) or default_payloads
+
+        # Seri/paralel test başlatıcılarındaki ortak görev ayarları.
+        cfg.qr_detection_timeout_sec = 1.0
+        cfg.confirmation_required_count = 1
+        cfg.final_linear_speed = 0.70
+        cfg.modes[selected_mode].search_timeout_seconds = 120.0
+        cfg.modes[selected_mode].hold_seconds = 10.0
+        cfg.modes[selected_mode].reverse_after_hold = False
+        cfg.parallel_maneuver_enabled = selected_mode == "parallel"
     return cfg
 
 
@@ -258,6 +279,7 @@ class QrDetection:
     frame_width: float
     frame_height: float
     payload_valid: bool
+    distance_m: Optional[float] = None
 
     @property
     def area_ratio(self) -> float:
@@ -301,9 +323,10 @@ class Task3DockingMission:
         self.last_rejected_qr_payload: Optional[str] = None
         self.bridge_connected = False
         self.last_bridge_state_time: Optional[float] = None
-        self.last_cmd_log_time = 0.0
-        self.last_position_log_time = 0.0
         self._missing_config_logged: set[str] = set()
+        self.parallel_initial_heading: Optional[float] = None
+        self.parallel_first_target_heading: Optional[float] = None
+        self.parallel_final_target_heading: Optional[float] = None
 
     @property
     def current_mode(self) -> ModeConfig:
@@ -372,6 +395,11 @@ class Task3DockingMission:
 
             canonical = normalize_payload(item.get("canonical_payload") or item.get("payload"))
             payload_valid = canonical in self.config.allowed_payloads
+            distance_m = _coerce_float(
+                item.get("distance_m", item.get("distance"))
+            )
+            if distance_m is not None and distance_m <= 0.0:
+                distance_m = None
             candidates.append(
                 QrDetection(
                     timestamp=now,
@@ -384,6 +412,7 @@ class Task3DockingMission:
                     frame_width=float(frame_width),
                     frame_height=float(frame_height),
                     payload_valid=payload_valid,
+                    distance_m=distance_m,
                 )
             )
 
@@ -451,33 +480,12 @@ class Task3DockingMission:
     def _send_cmd(self, linear_x: float, angular_z: float, reason: str = "") -> None:
         linear_x = float(linear_x)
         angular_z = float(angular_z)
-        if self.config.dry_run:
-            now = time.monotonic()
-            if now - self.last_cmd_log_time > 1.0:
-                self.logger.info(
-                    f"[DRY-RUN] cmd_vel linear.x={linear_x:.3f}, angular.z={angular_z:.3f} {reason}"
-                )
-                self.last_cmd_log_time = now
-            return
         publish_cmd_vel(self.cmd_vel_pub, linear_x=linear_x, angular_z=angular_z)
 
     def stop(self, reason: str = "") -> None:
-        if self.config.dry_run:
-            self._send_cmd(0.0, 0.0, reason=reason or "stop")
-        else:
-            stop_vehicle(self.cmd_vel_pub)
+        stop_vehicle(self.cmd_vel_pub)
 
     def _send_position_target(self, lat: float, lon: float, target_name: str, distance_m: float) -> None:
-        if self.config.dry_run:
-            now = time.monotonic()
-            if now - self.last_position_log_time > 1.0:
-                self.logger.info(
-                    f"[DRY-RUN] set_position {target_name}: "
-                    f"lat={lat:.7f}, lon={lon:.7f}, distance={distance_m:.2f}m"
-                )
-                self.last_position_log_time = now
-            return
-
         publish_set_position(self.position_target_pub, lat, lon)
         self.logger.info(
             f"set_position {target_name}: lat={lat:.7f}, lon={lon:.7f}, distance={distance_m:.2f}m",
@@ -486,19 +494,18 @@ class Task3DockingMission:
 
     def _watchdog_ok(self) -> bool:
         now = time.monotonic()
-        if not self.config.dry_run:
-            if self.last_bridge_state_time is None:
-                self.logger.info("Waiting for bridge state...", throttle_duration_sec=2.0)
-                self.stop("waiting_bridge_state")
-                return False
-            if now - self.last_bridge_state_time > self.config.bridge_state_timeout_sec:
-                self._enter_failsafe(f"Bridge state timeout > {self.config.bridge_state_timeout_sec}s")
-                return False
-            if not self.bridge_connected:
-                self._enter_failsafe("Bridge reports MAVLink disconnected")
-                return False
+        if self.last_bridge_state_time is None:
+            self.logger.info("Waiting for bridge state...", throttle_duration_sec=2.0)
+            self.stop("waiting_bridge_state")
+            return False
+        if now - self.last_bridge_state_time > self.config.bridge_state_timeout_sec:
+            self._enter_failsafe(f"Bridge state timeout > {self.config.bridge_state_timeout_sec}s")
+            return False
+        if not self.bridge_connected:
+            self._enter_failsafe("Bridge reports MAVLink disconnected")
+            return False
 
-        # GPS noktalarına gitme aktifse GPS zorunlu. Sadece görsel dry-run için config ile esnetilebilir.
+        # GPS noktalarına gitme aktifse veya config gerektiriyorsa GPS zorunlu.
         gps_required = self.config.require_gps_for_visual_docking or self._current_gps_target() is not None
         if gps_required:
             if self.last_gps_time is None or self.current_lat is None or self.current_lon is None:
@@ -592,6 +599,147 @@ class Task3DockingMission:
     def _state_age(self) -> float:
         return time.monotonic() - self.state_enter_time
 
+    def _depth_stop_status(self, detection: QrDetection) -> Dict[str, Any]:
+        threshold_m = max(
+            self.current_mode.stop_distance_m
+            + self.config.camera_to_bow_offset_m,
+            0.05,
+        )
+        window_size = max(self.config.depth_stop_window_size, 1)
+        required_count = max(
+            1,
+            min(self.config.depth_stop_required_count, window_size),
+        )
+        now = time.monotonic()
+        recent = [
+            item
+            for item in self.qr_history[-window_size:]
+            if item.canonical_payload == detection.canonical_payload
+            and item.distance_m is not None
+            and now - item.timestamp <= self.config.depth_stop_max_age_sec
+        ]
+        close_count = sum(
+            1 for item in recent if float(item.distance_m) <= threshold_m
+        )
+        current_close = bool(
+            detection.distance_m is not None
+            and detection.distance_m <= threshold_m
+        )
+        return {
+            "available": detection.distance_m is not None,
+            "distance_m": detection.distance_m,
+            "threshold_m": threshold_m,
+            "close_count": close_count,
+            "required_count": required_count,
+            "confirmed": current_close and close_count >= required_count,
+        }
+
+    def _heading_is_fresh(self) -> bool:
+        return bool(
+            self.current_heading is not None
+            and self.last_heading_time is not None
+            and time.monotonic() - self.last_heading_time
+            <= self.config.heading_timeout_sec
+        )
+
+    def _start_parallel_maneuver(self) -> None:
+        if not self.config.parallel_maneuver_enabled:
+            self.set_state(DockingState.HOLD_POSITION, "parallel_maneuver_disabled")
+            return
+        if not self._heading_is_fresh():
+            self._enter_failsafe("Parallel parking requires fresh heading")
+            return
+
+        direction_sign = (
+            -1.0 if self.config.parallel_turn_direction == "left" else 1.0
+        )
+        self.parallel_initial_heading = float(self.current_heading)
+        self.parallel_first_target_heading = (
+            self.parallel_initial_heading
+            + direction_sign * self.config.parallel_first_turn_deg
+        ) % 360.0
+        self.parallel_final_target_heading = (
+            self.parallel_initial_heading
+            + direction_sign * self.config.parallel_total_turn_deg
+        ) % 360.0
+        self.stop("parallel_dock_stop_confirmed")
+        self.set_state(DockingState.PARALLEL_TURN_FIRST, "parallel_turn_first")
+
+    def _parallel_heading_command(self, target_heading: float) -> Tuple[float, float]:
+        error = angle_diff_deg(target_heading, float(self.current_heading))
+        max_yaw = min(
+            abs(self.config.parallel_turn_max_yaw),
+            abs(self.config.max_yaw_speed),
+        )
+        angular_z = clamp(
+            self.config.parallel_turn_kp * error,
+            -max_yaw,
+            max_yaw,
+        )
+        min_yaw = min(abs(self.config.parallel_turn_min_yaw), max_yaw)
+        if (
+            abs(error) > self.config.parallel_turn_tolerance_deg
+            and abs(angular_z) < min_yaw
+        ):
+            angular_z = math.copysign(min_yaw, error)
+        return error, angular_z
+
+    def _update_parallel_turn(self, final_turn: bool) -> None:
+        if not self._heading_is_fresh():
+            self._enter_failsafe("Heading unavailable during parallel turn")
+            return
+        if self._state_age() > self.config.parallel_turn_timeout_sec:
+            self._enter_failsafe("Parallel turn timeout")
+            return
+
+        target_heading = (
+            self.parallel_final_target_heading
+            if final_turn
+            else self.parallel_first_target_heading
+        )
+        if target_heading is None:
+            self._enter_failsafe("Parallel target heading was not initialized")
+            return
+
+        error, angular_z = self._parallel_heading_command(target_heading)
+        if abs(error) <= self.config.parallel_turn_tolerance_deg:
+            self.stop("parallel_heading_reached")
+            self.set_state(
+                DockingState.HOLD_POSITION
+                if final_turn
+                else DockingState.PARALLEL_SHIFT_FORWARD,
+                "parallel_heading_complete"
+                if final_turn
+                else "parallel_first_turn_complete",
+            )
+            return
+
+        self._send_cmd(
+            self.config.parallel_turn_linear_speed,
+            angular_z,
+            reason="parallel_final_turn" if final_turn else "parallel_first_turn",
+        )
+
+    def _update_parallel_shift_forward(self) -> None:
+        if self._state_age() >= self.config.parallel_shift_seconds:
+            self.stop("parallel_shift_complete")
+            self.set_state(
+                DockingState.PARALLEL_TURN_FINAL,
+                "parallel_shift_complete",
+            )
+            return
+        self._send_cmd(
+            self.config.parallel_shift_speed,
+            0.0,
+            reason="parallel_shift_forward",
+        )
+
+    def _complete_dock_approach(self, reason: str) -> None:
+        if self.current_mode_name == "parallel":
+            self._start_parallel_maneuver()
+        else:
+            self.set_state(DockingState.HOLD_POSITION, reason)
+
     def _finish_current_mode(self) -> None:
         self.logger.info(f"Task3 mode finished: {self.current_mode_name}")
         self.mode_index += 1
@@ -602,6 +750,9 @@ class Task3DockingMission:
             return
         self.current_mode_name = self.config.sequence[self.mode_index]
         self.mode_started_at = time.monotonic()
+        self.parallel_initial_heading = None
+        self.parallel_first_target_heading = None
+        self.parallel_final_target_heading = None
         self.logger.info(f"Task3 next mode: {self.current_mode_name}")
         self.set_state(DockingState.GO_TO_APPROACH_POINT, "next_mode")
 
@@ -673,9 +824,20 @@ class Task3DockingMission:
             return
 
         detection = self.last_qr_detection
-        if detection.area_ratio >= self.current_mode.stop_area_ratio:
+        depth = self._depth_stop_status(detection)
+        if depth["available"] and detection.distance_m <= depth["threshold_m"]:
+            self.stop("dock_reached_by_depth")
+            if depth["confirmed"]:
+                self._complete_dock_approach(
+                    f"depth={detection.distance_m:.2f}m"
+                )
+            return
+
+        if not depth["available"] and detection.area_ratio >= self.current_mode.stop_area_ratio:
             self.stop("dock_reached_by_bbox_area")
-            self.set_state(DockingState.HOLD_POSITION, f"area_ratio={detection.area_ratio:.3f}")
+            self._complete_dock_approach(
+                f"area_ratio={detection.area_ratio:.3f}"
+            )
             return
 
         linear_x, angular_z, _ = self._align_command(
@@ -688,7 +850,12 @@ class Task3DockingMission:
     def _update_hold_position(self) -> None:
         self.stop("hold_position")
         if self._state_age() >= self.current_mode.hold_seconds:
-            self.set_state(DockingState.REVERSE_EXIT, "hold_complete")
+            if self.current_mode.reverse_after_hold:
+                self.set_state(DockingState.REVERSE_EXIT, "hold_complete")
+            elif self.current_mode.exit_point.is_valid:
+                self.set_state(DockingState.GO_TO_EXIT_POINT, "hold_complete")
+            else:
+                self.set_state(DockingState.MODE_FINISHED, "hold_complete")
 
     def _update_reverse_exit(self) -> None:
         if self._state_age() < self.current_mode.reverse_seconds:
@@ -735,6 +902,18 @@ class Task3DockingMission:
             self._update_final_approach()
             return
 
+        if self.state == DockingState.PARALLEL_TURN_FIRST:
+            self._update_parallel_turn(final_turn=False)
+            return
+
+        if self.state == DockingState.PARALLEL_SHIFT_FORWARD:
+            self._update_parallel_shift_forward()
+            return
+
+        if self.state == DockingState.PARALLEL_TURN_FINAL:
+            self._update_parallel_turn(final_turn=True)
+            return
+
         if self.state == DockingState.HOLD_POSITION:
             self._update_hold_position()
             return
@@ -762,8 +941,6 @@ class Task3DockingMission:
             "dock_global_heading_deg": self.current_mode.dock_global_heading_deg,
             "dock_heading_error_deg": self._global_dock_heading_error(),
             "dock_heading_tolerance_deg": self.current_mode.dock_heading_tolerance_deg,
-            "dry_run": self.config.dry_run,
-            "real_run_acknowledged": self.config.real_run_acknowledged,
             "bridge_connected": self.bridge_connected,
             "bridge_state_age_sec": None
             if self.last_bridge_state_time is None
@@ -771,6 +948,13 @@ class Task3DockingMission:
             "finished": self.finished,
             "gps_available": self.current_lat is not None and self.current_lon is not None,
             "heading_available": self.current_heading is not None,
+            "parallel_maneuver": {
+                "enabled": self.config.parallel_maneuver_enabled,
+                "direction": self.config.parallel_turn_direction,
+                "initial_heading_deg": self.parallel_initial_heading,
+                "first_target_heading_deg": self.parallel_first_target_heading,
+                "final_target_heading_deg": self.parallel_final_target_heading,
+            },
             "qr_fresh": self._qr_is_fresh(),
             "qr": None
             if detection is None
@@ -785,6 +969,7 @@ class Task3DockingMission:
                 "confidence": detection.confidence,
                 "x_error_norm": detection.x_error_norm,
                 "area_ratio": detection.area_ratio,
+                "distance_m": detection.distance_m,
                 "last_rejected_payload": self.last_rejected_qr_payload,
             },
         }
@@ -796,27 +981,17 @@ class Task3DockingNode(Node):
         self.config = config
         self.get_logger().info("Task 3 Docking Node starting...")
 
-        if create_mission_topics is not None:
-            self.mission_topics = create_mission_topics(
-                self,
-                gps_callback=self.gps_callback,
-                heading_callback=self.heading_callback,
-                state_callback=self.bridge_state_callback,
-            )
-            self.cmd_vel_pub = self.mission_topics.cmd_vel_pub
-            self.position_target_pub = self.mission_topics.position_target_pub
-        else:
-            self.cmd_vel_pub = self.create_publisher(Twist, "/cube/cmd_vel", 10)
-            self.position_target_pub = self.create_publisher(NavSatFix, "/cube/set_position", 10)
-            self.create_subscription(NavSatFix, "/cube/gps", self.gps_callback, 10)
-            self.create_subscription(Float32, "/cube/gps/heading", self.heading_callback, 10)
-            self.create_subscription(String, "/cube/state", self.bridge_state_callback, 10)
+        self.mission_topics = create_mission_topics(
+            self,
+            gps_callback=self.gps_callback,
+            heading_callback=self.heading_callback,
+            state_callback=self.bridge_state_callback,
+        )
+        self.cmd_vel_pub = self.mission_topics.cmd_vel_pub
+        self.position_target_pub = self.mission_topics.position_target_pub
 
-        self.mission_clients = None
-        if create_mission_clients is not None:
-            self.mission_clients = create_mission_clients(self)
-            if not self.config.dry_run and wait_for_mission_services is not None:
-                wait_for_mission_services(self, self.mission_clients)
+        self.mission_clients = create_mission_clients(self)
+        wait_for_mission_services(self, self.mission_clients)
 
         self.qr_sub = self.create_subscription(String, self.config.qr_topic, self.qr_callback, 10)
         self.active_task_pub = self.create_publisher(String, self.config.active_task_topic, 10)
@@ -833,10 +1008,8 @@ class Task3DockingNode(Node):
         self.status_timer = self.create_timer(0.5, self.publish_status)
         self.active_task_timer = self.create_timer(1.0, self.publish_active_task)
 
-        self.get_logger().warn(
-            "Task3 V3.1 single package loaded. dry_run=%s. "
-            "Set dry_run=false only after bench test."
-            % self.config.dry_run
+        self.get_logger().info(
+            f"Task 3 docking mode loaded: {self.config.sequence[0]}"
         )
 
     def publish_active_task(self) -> None:
@@ -889,45 +1062,39 @@ class Task3DockingNode(Node):
         self.decision_pub.publish(decision_msg)
 
     def prepare_vehicle(self) -> bool:
-        if self.config.dry_run:
-            self.get_logger().warn("dry_run=true: vehicle mode/arm commands will not be sent.")
-            return True
-
-        if not self.config.real_run_acknowledged:
-            self.get_logger().error(
-                f"dry_run=false blocked: export TASK3_REAL_RUN_ACK={REAL_RUN_ACK_VALUE} before real run."
-            )
+        if call_set_mode(self, self.mission_clients.set_mode_client, "GUIDED") is False:
+            self.get_logger().error("Failed to switch to GUIDED mode.")
             return False
-
-        if self.mission_clients is None:
-            self.get_logger().error("Mission clients are unavailable; cannot prepare vehicle.")
+        if call_trigger_service(
+            self,
+            self.mission_clients.force_arm_client,
+            "FORCE ARM",
+        ) is False:
+            self.get_logger().error("FORCE ARM failed.")
             return False
-        if self.config.set_guided_mode and call_set_mode is not None:
-            ok = call_set_mode(self, self.mission_clients.set_mode_client, "GUIDED")
-            if ok is False:
-                self.get_logger().error("Failed to switch to GUIDED mode.")
-                return False
-        if self.config.arm_vehicle and call_trigger_service is not None:
-            ok = call_trigger_service(self, self.mission_clients.force_arm_client, "FORCE ARM")
-            if ok is False:
-                self.get_logger().error("FORCE ARM failed.")
-                return False
         return True
 
     def shutdown_vehicle(self) -> None:
         try:
             self.mission.stop("shutdown")
         finally:
-            if not self.config.dry_run and self.mission_clients is not None and call_set_mode is not None:
-                try:
-                    call_set_mode(self, self.mission_clients.set_mode_client, HOLD_MODE_NAME, timeout_sec=2.0)
-                except Exception:  # noqa: BLE001
-                    pass
-            if not self.config.dry_run and self.config.arm_vehicle and call_trigger_service is not None:
-                try:
-                    call_trigger_service(self, self.mission_clients.disarm_client, "DISARM")
-                except Exception:  # noqa: BLE001
-                    pass
+            try:
+                call_set_mode(
+                    self,
+                    self.mission_clients.set_mode_client,
+                    HOLD_MODE_NAME,
+                    timeout_sec=2.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                call_trigger_service(
+                    self,
+                    self.mission_clients.disarm_client,
+                    "DISARM",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def main(args: Optional[List[str]] = None) -> None:
