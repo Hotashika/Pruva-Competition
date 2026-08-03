@@ -1,3 +1,4 @@
+import argparse
 import os
 import queue
 import shlex
@@ -26,6 +27,40 @@ from njord.servers import video_server
 from utils.shutdown_signals import GracefulShutdown
 
 os.environ.setdefault("YOLO_OFFLINE", "true")
+
+TASK3_MODE_ALIASES = {
+    "seri": "normal",
+    "paralel": "parallel",
+}
+TASK3_MODE_TARGETS = {
+    "normal": "middle_berth_1,middle_berth_2",
+    "parallel": "middle_parallel",
+}
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="NJORD competition runtime")
+    parser.add_argument(
+        "--task-3",
+        choices=tuple(TASK3_MODE_ALIASES),
+        metavar="{seri,paralel}",
+        help="Task 3 yanaşma algoritmasını seçip otomatik başlatır.",
+    )
+    return parser.parse_args(argv)
+
+
+def configure_task3_mode_environment(mode=None):
+    """Task 3 CLI seçimini mevcut Mission Manager sözleşmesine bağlar."""
+    if mode is None:
+        return None
+
+    canonical_mode = TASK3_MODE_ALIASES[mode]
+    os.environ["NJORD_INITIAL_MISSION_COMMAND"] = "3"
+    os.environ["TASK3_DOCKING_MODE"] = canonical_mode
+    os.environ["TASK3_SEQUENCE"] = canonical_mode
+    os.environ["TASK3_ALLOWED_PAYLOADS"] = TASK3_MODE_TARGETS[canonical_mode]
+
+    return canonical_mode
 
 def launch_child_process(command):
     return subprocess.Popen(
@@ -151,6 +186,14 @@ def start_capture_process():
 
 
 if __name__ == "__main__":
+    cli_args = parse_args()
+    selected_task3_mode = configure_task3_mode_environment(cli_args.task_3)
+    if selected_task3_mode is not None:
+        print(
+            "[SYSTEM] Njord Task 3 otomatik başlatılacak: "
+            f"mode={cli_args.task_3} ({selected_task3_mode})"
+        )
+
     fx = None
     cx = None
     bridge_only = False

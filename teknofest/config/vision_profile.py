@@ -22,6 +22,7 @@ DETECTOR_SPECS = {
     "buoy": {
         "class": BuoyDetector,
         "model_path": BUOY_MODEL_PATH,
+        "kwargs": {"use_tracking": True},
     },
 }
 

@@ -184,6 +184,15 @@ Only one bridge process should own the MAVLink serial connection at a time.
 python njord/main.py
 ```
 
+Start Njord Task 3 directly with the selected docking algorithm:
+
+```bash
+python3 njord/main.py --task-3 paralel
+python3 njord/main.py --task-3 seri
+```
+
+These commands select Task 3 through the existing Mission Manager contract.
+
 The Njord launcher:
 
 1. Cleans stale shared-memory segments.
@@ -311,6 +320,11 @@ QGroundControl WPL text. Example:
 
 The bridge also provides `/cube/set_mode_service`, `/cube/arm`,
 `/cube/force_arm`, and `/cube/disarm`.
+
+`/cube/cmd_vel` requires finite `linear.x` and `angular.z` values. If either
+value is `NaN` or infinite, the bridge rejects the command, neutralizes the
+active outputs, and publishes an error instead of forwarding motion to the
+vehicle.
 
 ## MAVLink Configuration
 

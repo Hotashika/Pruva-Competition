@@ -23,12 +23,22 @@ def normalize_qr_payload(payload):
     return normalized.replace("middle_birth_", "middle_berth_")
 
 
-def bbox_to_qr_detection(bbox, payload, confidence):
+def bbox_to_qr_detection(bbox, payload, confidence, distance_m=None):
     x1, y1, x2, y2 = map(int, bbox)
+    try:
+        distance_m = float(distance_m)
+    except (TypeError, ValueError):
+        distance_m = None
+    if (
+        distance_m is not None
+        and (not np.isfinite(distance_m) or distance_m <= 0.0)
+    ):
+        distance_m = None
     return {
         "payload": payload,
         "canonical_payload": payload,
         "confidence": float(confidence),
+        "distance_m": distance_m,
         "center_px": {"x": (x1 + x2) / 2.0, "y": (y1 + y2) / 2.0},
         "bbox_xywh_px": {
             "x": float(x1),

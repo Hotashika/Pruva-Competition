@@ -25,6 +25,18 @@ def test_task3_search_explains_ar_tag_stage():
     assert "correct dock" in decision["reason"]
 
 
+def test_task3_parallel_turn_keeps_docking_decision_contract():
+    decision = build_mission_decision(
+        3,
+        "PARALLEL_TURN_FIRST",
+        target_count=1,
+    )
+
+    assert decision["stage"] == "DOCKING"
+    assert decision["action"] == "Turn left for parallel docking"
+    assert decision["collision_risk"] is False
+
+
 def test_finished_mission_reports_full_progress():
     decision = build_mission_decision(4, "FINISHED", current_target=2, target_count=5)
 

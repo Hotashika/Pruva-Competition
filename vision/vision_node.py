@@ -258,6 +258,7 @@ class VisionNode(Node):
             bbox,
             canonical,
             detection.get("confidence", 0.0),
+            distance_m=detection.get("distance"),
         )
 
     def _publish_task_qr(self, frame_id, image, qr_detection):

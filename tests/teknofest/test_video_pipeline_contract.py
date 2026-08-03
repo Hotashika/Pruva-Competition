@@ -41,3 +41,9 @@ def test_detector_distance_is_computed_as_bbox_median():
     source, _tree = _parsed_source("vision/detector.py")
 
     assert 'method="median"' in source
+
+
+def test_teknofest_buoy_detector_uses_persistent_tracking():
+    source, _tree = _parsed_source("teknofest/config/vision_profile.py")
+
+    assert '"kwargs": {"use_tracking": True}' in source
