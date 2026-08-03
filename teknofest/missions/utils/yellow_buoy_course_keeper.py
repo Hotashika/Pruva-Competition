@@ -29,6 +29,7 @@ YELLOW_BUOY_CLASS_NAMES = frozenset(
     {
         "yellow",
         "yellow_buoy",
+        "yellow_buoys",
         "yellowbuoy",
         "yellow_marker",
         "sari",
@@ -36,7 +37,6 @@ YELLOW_BUOY_CLASS_NAMES = frozenset(
         "sari_samandira",
     }
 )
-
 
 def detection_class_name(detection) -> str:
     """Farklı detector şemalarından normalize edilmiş sınıf adı döndürür."""
