@@ -1016,7 +1016,7 @@ def test_standalone_timer_does_not_run_before_mission_is_active(task3_module):
     node.timer_callback()
 
 
-def test_standalone_main_starts_in_guided_without_entry_loiter(task3_module):
+def test_standalone_main_starts_in_guided_and_exits_in_manual(task3_module):
     requested_modes = []
     node = types.SimpleNamespace(
         mission_active=False,
@@ -1049,4 +1049,4 @@ def test_standalone_main_starts_in_guided_without_entry_loiter(task3_module):
 
     task3_module.main()
 
-    assert requested_modes == ["GUIDED"]
+    assert requested_modes == ["GUIDED", "MANUAL"]
