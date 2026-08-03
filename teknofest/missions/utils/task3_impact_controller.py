@@ -44,7 +44,7 @@ class Task3ImpactController:
             )
         return ImpactDecision(
             action=ImpactAction.RAM_COMPLETE,
-            reason="RAM süresi tamamlandı; yakın derinlik doğrulaması bekleniyor",
+            reason="RAM süresi tamamlandı.",
         )
 
     def post_impact_decision(self, elapsed) -> ImpactDecision:

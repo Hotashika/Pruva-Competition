@@ -2,7 +2,7 @@
 """
 TEKNOFEST Görev 2
 -----------------
-Waypoint takibi + sarı dubalardan Njord Task 1 tipi süreli kaçınma.
+İkinci en yakın sarı dubayla parkur takibi + Njord Task 1 tipi süreli kaçınma.
 
 Beklenen kamera topic'i:
     /vision/detections   (std_msgs/String, JSON)
@@ -62,6 +62,8 @@ from utils.mavlink_utilities import (
 )
 from utils.read_waypoints import parse_qgc_waypoints
 from teknofest.missions.utils.yellow_buoy_course_keeper import (
+    BuoyCourseConfig,
+    BuoyCourseKeeper,
     YELLOW_BUOY_CLASS_NAMES,
     detection_class_name,
 )
@@ -75,7 +77,8 @@ DETECTION_TOPIC = "/vision/detections"
 VISION_DETECTION_TIMEOUT_SEC = 12.0
 AVOIDANCE_VELOCITY_TOPIC = "/cube/task2_velocity"
 
-# Task 2 parkur takibi ve engel kaçınması yalnız sarı dubaları hedef alır.
+# Task 2 yalnızca sarı dubayı parkur ve kaçınma adayı olarak kullanır.
+# Kaçış yönü kameradaki mevcut sağ/sol konumundan seçilir.
 OBSTACLE_CLASS_NAMES = YELLOW_BUOY_CLASS_NAMES
 MIN_OBSTACLE_CONFIDENCE = 0.45
 
@@ -97,20 +100,31 @@ WAYPOINT_SETTLE_SEC = 0.75
 WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 
 # ============================================================
+# SARI DUBA PARKUR PARAMETRELERİ
+# ============================================================
+# İkinci en yakın sarı dubaya yönelirken üretilecek kısa GPS hedefinin
+# üst mesafesi.
+BUOY_COURSE_LOOKAHEAD_M = 5.0
+
+# Parkur bir kez bulunduğunda kısa tespit kaybında son yönü koruma süresi.
+BUOY_TARGET_MEMORY_SEC = 1.0
+
+# ============================================================
 # KAÇINMA PARAMETRELERİ
 # ============================================================
 # Sarı duba bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
-AVOIDANCE_START_DISTANCE_M = 4.0
+AVOIDANCE_START_DISTANCE_M = 3.0
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
-AVOIDANCE_TURN_ANGLE_DEG = 45.0
-AVOIDANCE_TURN_DURATION_SEC = 4.0
-AVOIDANCE_FORWARD_MIN_DURATION_SEC = 3.0
+AVOIDANCE_TURN_ANGLE_DEG = 30.0
+AVOIDANCE_TURN_DURATION_SEC = 2.0
+AVOIDANCE_FORWARD_MIN_DURATION_SEC = 1.5
 AVOIDANCE_CLEAR_CONFIRM_SEC = 1.0
 AVOIDANCE_TIMEOUT_SEC = 40.0
 AVOIDANCE_BEHIND_MARGIN_M = 1.0
 # Hız profili eski TEKNOFEST dinamik kaçınma davranışından korunur.
 AVOIDANCE_PASS_CLEARANCE_M = 3.0
-AVOIDANCE_EMERGENCY_DISTANCE_M = 1.5
+# Bu mesafenin altında da manevra minimum hızla devam eder.
+AVOIDANCE_MIN_SPEED_DISTANCE_M = 1.5
 AVOIDANCE_MIN_LINEAR_SPEED = 0.2
 AVOIDANCE_MAX_LINEAR_SPEED = 0.6
 AVOIDANCE_MAX_ANGULAR_Z = 0.8
@@ -171,6 +185,13 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.last_angular_z = 0.0
         self.finished = False
         self.state = MissionState.INIT
+        self.course_keeper = BuoyCourseKeeper(BuoyCourseConfig(
+            min_confidence=MIN_OBSTACLE_CONFIDENCE,
+            lookahead_m=BUOY_COURSE_LOOKAHEAD_M,
+            target_memory_sec=BUOY_TARGET_MEMORY_SEC,
+            course_buoy_class_names=YELLOW_BUOY_CLASS_NAMES,
+        ))
+        self.buoy_course_acquired = False
         self.aligned_target_key = None
         self.resume_navigation_without_alignment = False
         self.waypoint_hold_until = None
@@ -574,8 +595,9 @@ class Task2PointTrackingWithObstacleAvoidance:
                 continue
 
             distance = obstacle["distance"]
+            # Derinliği olmayan/geçersiz tespit manevrayı veya GPS seyrini
+            # durdurmaz; yalnızca engel adayı olarak kullanılmaz.
             if distance is None or distance <= 0.0:
-                self.obstacle_data_uncertain = True
                 continue
             if distance >= AVOIDANCE_EXIT_DISTANCE_M:
                 continue
@@ -687,9 +709,6 @@ class Task2PointTrackingWithObstacleAvoidance:
         angle_deg = self._safe_float(obstacle.get("angle"))
         if distance is None or distance <= 0.0 or angle_deg is None:
             return self.last_avoidance_speed_m_s
-        if distance <= AVOIDANCE_EMERGENCY_DISTANCE_M:
-            return 0.0
-
         angle_rad = math.radians(angle_deg)
         target_forward = distance * math.cos(angle_rad)
         target_starboard = distance * math.sin(angle_rad)
@@ -705,10 +724,10 @@ class Task2PointTrackingWithObstacleAvoidance:
         )
         distance_ratio = self._clamp(
             (
-                distance - AVOIDANCE_EMERGENCY_DISTANCE_M
+                distance - AVOIDANCE_MIN_SPEED_DISTANCE_M
             ) / (
                 AVOIDANCE_START_DISTANCE_M
-                - AVOIDANCE_EMERGENCY_DISTANCE_M
+                - AVOIDANCE_MIN_SPEED_DISTANCE_M
             ),
             0.0,
             1.0,
@@ -865,7 +884,9 @@ class Task2PointTrackingWithObstacleAvoidance:
             self._enter_failsafe("Kaçınma zaman aşımı; FAILSAFE + HOLD.")
             return True
 
-        # Eksik derinlik/yön temiz görüş değildir: araç durur, clear sayacı sıfırlanır.
+        # Yönü belirsiz yakın duba temiz görüş değildir: araç durur,
+        # clear sayacı sıfırlanır. Eksik derinlik ise adaydan elenir ve
+        # süreli manevra son geçerli hızla devam eder.
         self._nearest_relevant_obstacle(detections, now=now)
         if self.obstacle_data_uncertain:
             self.avoidance_clear_started_time = None
@@ -876,7 +897,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             )
             self.last_angular_z = 0.0
             self.logger.warn(
-                "Aktif kaçınmada sarı duba verisi belirsiz; araç veri "
+                "Aktif kaçınmada sarı dubanın yönü belirsiz; araç veri "
                 "düzelene kadar durduruldu.",
                 throttle_duration_sec=1.0,
             )
@@ -938,6 +959,8 @@ class Task2PointTrackingWithObstacleAvoidance:
             target_lon,
             target_name,
             tolerance_m,
+            detections,
+            follow_buoy_course=True,
     ):
         distance = calculate_gps_distance(
             self.current_lat,
@@ -950,38 +973,90 @@ class Task2PointTrackingWithObstacleAvoidance:
             self.logger.info(f"{target_name} ulaşıldı. Kalan mesafe: {distance:.2f} m")
             return True
 
-        target_key = (
-            target_name,
-            round(float(target_lat), 7),
-            round(float(target_lon), 7),
-        )
+        navigation_lat = target_lat
+        navigation_lon = target_lon
+        navigation_status = "direct_main_waypoint"
+        if follow_buoy_course:
+            course_decision = self.course_keeper.compute(
+                detections=detections,
+                current_lat=self.current_lat,
+                current_lon=self.current_lon,
+                current_heading=self.current_heading,
+                now=time.monotonic(),
+            )
+            if course_decision.should_stop:
+                if course_decision.reason == "fewer_than_two_course_buoys":
+                    navigation_status = (
+                        "buoy_course_unavailable/direct_main_waypoint"
+                    )
+                    self.logger.warn(
+                        "Yeterli sarı duba bulunamadı; ana GPS waypoint'ine "
+                        "devam ediliyor.",
+                        throttle_duration_sec=1.0,
+                    )
+                elif self.resume_navigation_without_alignment:
+                    navigation_status = (
+                        "post_avoidance_main_waypoint_fallback/"
+                        f"{course_decision.reason}"
+                    )
+                else:
+                    publish_cmd_vel(
+                        self.topics.cmd_vel_pub,
+                        linear_x=0.0,
+                        angular_z=0.0,
+                    )
+                    self.logger.warn(
+                        "Sarı duba parkur hedefi hesaplanamadı "
+                        f"({course_decision.reason}); araç bekletiliyor.",
+                        throttle_duration_sec=1.0,
+                    )
+                    return False
+            if (
+                    course_decision.target_lat is not None
+                    and course_decision.target_lon is not None
+            ):
+                if course_decision.status == "live":
+                    self.buoy_course_acquired = True
+                navigation_lat = course_decision.target_lat
+                navigation_lon = course_decision.target_lon
+                navigation_status = (
+                    f"buoy_course/{course_decision.status}/"
+                    f"{course_decision.reason}"
+                )
+
+        # Duba parkur hedefi aracın konumuna ve her yeni kamera karesine göre
+        # sürekli değişir. Koordinatı hizalama anahtarına katmak her hedef
+        # güncellemesinde aracı yeniden durdurup döndürüyordu. Bir ana waypoint
+        # için yalnızca ilk hedefte hizalan; sonraki dinamik GPS hedeflerini
+        # kesintisiz yayınla.
+        alignment_key = (target_name,)
         if self.resume_navigation_without_alignment:
-            self.aligned_target_key = target_key
-        elif self.aligned_target_key != target_key:
+            self.aligned_target_key = alignment_key
+        elif self.aligned_target_key != alignment_key:
             if not align_heading_to_gps_target(
                     self.topics.cmd_vel_pub,
                     self.current_lat,
                     self.current_lon,
                     self.current_heading,
-                    target_lat,
-                    target_lon,
+                    navigation_lat,
+                    navigation_lon,
                     logger=self.logger,
                     target_name=target_name,
                     tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
             ):
                 return False
-            self.aligned_target_key = target_key
+            self.aligned_target_key = alignment_key
 
         publish_set_position(
             self.topics.position_target_pub,
-            target_lat,
-            target_lon,
+            navigation_lat,
+            navigation_lon,
         )
         self.last_angular_z = 0.0
 
         self.logger.info(
             f"Hedef={target_name} | mesafe={distance:.2f} m | "
-            "navigation=direct_main_waypoint",
+            f"navigation={navigation_status}",
             throttle_duration_sec=1.0,
         )
         return False
@@ -1049,7 +1124,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         if self.obstacle_data_uncertain:
             stop_vehicle(self.topics.cmd_vel_pub)
             self.logger.warn(
-                "Yakın sarı duba görüldü fakat mesafe/yön güvenilir değil; "
+                "Yakın sarı duba görüldü fakat yönü güvenilir değil; "
                 "araç veri düzelene kadar bekletiliyor.",
                 throttle_duration_sec=1.0,
             )
@@ -1064,6 +1139,8 @@ class Task2PointTrackingWithObstacleAvoidance:
                 target_lon,
                 "WP0 (başlangıç)",
                 self.waypoint_tolerance + 2.0,
+                detections,
+                follow_buoy_course=False,
             )
 
             if reached_wp0:
@@ -1097,6 +1174,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             target_lon,
             f"WP{self.current_target_index}",
             self.waypoint_tolerance,
+            detections,
         )
 
         if reached_main_wp:
@@ -1109,7 +1187,8 @@ class Task2Node(Node):
     def __init__(self):
         super().__init__("task2_mission_node")
         self.get_logger().info(
-            "Görev 2 node'u başlatılıyor: waypoint takibi + süreli engelden kaçınma."
+            "Görev 2 node'u başlatılıyor: sarı duba parkur takibi + "
+            "süreli engelden kaçınma."
         )
         self.get_logger().info(
             "Süreli kaçınma profili: "

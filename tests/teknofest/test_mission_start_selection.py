@@ -184,7 +184,6 @@ def test_interface_waypoint_sync_uses_teknofest_files(monkeypatch):
     assert mission_config.MISSION_WAYPOINT_FILES == {
         1: "teknofest_task1.waypoints",
         2: "teknofest_task2.waypoints",
-        3: "teknofest_task3.waypoints",
         4: "teknofest.waypoints",
     }
     assert mission_config.WAYPOINT_DIRECTORY == (
@@ -194,7 +193,6 @@ def test_interface_waypoint_sync_uses_teknofest_files(monkeypatch):
         "teknofest.waypoints",
         "teknofest_task1.waypoints",
         "teknofest_task2.waypoints",
-        "teknofest_task3.waypoints",
     } == {
         path.name for path in mission_config.WAYPOINT_DIRECTORY.glob("*.waypoints")
     }
@@ -242,7 +240,6 @@ def test_teknofest_profile_replaces_stale_njord_waypoint_mapping(monkeypatch):
     assert main.os.environ["MAVLINK_MISSION_WAYPOINT_FILES"] == (
         "1:teknofest_task1.waypoints,"
         "2:teknofest_task2.waypoints,"
-        "3:teknofest_task3.waypoints,"
         "4:teknofest.waypoints"
     )
     assert Path(main.os.environ["MAVLINK_MISSION_WAYPOINT_DIRECTORY"]) == (

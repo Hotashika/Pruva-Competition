@@ -123,6 +123,66 @@ def test_njord_profile_replaces_stale_teknofest_waypoint_mapping(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("cli_mode", "canonical_mode", "payloads"),
+    [
+        ("seri", "normal", "middle_berth_1,middle_berth_2"),
+        ("paralel", "parallel", "middle_parallel"),
+    ],
+)
+def test_task3_cli_selects_mode_and_existing_mission_contract(
+    monkeypatch,
+    cli_mode,
+    canonical_mode,
+    payloads,
+):
+    main = _load_njord_main(monkeypatch)
+    for name in (
+        "NJORD_INITIAL_MISSION_COMMAND",
+        "TASK3_DOCKING_MODE",
+        "TASK3_SEQUENCE",
+        "TASK3_ALLOWED_PAYLOADS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    args = main.parse_args(["--task-3", cli_mode])
+    selected = main.configure_task3_mode_environment(args.task_3)
+
+    assert selected == canonical_mode
+    assert main.os.environ["NJORD_INITIAL_MISSION_COMMAND"] == "3"
+    assert main.os.environ["TASK3_DOCKING_MODE"] == canonical_mode
+    assert main.os.environ["TASK3_SEQUENCE"] == canonical_mode
+    assert main.os.environ["TASK3_ALLOWED_PAYLOADS"] == payloads
+
+
+def test_mission_manager_reads_cli_initial_task_from_environment(monkeypatch):
+    manager_module = _load_mission_manager(monkeypatch)
+    monkeypatch.setenv("NJORD_INITIAL_MISSION_COMMAND", "3")
+
+    assert manager_module.MissionManager._initial_mission_from_environment() == 3
+
+
+def test_task3_cli_start_waits_for_bridge_connection(monkeypatch):
+    manager_module = _load_mission_manager(monkeypatch)
+    manager = manager_module.MissionManager.__new__(manager_module.MissionManager)
+    manager.initial_mission_command = 3
+    manager.bridge_state = {"connected": False}
+    started = []
+    manager._publish_status = lambda _message: None
+    manager._mission_start_callback = lambda message: started.append(message.data)
+
+    manager._start_initial_mission_once()
+
+    assert manager.initial_mission_command == 3
+    assert started == []
+
+    manager.bridge_state = {"connected": True}
+    manager._start_initial_mission_once()
+
+    assert manager.initial_mission_command is None
+    assert started == [3]
+
+
 class _FakeProcess:
     def __init__(self, return_code=None, pid=1234):
         self.return_code = return_code

@@ -1,6 +1,7 @@
-"""İkinci en yakın sarı dubaya yönelen dinamik parkur hedefi üretir.
+"""İkinci en yakın renkli dubaya yönelen dinamik parkur hedefi üretir.
 
-Modül ROS'a bağlı değildir. Her ``compute`` çağrısında geçerli sarı duba
+Modül ROS'a bağlı değildir. Her ``compute`` çağrısında geçerli sarı, kırmızı,
+yeşil ve turuncu duba
 tespitlerini mesafeye göre yeniden sıralar, ikinci sıradaki dubanın kamera
 açısını araç heading'iyle birleştirir ve kısa bir GPS hedefi döndürür.
 """
@@ -38,6 +39,52 @@ YELLOW_BUOY_CLASS_NAMES = frozenset(
     }
 )
 
+RED_BUOY_CLASS_NAMES = frozenset(
+    {
+        "red",
+        "red_buoy",
+        "red_buoys",
+        "redbuoy",
+        "red_marker",
+        "kirmizi",
+        "kirmizi_duba",
+        "kirmizi_samandira",
+    }
+)
+
+GREEN_BUOY_CLASS_NAMES = frozenset(
+    {
+        "green",
+        "green_buoy",
+        "green_buoys",
+        "greenbuoy",
+        "green_marker",
+        "yesil",
+        "yesil_duba",
+        "yesil_samandira",
+    }
+)
+
+ORANGE_BUOY_CLASS_NAMES = frozenset(
+    {
+        "orange",
+        "orange_buoy",
+        "orange_buoys",
+        "orangebuoy",
+        "orange_marker",
+        "turuncu",
+        "turuncu_duba",
+        "turuncu_samandira",
+    }
+)
+
+COURSE_BUOY_CLASS_NAMES = frozenset().union(
+    YELLOW_BUOY_CLASS_NAMES,
+    RED_BUOY_CLASS_NAMES,
+    GREEN_BUOY_CLASS_NAMES,
+    ORANGE_BUOY_CLASS_NAMES,
+)
+
 def detection_class_name(detection) -> str:
     """Farklı detector şemalarından normalize edilmiş sınıf adı döndürür."""
     if not isinstance(detection, dict):
@@ -52,6 +99,11 @@ def detection_class_name(detection) -> str:
 def is_yellow_buoy_detection(detection) -> bool:
     """Tespit sarı parkur dubasıysa True döndürür."""
     return detection_class_name(detection) in YELLOW_BUOY_CLASS_NAMES
+
+
+def is_course_buoy_detection(detection) -> bool:
+    """Tespit desteklenen renkli parkur dubalarından biriyse True döndürür."""
+    return detection_class_name(detection) in COURSE_BUOY_CLASS_NAMES
 
 
 def _safe_float(value) -> Optional[float]:
@@ -99,6 +151,7 @@ class YellowBuoyCourseConfig:
     max_relative_bearing_deg: float = 70.0
     steering_smoothing_alpha: float = 0.55
     target_memory_sec: float = 1.0
+    course_buoy_class_names: frozenset[str] = COURSE_BUOY_CLASS_NAMES
 
 
 @dataclass(frozen=True)
@@ -122,13 +175,13 @@ class YellowBuoyCourseDecision:
 
 
 @dataclass(frozen=True)
-class _YellowBuoy:
+class _CourseBuoy:
     distance_m: float
     angle_deg: float
 
 
 class YellowBuoyCourseKeeper:
-    """Her iterasyonda ikinci en yakın sarı dubayı rota referansı yapar."""
+    """Her iterasyonda ikinci en yakın renkli dubayı rota referansı yapar."""
 
     def __init__(self, config: Optional[YellowBuoyCourseConfig] = None):
         self.config = config or YellowBuoyCourseConfig()
@@ -163,8 +216,11 @@ class YellowBuoyCourseKeeper:
         normalized_x = ((x1 + x2) / 2.0 - image_width / 2.0) / (image_width / 2.0)
         return normalized_x * (self.config.fallback_horizontal_fov_deg / 2.0)
 
-    def _to_yellow_buoy(self, detection) -> Optional[_YellowBuoy]:
-        if not is_yellow_buoy_detection(detection):
+    def _to_course_buoy(self, detection) -> Optional[_CourseBuoy]:
+        if (
+                detection_class_name(detection)
+                not in self.config.course_buoy_class_names
+        ):
             return None
 
         confidence = _safe_float(detection.get("confidence"))
@@ -193,7 +249,7 @@ class YellowBuoyCourseKeeper:
         if abs(angle_deg) > self.config.max_detection_angle_deg:
             return None
 
-        return _YellowBuoy(distance_m=distance, angle_deg=angle_deg)
+        return _CourseBuoy(distance_m=distance, angle_deg=angle_deg)
 
     def _blocked_or_memory(
             self,
@@ -243,7 +299,7 @@ class YellowBuoyCourseKeeper:
             current_heading,
             now=None,
     ) -> YellowBuoyCourseDecision:
-        """İkinci en yakın geçerli sarı dubaya doğru kısa GPS hedefi üretir."""
+        """İkinci en yakın geçerli renkli dubaya doğru kısa GPS hedefi üretir."""
         now = time.monotonic() if now is None else float(now)
         numeric_inputs = (current_lat, current_lon, current_heading)
         if any(_safe_float(value) is None for value in numeric_inputs):
@@ -258,14 +314,14 @@ class YellowBuoyCourseKeeper:
 
         candidates = []
         for detection in detections or []:
-            buoy = self._to_yellow_buoy(detection)
+            buoy = self._to_course_buoy(detection)
             if buoy is not None:
                 candidates.append(buoy)
         candidates.sort(key=lambda buoy: buoy.distance_m)
 
         if len(candidates) < 2:
             return self._blocked_or_memory(
-                "fewer_than_two_yellow_buoys",
+                "fewer_than_two_course_buoys",
                 current_lat,
                 current_lon,
                 current_heading,
@@ -310,7 +366,7 @@ class YellowBuoyCourseKeeper:
 
         return YellowBuoyCourseDecision(
             status="live",
-            reason="second_nearest_yellow_buoy",
+            reason="second_nearest_course_buoy",
             target_lat=target_lat,
             target_lon=target_lon,
             relative_bearing_deg=desired_relative,
@@ -318,3 +374,10 @@ class YellowBuoyCourseKeeper:
             selected_distance_m=selected.distance_m,
             candidate_count=len(candidates),
         )
+
+
+# Yeni kullanımlarda renk bağımsız adlar tercih edilir. Eski sınıf adları
+# mevcut görev ve dış kullanımlar bozulmasın diye korunur.
+BuoyCourseConfig = YellowBuoyCourseConfig
+BuoyCourseDecision = YellowBuoyCourseDecision
+BuoyCourseKeeper = YellowBuoyCourseKeeper

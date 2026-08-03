@@ -33,7 +33,6 @@ MISSION_SPECS = {
 MISSION_WAYPOINT_FILES = {
     1: "teknofest_task1.waypoints",
     2: "teknofest_task2.waypoints",
-    3: "teknofest_task3.waypoints",
     4: "teknofest.waypoints",
 }
 

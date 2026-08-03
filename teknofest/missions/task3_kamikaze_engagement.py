@@ -126,8 +126,6 @@ class Task3Config:
     # Temas ve kayıtlı GPS'e dönüş
     ram_speed: float = 0.85
     ram_duration_sec: float = 2.0
-    impact_distance_growth_ratio: float = 0.50
-    impact_distance_growth_margin_m: float = 0.20
     post_impact_forward_speed: float = 0.4
     post_impact_forward_duration_sec: float = 5.0
     impact_alignment_tolerance_deg: float = 8.0
@@ -190,8 +188,6 @@ class Task3Config:
                 "approach_min_speed",
                 "approach_max_speed",
                 "approach_speed_kp",
-                "impact_distance_growth_ratio",
-                "impact_distance_growth_margin_m",
         ):
             if float(getattr(self, name)) <= 0.0:
                 raise ValueError(f"{name} must be positive")
@@ -1176,32 +1172,7 @@ class Task3KamikazeEngagement:
             )
             return
 
-        max_allowed_distance = (
-            self.ram_entry_distance
-            * (1.0 + self.config.impact_distance_growth_ratio)
-            + self.config.impact_distance_growth_margin_m
-        )
-        impact_depth_confirmed = (
-            target is not None
-            and target["distance"]
-            <= max_allowed_distance
-        )
-        if not impact_depth_confirmed:
-            latest_distance = (
-                "none"
-                if target is None
-                else f"{target['distance']:.2f}m"
-            )
-            self._enter_search(
-                now,
-                "RAM bitti ancak yakın derinlik teması doğrulamadı; "
-                f"latest={latest_distance}, "
-                f"allowed={max_allowed_distance:.2f}m",
-                recenter=True,
-            )
-            return
-
-        if not self._register_impact(now, "depth_validated_ram"):
+        if not self._register_impact(now, "timed_ram_complete"):
             return
         if self.impact_count >= self.config.required_impact_count:
             self._finish_mission(now, decision.reason)
@@ -1661,6 +1632,11 @@ def main(args=None):
             node,
             node.mission_clients.disarm_client,
             "DISARM",
+        )
+        call_set_mode(
+            node,
+            node.mission_clients.set_mode_client,
+            "MANUAL",
         )
         node.destroy_node()
         if rclpy.ok():

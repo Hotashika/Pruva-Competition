@@ -582,7 +582,7 @@ def test_ram_end_saves_gps_and_immediately_advances(task3_module):
 
     impact_time = now + mission.config.ram_duration_sec + 0.01
     mission.update(
-        [_target(distance=1.1)],
+        [],
         now=impact_time,
         vision_frame_id=300,
     )
@@ -599,7 +599,7 @@ def test_ram_end_saves_gps_and_immediately_advances(task3_module):
     )
 
 
-def test_ram_end_does_not_record_impact_when_depth_is_far(task3_module):
+def test_ram_end_records_impact_without_rechecking_depth(task3_module):
     mission = _mission(task3_module)
     now = _enter_ram(mission, task3_module)
     mission.update(
@@ -608,9 +608,9 @@ def test_ram_end_does_not_record_impact_when_depth_is_far(task3_module):
         vision_frame_id=300,
     )
 
-    assert mission.impact_count == 0
-    assert mission.state is task3_module.MissionState.SEARCH
-    assert mission.impact_target_gps is None
+    assert mission.impact_count == 1
+    assert mission.state is task3_module.MissionState.POST_IMPACT_ADVANCE
+    assert mission.impact_target_gps is not None
 
 
 def test_post_impact_advance_returns_with_global_gps_target(task3_module):
@@ -993,7 +993,6 @@ def test_production_defaults_match_direct_attack_plan(task3_module):
     assert defaults.ram_start_distance_m == pytest.approx(1.0)
     assert defaults.approach_min_speed == pytest.approx(0.12)
     assert defaults.approach_max_speed == pytest.approx(0.45)
-    assert defaults.impact_distance_growth_ratio == pytest.approx(0.50)
     assert defaults.ram_speed == pytest.approx(0.85)
     assert defaults.ram_duration_sec == pytest.approx(2.0)
     assert defaults.post_impact_forward_speed == pytest.approx(0.4)

@@ -77,6 +77,7 @@ class MissionManager(Node):
         self.last_reported_state = None
         self.active_mission_number = None
         self.active_mission_process = None
+        self.initial_mission_command = self._initial_mission_from_environment()
 
         self.status_pub = self.create_publisher(String, "/mission_manager/status", 10)
         self.mission_start_ack_pub = self.create_publisher(
@@ -85,12 +86,44 @@ class MissionManager(Node):
         self.create_subscription(Int32, self.mission_start_topic, self._mission_start_callback, 10)
         self.create_subscription(String, "/cube/state", self._bridge_state_callback, 10)
         self.create_timer(1.0, self._status_loop)
+        if self.initial_mission_command is not None:
+            self.create_timer(1.0, self._start_initial_mission_once)
 
         self._publish_status(
             f"Mission Manager aktif. {self.mission_start_topic} dinleniyor; "
             f"gorev process yonetimi aktif, JSON durum dosyasi idle olarak sifirlandi: "
             f"{self.task_selection_file}"
         )
+
+    @staticmethod
+    def _initial_mission_from_environment():
+        raw = os.getenv("NJORD_INITIAL_MISSION_COMMAND", "").strip()
+        if not raw:
+            return None
+        try:
+            command = int(raw)
+        except ValueError:
+            return None
+        return command if command in MISSION_PATHS else None
+
+    def _start_initial_mission_once(self):
+        command = self.initial_mission_command
+        if command is None:
+            return
+        if (
+            command == 3
+            and not self.bridge_state.get("connected", False)
+        ):
+            # Timer tekrar çalışacak; gerçek motor görevini MAVLink
+            # heartbeat bağlantısı gelmeden başlatma.
+            return
+        self.initial_mission_command = None
+        message = Int32()
+        message.data = command
+        self._publish_status(
+            f"CLI initial mission request is being applied: command={command}"
+        )
+        self._mission_start_callback(message)
 
     def _bridge_state_callback(self, msg):
         self.bridge_state = parse_bridge_state(msg.data)
