@@ -56,6 +56,27 @@ def test_second_nearest_buoy_is_selected_after_distance_sorting():
     assert decision.target_lon > CURRENT_LON
 
 
+def test_non_yellow_buoys_are_ignored_during_course_selection():
+    decision = keeper_without_smoothing().compute(
+        [
+            yellow(2.0, -15.0, class_name="green_buoy"),
+            yellow(6.0, 22.0, class_name="red_buoys"),
+            yellow(9.0, 35.0, class_name="yellow_buoy"),
+            yellow(12.0, -40.0, class_name="yellow_buoys"),
+        ],
+        CURRENT_LAT,
+        CURRENT_LON,
+        10.0,
+        now=10.0,
+    )
+
+    assert decision.status == "live"
+    assert decision.candidate_count == 2
+    assert decision.selected_distance_m == pytest.approx(12.0)
+    assert decision.relative_bearing_deg == pytest.approx(-40.0)
+    assert decision.global_bearing_deg == pytest.approx(330.0)
+
+
 def test_target_is_reselected_on_every_iteration():
     keeper = keeper_without_smoothing()
     first = keeper.compute(
@@ -91,7 +112,7 @@ def test_invalid_candidates_do_not_affect_second_nearest_selection():
             yellow(2.0, None),
             yellow(4.0, -12.0),
             yellow(8.0, 18.0),
-            yellow(3.0, 0.0, class_name="orange_buoy"),
+            yellow(3.0, 0.0, class_name="boat"),
         ],
         CURRENT_LAT,
         CURRENT_LON,
