@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 import types
 from pathlib import Path
@@ -15,6 +16,14 @@ TASK2_PATH = (
 )
 
 
+class FakePublisher:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, message):
+        self.messages.append(message)
+
+
 @pytest.fixture()
 def task2_module(monkeypatch):
     rclpy = types.ModuleType("rclpy")
@@ -28,6 +37,17 @@ def task2_module(monkeypatch):
         {"BEST_EFFORT": 1},
     )
     rclpy_qos.QoSProfile = lambda **kwargs: kwargs
+
+    geometry_msgs = types.ModuleType("geometry_msgs")
+    geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
+
+    class Twist:
+        def __init__(self):
+            self.linear = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+    geometry_msgs_msg.Twist = Twist
+    geometry_msgs.msg = geometry_msgs_msg
 
     mavros_msgs = types.ModuleType("mavros_msgs")
     mavros_srv = types.ModuleType("mavros_msgs.srv")
@@ -67,6 +87,8 @@ def task2_module(monkeypatch):
         "rclpy": rclpy,
         "rclpy.node": rclpy_node,
         "rclpy.qos": rclpy_qos,
+        "geometry_msgs": geometry_msgs,
+        "geometry_msgs.msg": geometry_msgs_msg,
         "mavros_msgs": mavros_msgs,
         "mavros_msgs.srv": mavros_srv,
         "std_msgs": std_msgs,
@@ -102,9 +124,11 @@ def _mission(task2_module):
     mission.avoidance_side = None
     mission.avoided_obstacle_side = None
     mission.avoidance_started_time = None
+    mission.avoidance_phase = None
+    mission.avoidance_phase_started_time = None
+    mission.avoidance_entry_heading = None
     mission.avoidance_clear_started_time = None
-    mission.last_avoidance_linear_x = 0.0
-    mission.last_avoidance_angular_z = 0.0
+    mission.last_avoidance_speed_m_s = 0.0
     mission.avoiding_track_id = None
     mission.active_obstacle_reference = None
     mission.pending_obstacle = None
@@ -114,13 +138,14 @@ def _mission(task2_module):
     mission.last_angular_z = 0.0
     mission.aligned_target_key = None
     mission.resume_navigation_without_alignment = False
-    mission.yellow_course_acquired = False
+    mission.buoy_course_acquired = False
     mission.waypoint_hold_until = None
     mission.waypoint_hold_name = None
     mission.state = task2_module.MissionState.NAVIGATING
     mission.topics = types.SimpleNamespace(
         cmd_vel_pub=object(),
         position_target_pub=object(),
+        avoidance_velocity_pub=FakePublisher(),
     )
     mission.clients = types.SimpleNamespace(
         set_mode_client=types.SimpleNamespace(call_async=lambda request: None),
@@ -153,6 +178,22 @@ def _yellow(**overrides):
     return detection
 
 
+def test_task2_initializes_yellow_only_course_keeper(task2_module):
+    logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    node = types.SimpleNamespace(get_logger=lambda: logger)
+    mission = task2_module.Task2PointTrackingWithObstacleAvoidance(
+        node,
+        types.SimpleNamespace(avoidance_velocity_pub=FakePublisher()),
+        types.SimpleNamespace(),
+    )
+
+    assert (
+        mission.course_keeper.config.course_buoy_class_names
+        == task2_module.YELLOW_BUOY_CLASS_NAMES
+    )
+    assert task2_module.OBSTACLE_CLASS_NAMES == task2_module.YELLOW_BUOY_CLASS_NAMES
+
+
 def test_close_yellow_buoy_without_angle_or_direction_is_uncertain(task2_module):
     mission = _mission(task2_module)
 
@@ -164,11 +205,44 @@ def test_close_yellow_buoy_without_angle_or_direction_is_uncertain(task2_module)
     assert mission.obstacle_data_uncertain is True
 
 
-def test_only_yellow_buoy_triggers_obstacle_logic(task2_module):
+@pytest.mark.parametrize(
+    "class_name",
+    [
+        "yellow_buoy",
+        "yellow_buoys",
+        "Sarı Duba",
+    ],
+)
+def test_yellow_buoy_aliases_trigger_obstacle_logic(
+        task2_module,
+        class_name,
+):
     mission = _mission(task2_module)
 
     obstacle = mission._nearest_relevant_obstacle([{
-        "class": "orange_buoy",
+        "class": class_name,
+        "confidence": 0.99,
+        "distance": 1.0,
+        "angle": 0.0,
+    }])
+
+    assert obstacle is not None
+    assert obstacle["distance"] == 1.0
+    assert mission.obstacle_data_uncertain is False
+
+
+@pytest.mark.parametrize(
+    "class_name",
+    ["orange_buoy", "green_buoy", "red_buoy", "Kırmızı Duba"],
+)
+def test_non_yellow_buoys_do_not_trigger_obstacle_logic(
+        task2_module,
+        class_name,
+):
+    mission = _mission(task2_module)
+
+    obstacle = mission._nearest_relevant_obstacle([{
+        "class": class_name,
         "confidence": 0.99,
         "distance": 1.0,
         "angle": 0.0,
@@ -178,20 +252,37 @@ def test_only_yellow_buoy_triggers_obstacle_logic(task2_module):
     assert mission.obstacle_data_uncertain is False
 
 
-def test_avoidance_candidate_boundaries_are_four_and_five(
+def test_unrelated_detection_does_not_trigger_obstacle_logic(task2_module):
+    mission = _mission(task2_module)
+
+    obstacle = mission._nearest_relevant_obstacle([{
+        "class": "blue_boat",
+        "confidence": 0.99,
+        "distance": 1.0,
+        "angle": 0.0,
+    }])
+
+    assert obstacle is None
+    assert mission.obstacle_data_uncertain is False
+
+
+def test_avoidance_candidate_boundaries_are_three_and_five(
         task2_module,
 ):
     mission = _mission(task2_module)
 
     start_boundary = mission._nearest_relevant_obstacle([
-        _yellow(distance=4.0)
+        _yellow(distance=3.0)
     ])
     clear_boundary = mission._nearest_relevant_obstacle([
         _yellow(distance=5.0)
     ])
 
-    assert task2_module.AVOIDANCE_START_DISTANCE_M == 4.0
-    assert start_boundary["distance"] == 4.0
+    assert task2_module.AVOIDANCE_START_DISTANCE_M == 3.0
+    assert task2_module.AVOIDANCE_TURN_DURATION_SEC == 2.0
+    assert task2_module.AVOIDANCE_FORWARD_MIN_DURATION_SEC == 1.5
+    assert task2_module.VISION_DETECTION_TIMEOUT_SEC == 12.0
+    assert start_boundary["distance"] == 3.0
     assert clear_boundary is None
     assert mission.obstacle_data_uncertain is False
 
@@ -229,72 +320,59 @@ def test_real_angle_takes_priority_over_side_fallback(task2_module):
 
 
 @pytest.mark.parametrize(
-    ("obstacle_side", "angle", "pass_side", "turn_sign"),
+    ("obstacle_side", "pass_side", "expected_bearing"),
     [
-        ("left", -15.0, "right", 1),
-        ("right", 15.0, "left", -1),
-        ("center", 0.0, "right", 1),
+        ("left", "right", 120.0),
+        ("right", "left", 60.0),
+        ("center", "right", 120.0),
     ],
 )
-def test_pass_side_policy_produces_expected_turn_direction(
+def test_pass_side_policy_keeps_fixed_thirty_degree_bearing(
         task2_module,
         obstacle_side,
-        angle,
         pass_side,
-        turn_sign,
+        expected_bearing,
 ):
     mission = _mission(task2_module)
+    mission.current_heading = 90.0
 
-    command = mission._calculate_avoidance_command(
-        _yellow(side=obstacle_side, angle=angle, distance=3.0)
+    assert mission._start_avoidance(
+        _yellow(side=obstacle_side, distance=3.0),
+        now=10.0,
     )
+    velocity = mission.topics.avoidance_velocity_pub.messages[-1]
+    bearing = math.degrees(math.atan2(velocity.linear.y, velocity.linear.x)) % 360.0
 
-    assert command["avoidance_side"] == pass_side
-    assert command["angular_z"] * turn_sign > 0.0
+    assert mission.avoidance_side == pass_side
+    assert task2_module.AVOIDANCE_TURN_ANGLE_DEG == 30.0
+    assert bearing == pytest.approx(expected_bearing)
 
 
-def test_command_changes_dynamically_with_angle_and_depth(task2_module):
+def test_avoidance_speed_changes_dynamically_with_angle_and_depth(task2_module):
     mission = _mission(task2_module)
     mission.avoidance_side = "right"
 
-    farther = mission._calculate_avoidance_command(
-        _yellow(distance=3.0, angle=-10.0)
+    farther = mission._calculate_avoidance_speed(
+        mission._normalize_detection(_yellow(distance=3.0, angle=-10.0))
     )
-    nearer = mission._calculate_avoidance_command(
-        _yellow(distance=2.0, angle=10.0)
+    nearer = mission._calculate_avoidance_speed(
+        mission._normalize_detection(_yellow(distance=2.0, angle=10.0))
     )
 
-    assert nearer["linear_x"] != pytest.approx(farther["linear_x"])
-    assert nearer["angular_z"] != pytest.approx(farther["angular_z"])
-    assert task2_module.AVOIDANCE_MIN_LINEAR_SPEED <= farther["linear_x"] <= 0.6
-    assert task2_module.AVOIDANCE_MIN_LINEAR_SPEED <= nearer["linear_x"] <= 0.6
+    assert nearer != pytest.approx(farther)
+    assert task2_module.AVOIDANCE_MIN_LINEAR_SPEED <= farther <= 0.6
+    assert task2_module.AVOIDANCE_MIN_LINEAR_SPEED <= nearer <= 0.6
 
 
-@pytest.mark.parametrize(
-    ("side", "angle", "expected_angular_z"),
-    [
-        ("center", -89.0, 0.8),
-        ("right", 89.0, -0.8),
-    ],
-)
-def test_emergency_distance_stops_forward_motion_and_clamps_turn(
-        task2_module,
-        side,
-        angle,
-        expected_angular_z,
-):
+def test_below_minimum_speed_distance_continues_manoeuvre(task2_module):
     mission = _mission(task2_module)
+    mission.avoidance_side = "right"
 
-    command = mission._calculate_avoidance_command(
-        _yellow(
-            distance=1.0,
-            side=side,
-            angle=angle,
-        )
+    speed = mission._calculate_avoidance_speed(
+        mission._normalize_detection(_yellow(distance=1.0, angle=-89.0))
     )
 
-    assert command["linear_x"] == 0.0
-    assert command["angular_z"] == pytest.approx(expected_angular_z)
+    assert speed == pytest.approx(task2_module.AVOIDANCE_MIN_LINEAR_SPEED)
 
 
 def test_confirmation_applies_ema_to_range_and_angle(task2_module):
@@ -358,61 +436,69 @@ def test_active_obstacle_prefers_exact_track_id(task2_module):
     assert matched["track_id"] == 7
 
 
-def test_two_frames_start_cmd_vel_avoidance_without_gps_or_keeper(
+@pytest.mark.parametrize(
+    "class_name",
+    ["yellow_buoy", "yellow_buoys", "Sarı Duba"],
+)
+def test_two_frames_start_global_velocity_avoidance_without_course_keeper(
         task2_module,
         monkeypatch,
+        class_name,
 ):
     mission = _mission(task2_module)
-    velocity_commands = []
     monkeypatch.setattr(task2_module.time, "monotonic", lambda: 10.0)
-    task2_module.publish_cmd_vel = (
-        lambda publisher, linear_x, angular_z: velocity_commands.append(
-            (linear_x, angular_z)
-        )
-    )
     task2_module.publish_set_position = lambda *args, **kwargs: pytest.fail(
         "active avoidance must not publish a GPS target"
     )
     mission._navigate_to_gps_target = lambda *args, **kwargs: pytest.fail(
         "active avoidance must not enter normal/course navigation"
     )
-    detection = _yellow(distance=2.5, side="left", angle=-10.0)
+    detection = _yellow(
+        distance=2.5,
+        side="left",
+        angle=-10.0,
+        **{"class": class_name},
+    )
 
     mission.update([detection])
     assert mission.state is task2_module.MissionState.NAVIGATING
-    assert velocity_commands == []
+    assert mission.topics.avoidance_velocity_pub.messages == []
 
     mission.update([detection])
 
     assert mission.state is task2_module.MissionState.AVOIDING
     assert mission.avoidance_side == "right"
-    assert len(velocity_commands) == 1
-    assert velocity_commands[-1][0] > 0.0
-    assert velocity_commands[-1][1] > 0.0
+    assert len(mission.topics.avoidance_velocity_pub.messages) == 1
+    velocity = mission.topics.avoidance_velocity_pub.messages[-1]
+    assert velocity.linear.x > 0.0
+    assert velocity.linear.y > 0.0
 
-    mission.update([_yellow(distance=2.2, side="left", angle=-6.0)])
+    mission.update([
+        _yellow(
+            distance=2.2,
+            side="left",
+            angle=-6.0,
+            **{"class": class_name},
+        )
+    ])
 
     assert mission.state is task2_module.MissionState.AVOIDING
-    assert len(velocity_commands) == 2
+    assert len(mission.topics.avoidance_velocity_pub.messages) == 2
 
 
 def test_short_detection_loss_holds_last_command_and_reacquisition_continues(
         task2_module,
 ):
     mission = _mission(task2_module)
-    velocity_commands = []
-    task2_module.publish_cmd_vel = (
-        lambda publisher, linear_x, angular_z: velocity_commands.append(
-            (linear_x, angular_z)
-        )
-    )
     detection = _yellow(distance=2.5, side="left", angle=-10.0)
     assert mission._start_avoidance(detection, now=0.0)
-    first_command = velocity_commands[-1]
+    first_velocity = mission.topics.avoidance_velocity_pub.messages[-1]
 
     assert mission._update_active_avoidance([], now=0.1)
-    assert mission.avoidance_clear_started_time == 0.1
-    assert velocity_commands[-1] == first_command
+    assert mission.avoidance_clear_started_time is None
+    repeated_velocity = mission.topics.avoidance_velocity_pub.messages[-1]
+    assert repeated_velocity.linear.x == pytest.approx(first_velocity.linear.x)
+    assert repeated_velocity.linear.y == pytest.approx(first_velocity.linear.y)
 
     assert mission._update_active_avoidance(
         [_yellow(distance=2.2, side="left", angle=-6.0)],
@@ -421,18 +507,13 @@ def test_short_detection_loss_holds_last_command_and_reacquisition_continues(
 
     assert mission.state is task2_module.MissionState.AVOIDING
     assert mission.avoidance_clear_started_time is None
-    assert len(velocity_commands) == 3
+    assert len(mission.topics.avoidance_velocity_pub.messages) == 3
 
 
-def test_uncertain_depth_stops_without_advancing_clear_timer(task2_module):
+def test_uncertain_depth_keeps_active_manoeuvre_moving(task2_module):
     mission = _mission(task2_module)
-    velocity_commands = []
-    task2_module.publish_cmd_vel = (
-        lambda publisher, linear_x, angular_z: velocity_commands.append(
-            (linear_x, angular_z)
-        )
-    )
     assert mission._start_avoidance(_yellow(), now=0.0)
+    first_velocity = mission.topics.avoidance_velocity_pub.messages[-1]
 
     uncertain = _yellow()
     uncertain.pop("distance")
@@ -440,7 +521,25 @@ def test_uncertain_depth_stops_without_advancing_clear_timer(task2_module):
 
     assert mission.state is task2_module.MissionState.AVOIDING
     assert mission.avoidance_clear_started_time is None
-    assert velocity_commands[-1] == (0.0, 0.0)
+    repeated_velocity = mission.topics.avoidance_velocity_pub.messages[-1]
+    assert repeated_velocity.linear.x == pytest.approx(first_velocity.linear.x)
+    assert repeated_velocity.linear.y == pytest.approx(first_velocity.linear.y)
+
+
+def test_uncertain_depth_does_not_interrupt_gps_navigation(task2_module):
+    mission = _mission(task2_module)
+    navigation_calls = []
+    mission._navigate_to_gps_target = (
+        lambda *args, **kwargs: navigation_calls.append((args, kwargs)) or False
+    )
+    uncertain = _yellow()
+    uncertain.pop("distance")
+
+    mission.update([uncertain])
+
+    assert mission.state is task2_module.MissionState.NAVIGATING
+    assert len(navigation_calls) == 1
+    assert mission.obstacle_data_uncertain is False
 
 
 def test_clear_view_resumes_same_keeper_in_same_tick_without_alignment(
@@ -461,7 +560,7 @@ def test_clear_view_resumes_same_keeper_in_same_tick_without_alignment(
             target_lat=37.95160,
             target_lon=32.50120,
             status="live",
-            reason="second_nearest_yellow_buoy",
+            reason="second_nearest_course_buoy",
         )
 
     keeper.compute = compute_course
@@ -490,15 +589,14 @@ def test_clear_view_resumes_same_keeper_in_same_tick_without_alignment(
     assert mission._start_avoidance(_yellow(), now=0.0)
 
     assert mission._update_active_avoidance([], now=0.1)
-    assert mission._update_active_avoidance([], now=0.79)
-    assert mission._update_active_avoidance([], now=0.99)
+    assert mission._update_active_avoidance([], now=1.99)
+    assert mission._update_active_avoidance([], now=2.0)
 
     assert mission.state is task2_module.MissionState.AVOIDING
     assert keeper_calls == []
     assert published_targets == []
 
-    clock["now"] = 1.01
-    mission.avoidance_clear_started_time = 0.1
+    clock["now"] = 3.5
     mission.update([])
     mission.update([])
 
@@ -523,14 +621,14 @@ def test_post_avoidance_blocked_course_falls_back_to_main_waypoint(
     published_targets = []
     stops = []
     clock = {"now": 1.01}
-    mission.yellow_course_acquired = True
+    mission.buoy_course_acquired = True
     mission.course_keeper = types.SimpleNamespace(
         compute=lambda **kwargs: types.SimpleNamespace(
             should_stop=True,
             target_lat=None,
             target_lon=None,
             status="blocked",
-            reason="fewer_than_two_yellow_buoys",
+            reason="fewer_than_two_course_buoys",
         ),
     )
     monkeypatch.setattr(
@@ -550,7 +648,10 @@ def test_post_avoidance_blocked_course_falls_back_to_main_waypoint(
         lambda publisher, lat, lon: published_targets.append((lat, lon))
     )
     assert mission._start_avoidance(_yellow(), now=0.0)
+    mission.avoidance_phase = "forward"
+    mission.avoidance_phase_started_time = 0.0
     mission.avoidance_clear_started_time = 0.0
+    clock["now"] = 2.0
 
     mission.update([])
 
@@ -562,7 +663,7 @@ def test_post_avoidance_blocked_course_falls_back_to_main_waypoint(
     assert stops == []
 
 
-def test_avoidance_does_not_start_above_four_metres(
+def test_avoidance_does_not_start_above_three_metres(
         task2_module,
         monkeypatch,
 ):
@@ -577,12 +678,12 @@ def test_avoidance_does_not_start_above_four_metres(
 
     for now in (1.0, 1.1):
         clock["now"] = now
-        mission.update([_yellow(distance=4.01)])
+        mission.update([_yellow(distance=3.01)])
 
     assert mission.state is task2_module.MissionState.NAVIGATING
 
 
-def test_eight_second_timeout_enters_failsafe_and_requests_hold(task2_module):
+def test_forty_second_timeout_enters_failsafe_and_requests_hold(task2_module):
     mission = _mission(task2_module)
     stopped = []
     hold_requests = []
@@ -590,14 +691,14 @@ def test_eight_second_timeout_enters_failsafe_and_requests_hold(task2_module):
     mission._request_hold_mode = lambda: hold_requests.append(True)
     assert mission._start_avoidance(_yellow(), now=10.0)
 
-    mission._update_active_avoidance([_yellow()], now=18.0)
+    mission._update_active_avoidance([_yellow()], now=50.0)
 
     assert mission.state is task2_module.MissionState.FAILSAFE
     assert stopped == [True]
     assert hold_requests == [True]
 
 
-def test_normal_navigation_publishes_dynamic_yellow_course_target(task2_module):
+def test_normal_navigation_publishes_dynamic_buoy_course_target(task2_module):
     mission = _mission(task2_module)
     published_targets = []
     received_detections = []
@@ -609,7 +710,7 @@ def test_normal_navigation_publishes_dynamic_yellow_course_target(task2_module):
             target_lat=37.95160,
             target_lon=32.50120,
             status="live",
-            reason="second_nearest_yellow_buoy",
+            reason="second_nearest_course_buoy",
         )
 
     mission.course_keeper = types.SimpleNamespace(compute=compute_course)
@@ -634,10 +735,68 @@ def test_normal_navigation_publishes_dynamic_yellow_course_target(task2_module):
     assert reached is False
     assert received_detections == detections
     assert published_targets == [(37.95160, 32.50120)]
-    assert mission.yellow_course_acquired is True
+    assert mission.buoy_course_acquired is True
 
 
-def test_missing_yellow_course_keeps_following_main_waypoint(
+def test_dynamic_buoy_target_aligns_only_once_per_waypoint(task2_module):
+    mission = _mission(task2_module)
+    decisions = iter([
+        types.SimpleNamespace(
+            should_stop=False,
+            target_lat=37.95160,
+            target_lon=32.50120,
+            status="live",
+            reason="second_nearest_course_buoy",
+        ),
+        types.SimpleNamespace(
+            should_stop=False,
+            target_lat=37.95166,
+            target_lon=32.50126,
+            status="live",
+            reason="second_nearest_course_buoy",
+        ),
+        types.SimpleNamespace(
+            should_stop=True,
+            target_lat=None,
+            target_lon=None,
+            status="blocked",
+            reason="fewer_than_two_course_buoys",
+        ),
+    ])
+    mission.course_keeper = types.SimpleNamespace(
+        compute=lambda **kwargs: next(decisions),
+    )
+    alignment_targets = []
+    published_targets = []
+    task2_module.calculate_gps_distance = lambda *args, **kwargs: 10.0
+    task2_module.align_heading_to_gps_target = (
+        lambda _publisher, _current_lat, _current_lon, _current_heading,
+        target_lat, target_lon, **kwargs:
+        alignment_targets.append((target_lat, target_lon)) or True
+    )
+    task2_module.publish_set_position = (
+        lambda publisher, lat, lon: published_targets.append((lat, lon))
+    )
+
+    for _ in range(3):
+        mission._navigate_to_gps_target(
+            37.95200,
+            32.50150,
+            "WP1",
+            1.0,
+            detections=[],
+        )
+
+    assert alignment_targets == [(37.95160, 32.50120)]
+    assert published_targets == [
+        (37.95160, 32.50120),
+        (37.95166, 32.50126),
+        (37.95200, 32.50150),
+    ]
+    assert mission.aligned_target_key == ("WP1",)
+
+
+def test_missing_buoy_course_keeps_following_main_waypoint(
         task2_module,
         monkeypatch,
 ):
@@ -649,7 +808,7 @@ def test_missing_yellow_course_keeps_following_main_waypoint(
         compute=lambda **kwargs: types.SimpleNamespace(
             should_stop=True,
             status="blocked",
-            reason="fewer_than_two_yellow_buoys",
+            reason="fewer_than_two_course_buoys",
             target_lat=None,
             target_lon=None,
         )

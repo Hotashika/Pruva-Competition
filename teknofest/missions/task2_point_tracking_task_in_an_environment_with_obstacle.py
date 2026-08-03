@@ -2,7 +2,7 @@
 """
 TEKNOFEST Görev 2
 -----------------
-Waypoint takibi + parkur dubalarından açı/derinlik tabanlı dinamik kaçınma.
+İkinci en yakın sarı dubayla parkur takibi + Njord Task 1 tipi süreli kaçınma.
 
 Beklenen kamera topic'i:
     /vision/detections   (std_msgs/String, JSON)
@@ -39,6 +39,7 @@ while REPO_ROOT_TEXT in sys.path:
 sys.path.insert(0, REPO_ROOT_TEXT)
 
 import rclpy
+from geometry_msgs.msg import Twist
 from mavros_msgs.srv import SetMode
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
@@ -61,9 +62,9 @@ from utils.mavlink_utilities import (
 )
 from utils.read_waypoints import parse_qgc_waypoints
 from teknofest.missions.utils.yellow_buoy_course_keeper import (
+    BuoyCourseConfig,
+    BuoyCourseKeeper,
     YELLOW_BUOY_CLASS_NAMES,
-    YellowBuoyCourseConfig,
-    YellowBuoyCourseKeeper,
     detection_class_name,
 )
 
@@ -74,9 +75,10 @@ WAYPOINT_PATH = WAYPOINT_DIRECTORY / "teknofest_task2.waypoints"
 # ============================================================
 DETECTION_TOPIC = "/vision/detections"
 VISION_DETECTION_TIMEOUT_SEC = 12.0
+AVOIDANCE_VELOCITY_TOPIC = "/cube/task2_velocity"
 
-# Test sahasında sarı, yeşil, kırmızı ve turuncu parkur dubalarının
-# tamamı aynı engelden kaçınma davranışını tetikler.
+# Task 2 yalnızca sarı dubayı parkur ve kaçınma adayı olarak kullanır.
+# Kaçış yönü kameradaki mevcut sağ/sol konumundan seçilir.
 OBSTACLE_CLASS_NAMES = YELLOW_BUOY_CLASS_NAMES
 MIN_OBSTACLE_CONFIDENCE = 0.45
 
@@ -100,28 +102,33 @@ WAYPOINT_HEADING_TOLERANCE_DEG = 15.0
 # ============================================================
 # SARI DUBA PARKUR PARAMETRELERİ
 # ============================================================
-# Ikinci en yakin sari dubaya yonelirken uretilecek kisa GPS hedefinin ust mesafesi.
-YELLOW_COURSE_LOOKAHEAD_M = 5.0
+# İkinci en yakın sarı dubaya yönelirken üretilecek kısa GPS hedefinin
+# üst mesafesi.
+BUOY_COURSE_LOOKAHEAD_M = 5.0
 
-# Sari parkur bir kez bulunduktan sonra tespit kaybinda son yonu koruma suresi.
-YELLOW_TARGET_MEMORY_SEC = 1.0
+# Parkur bir kez bulunduğunda kısa tespit kaybında son yönü koruma süresi.
+BUOY_TARGET_MEMORY_SEC = 1.0
 
 # ============================================================
 # KAÇINMA PARAMETRELERİ
 # ============================================================
 # Sarı duba bu mesafeye veya daha yakına geldiğinde kaçınma başlatılır.
-AVOIDANCE_START_DISTANCE_M = 4.0
-# Aktif engel bu mesafeye çıktığında temiz görüş süresi başlar.
+AVOIDANCE_START_DISTANCE_M = 3.0
 AVOIDANCE_EXIT_DISTANCE_M = 5.0
+AVOIDANCE_TURN_ANGLE_DEG = 30.0
+AVOIDANCE_TURN_DURATION_SEC = 2.0
+AVOIDANCE_FORWARD_MIN_DURATION_SEC = 1.5
+AVOIDANCE_CLEAR_CONFIRM_SEC = 1.0
+AVOIDANCE_TIMEOUT_SEC = 40.0
+AVOIDANCE_BEHIND_MARGIN_M = 1.0
+# Hız profili eski TEKNOFEST dinamik kaçınma davranışından korunur.
 AVOIDANCE_PASS_CLEARANCE_M = 3.0
-AVOIDANCE_EMERGENCY_DISTANCE_M = 1.5
+# Bu mesafenin altında da manevra minimum hızla devam eder.
+AVOIDANCE_MIN_SPEED_DISTANCE_M = 1.5
 AVOIDANCE_MIN_LINEAR_SPEED = 0.2
 AVOIDANCE_MAX_LINEAR_SPEED = 0.6
 AVOIDANCE_MAX_ANGULAR_Z = 0.8
 AVOIDANCE_TURN_SPEED_REDUCTION = 0.5
-AVOIDANCE_MIN_DURATION_SEC = 1.0
-AVOIDANCE_CLEAR_DURATION_SEC = 0.7
-AVOIDANCE_TIMEOUT_SEC = 8.0
 SIDE_FALLBACK_ANGLE_DEG = 15.0
 
 # ============================================================
@@ -152,6 +159,12 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.logger = node.get_logger()
         self.topics = mission_topics
         self.clients = mission_clients
+        if not hasattr(self.topics, "avoidance_velocity_pub"):
+            self.topics.avoidance_velocity_pub = node.create_publisher(
+                Twist,
+                AVOIDANCE_VELOCITY_TOPIC,
+                10,
+            )
 
         self.logger.info(f"[INIT] Waypoint dosyası: {WAYPOINT_PATH.resolve()}")
         self.waypoints = parse_qgc_waypoints(WAYPOINT_PATH)
@@ -172,12 +185,13 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.last_angular_z = 0.0
         self.finished = False
         self.state = MissionState.INIT
-        self.course_keeper = YellowBuoyCourseKeeper(YellowBuoyCourseConfig(
+        self.course_keeper = BuoyCourseKeeper(BuoyCourseConfig(
             min_confidence=MIN_OBSTACLE_CONFIDENCE,
-            lookahead_m=YELLOW_COURSE_LOOKAHEAD_M,
-            target_memory_sec=YELLOW_TARGET_MEMORY_SEC,
+            lookahead_m=BUOY_COURSE_LOOKAHEAD_M,
+            target_memory_sec=BUOY_TARGET_MEMORY_SEC,
+            course_buoy_class_names=YELLOW_BUOY_CLASS_NAMES,
         ))
-        self.yellow_course_acquired = False
+        self.buoy_course_acquired = False
         self.aligned_target_key = None
         self.resume_navigation_without_alignment = False
         self.waypoint_hold_until = None
@@ -187,9 +201,11 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.avoidance_side = None
         self.avoided_obstacle_side = None
         self.avoidance_started_time = None
+        self.avoidance_phase = None
+        self.avoidance_phase_started_time = None
+        self.avoidance_entry_heading = None
         self.avoidance_clear_started_time = None
-        self.last_avoidance_linear_x = 0.0
-        self.last_avoidance_angular_z = 0.0
+        self.last_avoidance_speed_m_s = 0.0
         self.avoiding_track_id = None
         self.active_obstacle_reference = None
         self.pending_obstacle = None
@@ -387,12 +403,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         if not isinstance(obj, dict):
             return None
 
-        class_name = obj.get("class")
-        if class_name is None:
-            class_name = obj.get("class_name")
-        if class_name is None:
-            class_name = obj.get("label", "obstacle")
-        class_name = str(class_name).strip().lower()
+        class_name = detection_class_name(obj) or "obstacle"
 
         confidence = self._safe_float(obj.get("confidence"))
         if confidence is None:
@@ -580,17 +591,18 @@ class Task2PointTrackingWithObstacleAvoidance:
             if obstacle["confidence"] < MIN_OBSTACLE_CONFIDENCE:
                 continue
 
-            if detection_class_name(obstacle) not in OBSTACLE_CLASS_NAMES:
+            if OBSTACLE_CLASS_NAMES and obstacle["class"] not in OBSTACLE_CLASS_NAMES:
                 continue
 
             distance = obstacle["distance"]
+            # Derinliği olmayan/geçersiz tespit manevrayı veya GPS seyrini
+            # durdurmaz; yalnızca engel adayı olarak kullanılmaz.
             if distance is None or distance <= 0.0:
-                self.obstacle_data_uncertain = True
                 continue
             if distance >= AVOIDANCE_EXIT_DISTANCE_M:
                 continue
 
-            # Yakın parkur dubasının açısı/yönü yoksa ilerlemek güvenli değildir.
+            # Yakın sarı dubanın açısı/yönü yoksa ilerlemek güvenli değildir.
             if obstacle["side"] is None or obstacle["angle"] is None:
                 self.obstacle_data_uncertain = True
                 continue
@@ -633,7 +645,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             obstacle = self._normalize_detection(raw)
             if (
                     obstacle is None
-                    or detection_class_name(obstacle) not in OBSTACLE_CLASS_NAMES
+                    or obstacle["class"] not in OBSTACLE_CLASS_NAMES
                     or obstacle["confidence"] < MIN_OBSTACLE_CONFIDENCE
             ):
                 continue
@@ -667,7 +679,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         return filtered
 
     # ========================================================
-    # DİNAMİK KAÇINMA
+    # NJORD TASK 1 TİPİ SÜRELİ KAÇINMA
     # ========================================================
     @staticmethod
     def _choose_avoidance_side(obstacle_side):
@@ -688,91 +700,96 @@ class Task2PointTrackingWithObstacleAvoidance:
     def _clamp(value, minimum, maximum):
         return max(minimum, min(maximum, value))
 
-    def _calculate_avoidance_command(self, obstacle):
-        obstacle = self._normalize_detection(obstacle)
-        if (
-                obstacle is None
-                or obstacle["distance"] is None
-                or obstacle["distance"] <= 0.0
-                or obstacle["side"] is None
-                or obstacle["angle"] is None
-        ):
-            return None
+    def _calculate_avoidance_speed(self, obstacle):
+        """Eski TEKNOFEST mesafe/dönüş tabanlı ileri hızını hesaplar."""
+        if obstacle is None:
+            return self.last_avoidance_speed_m_s
 
-        avoidance_side = self.avoidance_side
-        if avoidance_side is None:
-            avoidance_side = self._choose_avoidance_side(obstacle["side"])
-
-        distance = float(obstacle["distance"])
-        angle_deg = float(obstacle["angle"])
+        distance = self._safe_float(obstacle.get("distance"))
+        angle_deg = self._safe_float(obstacle.get("angle"))
+        if distance is None or distance <= 0.0 or angle_deg is None:
+            return self.last_avoidance_speed_m_s
         angle_rad = math.radians(angle_deg)
         target_forward = distance * math.cos(angle_rad)
         target_starboard = distance * math.sin(angle_rad)
         target_starboard += (
             AVOIDANCE_PASS_CLEARANCE_M
-            if avoidance_side == "right"
+            if self.avoidance_side == "right"
             else -AVOIDANCE_PASS_CLEARANCE_M
         )
-
         angular_z = self._clamp(
             math.atan2(target_starboard, target_forward),
             -AVOIDANCE_MAX_ANGULAR_Z,
             AVOIDANCE_MAX_ANGULAR_Z,
         )
-        if distance <= AVOIDANCE_EMERGENCY_DISTANCE_M:
-            linear_x = 0.0
-        else:
-            distance_ratio = self._clamp(
-                (
-                    distance - AVOIDANCE_EMERGENCY_DISTANCE_M
-                ) / (
-                    AVOIDANCE_START_DISTANCE_M
-                    - AVOIDANCE_EMERGENCY_DISTANCE_M
-                ),
-                0.0,
-                1.0,
-            )
-            base_speed = (
-                AVOIDANCE_MIN_LINEAR_SPEED
-                + distance_ratio
-                * (AVOIDANCE_MAX_LINEAR_SPEED - AVOIDANCE_MIN_LINEAR_SPEED)
-            )
-            turn_ratio = min(
-                1.0,
-                abs(angular_z) / AVOIDANCE_MAX_ANGULAR_Z,
-            )
-            linear_x = max(
-                AVOIDANCE_MIN_LINEAR_SPEED,
-                base_speed
-                * (1.0 - AVOIDANCE_TURN_SPEED_REDUCTION * turn_ratio),
-            )
-
-        return {
-            "linear_x": linear_x,
-            "angular_z": angular_z,
-            "distance": distance,
-            "angle": angle_deg,
-            "avoidance_side": avoidance_side,
-        }
-
-    def _publish_avoidance_command(self, command):
-        self.avoidance_side = command["avoidance_side"]
-        self.last_avoidance_linear_x = command["linear_x"]
-        self.last_avoidance_angular_z = command["angular_z"]
-        self.last_angular_z = command["angular_z"]
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
-            linear_x=command["linear_x"],
-            angular_z=command["angular_z"],
+        distance_ratio = self._clamp(
+            (
+                distance - AVOIDANCE_MIN_SPEED_DISTANCE_M
+            ) / (
+                AVOIDANCE_START_DISTANCE_M
+                - AVOIDANCE_MIN_SPEED_DISTANCE_M
+            ),
+            0.0,
+            1.0,
+        )
+        base_speed = (
+            AVOIDANCE_MIN_LINEAR_SPEED
+            + distance_ratio
+            * (AVOIDANCE_MAX_LINEAR_SPEED - AVOIDANCE_MIN_LINEAR_SPEED)
+        )
+        turn_ratio = min(1.0, abs(angular_z) / AVOIDANCE_MAX_ANGULAR_Z)
+        return max(
+            AVOIDANCE_MIN_LINEAR_SPEED,
+            base_speed * (1.0 - AVOIDANCE_TURN_SPEED_REDUCTION * turn_ratio),
         )
 
-    def _republish_last_avoidance_command(self):
-        publish_cmd_vel(
-            self.topics.cmd_vel_pub,
-            linear_x=self.last_avoidance_linear_x,
-            angular_z=self.last_avoidance_angular_z,
+    def _publish_avoidance_velocity(self, obstacle=None):
+        """Sabit faz yönünde, eski dinamik büyüklükle global hız yayınlar."""
+        if self.avoidance_entry_heading is None:
+            self._enter_failsafe(
+                "Kaçınma giriş heading'i bulunamadı. FAILSAFE + HOLD."
+            )
+            return False
+
+        target_bearing = float(self.avoidance_entry_heading)
+        if self.avoidance_phase == "right":
+            target_bearing += AVOIDANCE_TURN_ANGLE_DEG
+        elif self.avoidance_phase == "left":
+            target_bearing -= AVOIDANCE_TURN_ANGLE_DEG
+        target_bearing %= 360.0
+
+        speed_m_s = self._calculate_avoidance_speed(obstacle)
+        self.last_avoidance_speed_m_s = speed_m_s
+        bearing_rad = math.radians(target_bearing)
+        message = Twist()
+        message.linear.x = speed_m_s * math.cos(bearing_rad)
+        message.linear.y = speed_m_s * math.sin(bearing_rad)
+        message.linear.z = 0.0
+        message.angular.z = 0.0
+        self.topics.avoidance_velocity_pub.publish(message)
+        self.last_angular_z = 0.0
+        self.logger.info(
+            "Süreli kaçınma: "
+            f"faz={self.avoidance_phase}, bearing={target_bearing:.1f}°, "
+            f"speed={speed_m_s:.3f} m/s",
+            throttle_duration_sec=1.0,
         )
-        self.last_angular_z = self.last_avoidance_angular_z
+        return True
+
+    @staticmethod
+    def _obstacle_is_behind(obstacle):
+        if obstacle is None:
+            return False
+        distance = Task2PointTrackingWithObstacleAvoidance._safe_float(
+            obstacle.get("distance")
+        )
+        angle = Task2PointTrackingWithObstacleAvoidance._safe_float(
+            obstacle.get("angle")
+        )
+        if distance is None or angle is None:
+            return False
+        forward_m = distance * math.cos(math.radians(angle))
+        return forward_m <= -AVOIDANCE_BEHIND_MARGIN_M
 
     def _start_avoidance(
             self,
@@ -780,8 +797,14 @@ class Task2PointTrackingWithObstacleAvoidance:
             now=None,
     ):
         obstacle = self._normalize_detection(obstacle)
-        command = self._calculate_avoidance_command(obstacle)
-        if command is None:
+        if (
+                obstacle is None
+                or obstacle["distance"] is None
+                or obstacle["distance"] <= 0.0
+                or obstacle["side"] is None
+                or obstacle["angle"] is None
+                or self.current_heading is None
+        ):
             publish_cmd_vel(
                 self.topics.cmd_vel_pub,
                 linear_x=0.0,
@@ -790,24 +813,27 @@ class Task2PointTrackingWithObstacleAvoidance:
             return False
 
         self.avoided_obstacle_side = obstacle["side"]
-        self.avoidance_side = command["avoidance_side"]
+        self.avoidance_side = self._choose_avoidance_side(obstacle["side"])
         self.avoidance_started_time = (
             time.monotonic() if now is None else float(now)
         )
+        self.avoidance_phase = self.avoidance_side
+        self.avoidance_phase_started_time = self.avoidance_started_time
+        self.avoidance_entry_heading = float(self.current_heading)
         self.avoidance_clear_started_time = None
         self.avoiding_track_id = obstacle.get("track_id")
         self.active_obstacle_reference = obstacle
         self.state = MissionState.AVOIDING
         self.aligned_target_key = None
         self.resume_navigation_without_alignment = False
-        self._publish_avoidance_command(command)
+        self._publish_avoidance_velocity(obstacle)
 
         self.logger.warn(
             f"ENGEL: class={obstacle['class']}, distance={obstacle['distance']:.2f} m, "
             f"camera_side={obstacle['side']}, angle={obstacle['angle']:.1f}°. "
-            f"Geçiş={self.avoidance_side}; dinamik manevra="
-            f"linear_x={command['linear_x']:.2f}, "
-            f"angular_z={command['angular_z']:+.2f}"
+            f"Geçiş={self.avoidance_side}; "
+            f"{AVOIDANCE_TURN_ANGLE_DEG:.0f}° süreli manevra "
+            f"dinamik hız={self.last_avoidance_speed_m_s:.2f} m/s."
         )
         return True
 
@@ -815,9 +841,11 @@ class Task2PointTrackingWithObstacleAvoidance:
         self.avoidance_side = None
         self.avoided_obstacle_side = None
         self.avoidance_started_time = None
+        self.avoidance_phase = None
+        self.avoidance_phase_started_time = None
+        self.avoidance_entry_heading = None
         self.avoidance_clear_started_time = None
-        self.last_avoidance_linear_x = 0.0
-        self.last_avoidance_angular_z = 0.0
+        self.last_avoidance_speed_m_s = 0.0
         self.avoiding_track_id = None
         self.active_obstacle_reference = None
         self.pending_obstacle = None
@@ -832,9 +860,8 @@ class Task2PointTrackingWithObstacleAvoidance:
         self._reset_avoidance_state()
         self.resume_navigation_without_alignment = True
         self.logger.info(
-            f"Engel kesintisiz {AVOIDANCE_CLEAR_DURATION_SEC:.1f}s temiz. "
-            f"{completed_side} taraftan dinamik geçiş tamamlandı; "
-            "durmadan aynı ana waypoint ve duba parkur takibine dönülüyor."
+            f"{completed_side} taraftan süreli geçiş tamamlandı; "
+            "aynı ana GPS waypoint'ine dönülüyor."
         )
 
     def _avoidance_timed_out(self, now=None):
@@ -846,14 +873,20 @@ class Task2PointTrackingWithObstacleAvoidance:
     def _update_active_avoidance(self, detections, now=None):
         """Kaçınma bu çevrimi tüketiyorsa True, tamamlandıysa False döndürür."""
         now = time.monotonic() if now is None else float(now)
-        if self.avoidance_started_time is None:
-            self._enter_failsafe("AVOIDING başlangıç zamanı yok; FAILSAFE + HOLD.")
+        if (
+                self.avoidance_started_time is None
+                or self.avoidance_phase_started_time is None
+                or self.avoidance_entry_heading is None
+        ):
+            self._enter_failsafe("Süreli kaçınma durumu eksik; FAILSAFE + HOLD.")
             return True
         if self._avoidance_timed_out(now):
             self._enter_failsafe("Kaçınma zaman aşımı; FAILSAFE + HOLD.")
             return True
 
-        # Eksik derinlik/yön temiz görüş değildir: araç durur, clear sayacı sıfırlanır.
+        # Yönü belirsiz yakın duba temiz görüş değildir: araç durur,
+        # clear sayacı sıfırlanır. Eksik derinlik ise adaydan elenir ve
+        # süreli manevra son geçerli hızla devam eder.
         self._nearest_relevant_obstacle(detections, now=now)
         if self.obstacle_data_uncertain:
             self.avoidance_clear_started_time = None
@@ -864,50 +897,57 @@ class Task2PointTrackingWithObstacleAvoidance:
             )
             self.last_angular_z = 0.0
             self.logger.warn(
-                "Aktif kaçınmada parkur dubası verisi belirsiz; araç veri "
+                "Aktif kaçınmada sarı dubanın yönü belirsiz; araç veri "
                 "düzelene kadar durduruldu.",
                 throttle_duration_sec=1.0,
             )
             return True
 
         obstacle = self._matching_avoidance_obstacle(detections)
+        phase_elapsed = now - self.avoidance_phase_started_time
+
+        if self.avoidance_phase in {"right", "left"}:
+            if phase_elapsed < AVOIDANCE_TURN_DURATION_SEC:
+                self._publish_avoidance_velocity(obstacle)
+                return True
+
+            completed_side = self.avoidance_phase
+            self.avoidance_phase = "forward"
+            self.avoidance_phase_started_time = now
+            self.avoidance_clear_started_time = now if obstacle is None else None
+            self.logger.info(
+                f"{completed_side} yönündeki süreli bacak tamamlandı; "
+                "engel temizlenene kadar giriş heading'inde ileri gidiliyor."
+            )
+            self._publish_avoidance_velocity(obstacle)
+            return True
+
+        if self.avoidance_phase != "forward":
+            self._enter_failsafe(
+                f"Bilinmeyen kaçınma fazı: {self.avoidance_phase}. FAILSAFE + HOLD."
+            )
+            return True
+
+        obstacle_behind = self._obstacle_is_behind(obstacle)
         if obstacle is None:
             if self.avoidance_clear_started_time is None:
                 self.avoidance_clear_started_time = now
-            maneuver_elapsed = now - self.avoidance_started_time
-            clear_elapsed = now - self.avoidance_clear_started_time
-            if (
-                    maneuver_elapsed >= AVOIDANCE_MIN_DURATION_SEC
-                    and clear_elapsed >= AVOIDANCE_CLEAR_DURATION_SEC
-            ):
-                self._finish_avoidance()
-                return False
+        else:
+            self.avoidance_clear_started_time = None
 
-            # Kısa tespit kaybında son güvenli komutu clear süresince koru.
-            self._republish_last_avoidance_command()
-            return True
-
-        self.avoidance_clear_started_time = None
-        command = self._calculate_avoidance_command(obstacle)
-        if command is None:
-            publish_cmd_vel(
-                self.topics.cmd_vel_pub,
-                linear_x=0.0,
-                angular_z=0.0,
-            )
-            self.last_angular_z = 0.0
-            return True
-
-        self._publish_avoidance_command(command)
-        self.logger.info(
-            f"Dinamik kaçınma: class={obstacle['class']}, "
-            f"geçiş={command['avoidance_side']}, "
-            f"distance={command['distance']:.2f} m, "
-            f"angle={command['angle']:+.1f}°, "
-            f"linear_x={command['linear_x']:.2f}, "
-            f"angular_z={command['angular_z']:+.2f}",
-            throttle_duration_sec=0.5,
+        detection_clear = (
+            self.avoidance_clear_started_time is not None
+            and now - self.avoidance_clear_started_time
+            >= AVOIDANCE_CLEAR_CONFIRM_SEC
         )
+        minimum_forward_complete = (
+            phase_elapsed >= AVOIDANCE_FORWARD_MIN_DURATION_SEC
+        )
+        if minimum_forward_complete and (obstacle_behind or detection_clear):
+            self._finish_avoidance()
+            return False
+
+        self._publish_avoidance_velocity(obstacle)
         return True
 
     # ========================================================
@@ -920,7 +960,7 @@ class Task2PointTrackingWithObstacleAvoidance:
             target_name,
             tolerance_m,
             detections,
-            follow_yellow_course=True,
+            follow_buoy_course=True,
     ):
         distance = calculate_gps_distance(
             self.current_lat,
@@ -936,20 +976,18 @@ class Task2PointTrackingWithObstacleAvoidance:
         navigation_lat = target_lat
         navigation_lon = target_lon
         navigation_status = "direct_main_waypoint"
-        if follow_yellow_course:
-            now = time.monotonic()
+        if follow_buoy_course:
             course_decision = self.course_keeper.compute(
                 detections=detections,
                 current_lat=self.current_lat,
                 current_lon=self.current_lon,
                 current_heading=self.current_heading,
-                now=now,
+                now=time.monotonic(),
             )
             if course_decision.should_stop:
-                if course_decision.reason == "fewer_than_two_yellow_buoys":
+                if course_decision.reason == "fewer_than_two_course_buoys":
                     navigation_status = (
-                        "yellow_course_unavailable/"
-                        "direct_main_waypoint"
+                        "buoy_course_unavailable/direct_main_waypoint"
                     )
                     self.logger.warn(
                         "Yeterli sarı duba bulunamadı; ana GPS waypoint'ine "
@@ -968,7 +1006,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                         angular_z=0.0,
                     )
                     self.logger.warn(
-                        f"Sarı duba parkur hedefi hesaplanamadı "
+                        "Sarı duba parkur hedefi hesaplanamadı "
                         f"({course_decision.reason}); araç bekletiliyor.",
                         throttle_duration_sec=1.0,
                     )
@@ -978,22 +1016,23 @@ class Task2PointTrackingWithObstacleAvoidance:
                     and course_decision.target_lon is not None
             ):
                 if course_decision.status == "live":
-                    self.yellow_course_acquired = True
+                    self.buoy_course_acquired = True
                 navigation_lat = course_decision.target_lat
                 navigation_lon = course_decision.target_lon
                 navigation_status = (
-                    f"yellow_course/{course_decision.status}/"
+                    f"buoy_course/{course_decision.status}/"
                     f"{course_decision.reason}"
                 )
 
-        target_key = (
-            target_name,
-            round(float(navigation_lat), 7),
-            round(float(navigation_lon), 7),
-        )
+        # Duba parkur hedefi aracın konumuna ve her yeni kamera karesine göre
+        # sürekli değişir. Koordinatı hizalama anahtarına katmak her hedef
+        # güncellemesinde aracı yeniden durdurup döndürüyordu. Bir ana waypoint
+        # için yalnızca ilk hedefte hizalan; sonraki dinamik GPS hedeflerini
+        # kesintisiz yayınla.
+        alignment_key = (target_name,)
         if self.resume_navigation_without_alignment:
-            self.aligned_target_key = target_key
-        elif self.aligned_target_key != target_key:
+            self.aligned_target_key = alignment_key
+        elif self.aligned_target_key != alignment_key:
             if not align_heading_to_gps_target(
                     self.topics.cmd_vel_pub,
                     self.current_lat,
@@ -1006,7 +1045,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                     tolerance_deg=WAYPOINT_HEADING_TOLERANCE_DEG,
             ):
                 return False
-            self.aligned_target_key = target_key
+            self.aligned_target_key = alignment_key
 
         publish_set_position(
             self.topics.position_target_pub,
@@ -1071,8 +1110,8 @@ class Task2PointTrackingWithObstacleAvoidance:
 
         now = time.monotonic()
 
-        # Devam eden kaçınma yalnız /cube/cmd_vel kullanır. Temiz geçiş
-        # doğrulanırsa aynı çevrimde course keeper ve GPS navigasyonu sürer.
+        # Devam eden kaçınma yalnız global hız hedefi kullanır. Temiz geçiş
+        # doğrulanırsa aynı çevrimde ana GPS waypoint navigasyonu sürer.
         if self.state == MissionState.AVOIDING:
             if self._update_active_avoidance(detections, now=now):
                 return
@@ -1085,7 +1124,7 @@ class Task2PointTrackingWithObstacleAvoidance:
         if self.obstacle_data_uncertain:
             stop_vehicle(self.topics.cmd_vel_pub)
             self.logger.warn(
-                "Yakın parkur dubası görüldü fakat mesafe/yön güvenilir değil; "
+                "Yakın sarı duba görüldü fakat yönü güvenilir değil; "
                 "araç veri düzelene kadar bekletiliyor.",
                 throttle_duration_sec=1.0,
             )
@@ -1101,7 +1140,7 @@ class Task2PointTrackingWithObstacleAvoidance:
                 "WP0 (başlangıç)",
                 self.waypoint_tolerance + 2.0,
                 detections,
-                follow_yellow_course=False,
+                follow_buoy_course=False,
             )
 
             if reached_wp0:
@@ -1148,7 +1187,15 @@ class Task2Node(Node):
     def __init__(self):
         super().__init__("task2_mission_node")
         self.get_logger().info(
-            "Görev 2 node'u başlatılıyor: waypoint takibi + dinamik engelden kaçınma."
+            "Görev 2 node'u başlatılıyor: sarı duba parkur takibi + "
+            "süreli engelden kaçınma."
+        )
+        self.get_logger().info(
+            "Süreli kaçınma profili: "
+            f"{AVOIDANCE_TURN_ANGLE_DEG:.0f}° yön bacağı "
+            f"{AVOIDANCE_TURN_DURATION_SEC:.1f}s, "
+            f"ardından en az {AVOIDANCE_FORWARD_MIN_DURATION_SEC:.1f}s "
+            "giriş heading'inde ileri; hız eski mesafe/dönüş profiline göre dinamik."
         )
 
         self.mission_clients = create_mission_clients(self)
@@ -1508,11 +1555,6 @@ def main(args=None):
                 node,
                 node.mission_clients.disarm_client,
                 "DISARM",
-            )
-            call_set_mode(
-                node,
-                node.mission_clients.set_mode_client,
-                "MANUAL",
             )
         except Exception:  # noqa: BLE001
             pass
